@@ -158,6 +158,7 @@ static memory::ptr get_memory_from_pool(engine& _engine,
     if (_node.get_program().get_config().get_property(ov::intel_gpu::enable_memory_pool)) {
         if (curr_memory != nullptr)
             pool.release_memory(curr_memory, _node.get_unique_id(), _node.id(), net_id);
+        // std::cout << "[primitive_inst] pool.get_memory 1 " << std::endl;
         return pool.get_memory(layout,
                                _node.id(),
                                _node.get_unique_id(),
@@ -168,6 +169,7 @@ static memory::ptr get_memory_from_pool(engine& _engine,
                                reset,
                                _node.is_dynamic());
     }
+    // std::cout << "[primitive_inst] pool.get_memory 2 " << std::endl;
     return pool.get_memory(layout, type, reset);
 }
 
@@ -246,6 +248,7 @@ void primitive_inst::check_memory_to_set(const memory& mem, const layout& l) con
 }
 
 event::ptr primitive_inst::set_output_memory(memory::ptr mem_new, bool check, size_t idx) {
+    // std::cout << "[primitive_inst] set_output_memory " << std::endl;
     auto& eng = _network.get_engine();
     // skip all the buzz if no action actually required
     event::ptr ev = nullptr;
@@ -268,6 +271,8 @@ event::ptr primitive_inst::set_output_memory(memory::ptr mem_new, bool check, si
 }
 
 void primitive_inst::update_shape() {
+    // std::cout << "[debug] " << id() << " update_shape" << std::endl;
+
     OV_ITT_SCOPED_TASK(ov::intel_gpu::itt::domains::intel_gpu_plugin, openvino::itt::handle("update_shape: " + id()));
     GPU_DEBUG_PROFILED_STAGE(instrumentation::pipeline_stage::shape_inference);
     if (update_shape_done_by_other) {
@@ -442,6 +447,7 @@ void primitive_inst::update_shape() {
         _impl_params->output_layouts[idx] = layout;
     };
 
+    // std::cout << "primitive_inst _node->type()->calc_output_layouts new_layouts: " << std::endl;
     auto new_layouts = _node->type()->calc_output_layouts(*_node, *_impl_params);
     if (new_layouts.empty()) {
         auto new_layout = _node->type()->calc_output_layout(*_node, *_impl_params);
@@ -510,6 +516,7 @@ event::ptr primitive_inst::realloc_if_needed() {
 
     event::ptr ev = nullptr;
     const auto& users = get_user_insts();
+    // std::cout << "[debug] " << id() << " realloc_if_needed get_user_insts end. users.size: " << users.size() << std::endl;
     if (users.size() == 1 && users.front()->get_node().is_type<concatenation>()) {
         auto concat_inst = users.front();
         if (concat_inst->can_be_optimized()) {
@@ -530,8 +537,10 @@ event::ptr primitive_inst::realloc_if_needed() {
     OPENVINO_ASSERT(actual_layouts[0].is_static(), "[GPU] Can't realloc mem for dynamic layout");
 
     // input_layout node is supposed to always use external memory in dynamic case
-    if (_node->is_type<input_layout>())
+    if (_node->is_type<input_layout>()) {
+        // std::cout << "[debug] " << id() << " realloc_if_needed return: use external memory " << std::endl;
         return ev;
+    }
 
     auto& sp = *get_network().get_shape_predictor();
     std::vector<size_t> dt_sizes_in_B;
@@ -848,13 +857,15 @@ event::ptr primitive_inst::realloc_if_needed() {
     }
 
     _mem_allocated = true;
+    // std::cout << "[debug] " << id() << " realloc_if_needed _mem_allocated = true, _impl==nullptr: " << (_impl == nullptr) << std::endl;
     // intermediate memory allocation is required for primitives consisting of multiple kernels in dynamic case
     {
         if (_impl == nullptr)
             return ev;
         const auto& ibuf_layouts = _impl->get_internal_buffer_layouts();
-        if (ibuf_layouts.empty())
+        if (ibuf_layouts.empty()) {
             return ev;
+        }
         GPU_DEBUG_CODE(std::string memalloc_info = "");
         for (size_t i = 0; i < ibuf_layouts.size(); ++i) {
             if (i < _intermediates_memory.size() && ibuf_layouts[i].bytes_count() <= max_intermediates_memory_sizes[i]) {
@@ -880,6 +891,7 @@ event::ptr primitive_inst::realloc_if_needed() {
         }
         GPU_DEBUG_PROFILED_STAGE_MEMALLOC_INFO(memalloc_info);
     }
+    // std::cout << "[debug] " << id() << " realloc_if_needed return " << std::endl;
     return ev;
 }
 
@@ -1063,7 +1075,9 @@ bool primitive_inst::update_impl(bool use_async_compilation) {
                     if (!is_current_impl_dynamic)
                         _impl = std::move(_dynamic_impl);
                     auto new_impl_params = _impl->canonicalize_shapes(*_impl_params);
+                    // std::cout << "[debug] " << id() << " _impl->update_dispatch_data start " << std::endl;
                     _impl->update_dispatch_data(new_impl_params);
+                    // std::cout << "[debug] " << id() << " _impl->update_dispatch_data end" << std::endl;
                     update_shape_info_tensor(new_impl_params);
                 }
             } else {
@@ -1548,11 +1562,13 @@ bool primitive_inst::has_inner_networks() const {
 event::ptr primitive_inst::execute(const std::vector<event::ptr>& events) {
     OV_ITT_SCOPED_TASK(ov::intel_gpu::itt::domains::intel_gpu_plugin, openvino::itt::handle("primitive_inst::execute: " + id()));
     const auto& primitive_id = id();
+    std::cout << "[debug] " << id() << " primitive_inst execute " << std::endl;
     OPENVINO_ASSERT(_has_valid_input, primitive_id, " has invalid/unset input");
     GPU_DEBUG_GET_INSTANCE(debug_config);
     GPU_DEBUG_TRACE_DETAIL << "-----------------------------------------------------------------" << std::endl;
     GPU_DEBUG_TRACE_DETAIL << "Execute " << id() << " (type: " << _impl_params->desc->type_string() << ") " << std::endl;
     for (size_t i = 0; i < _deps.size(); ++i) {
+        // std::cout << "[debug] " << id() << " execute inputs[" << i << "]: " << _deps[i].first->id() << std::endl;
         GPU_DEBUG_TRACE_DETAIL << "- inputs[" << i << "] : " <<  _deps[i].first->id() << std::endl;
     }
     GPU_DEBUG_TRACE_DETAIL << "-----------------------------------------------------------------" << std::endl;
@@ -1563,9 +1579,11 @@ event::ptr primitive_inst::execute(const std::vector<event::ptr>& events) {
     if ((is_dynamic() || _node->is_in_shape_of_subgraph()) && !has_inner_networks()) {
         do_runtime_in_place_concat();
         OPENVINO_ASSERT(_node != nullptr, "[GPU] Invalid primitive_inst object for dynamic shapes case: program_node can't be null");
+        // std::cout << "[debug] " << id() << " execute update_shape" << std::endl;
         update_shape();
 
         bool can_skip_execution = false;
+        // std::cout << "[debug] " << id() << " execute _impl_params output_layouts count: " << _impl_params->output_layouts[0].count() << std::endl;
         if (_impl_params->output_layouts[0].count() == 0) {
             GPU_DEBUG_TRACE_DETAIL << id() << " : Skipping because output data is empty " << std::endl;
             can_skip_execution = true;
@@ -1620,6 +1638,7 @@ event::ptr primitive_inst::execute(const std::vector<event::ptr>& events) {
                 }
             }
             GPU_DEBUG_TRACE_DETAIL << "[Start] Executing unfused subgraph of " << id() << std::endl;
+            // std::cout << "[debug] " << id() << " subgraph execute " << std::endl;
             auto outputs = subgraph->execute(events);
             GPU_DEBUG_TRACE_DETAIL << "[End] Finished executing unfused subgraph of " << id() << std::endl;
 
@@ -1643,12 +1662,15 @@ event::ptr primitive_inst::execute(const std::vector<event::ptr>& events) {
                 auto ev = update_weights();
                 if (ev)
                     dependencies.push_back(ev);
+                // std::cout << "[debug] " << id() << " update_impl end, realloc_if_needed start " << std::endl;
                 auto ev_reset = realloc_if_needed();
+                // std::cout << "[debug] " << id() << " update_impl end, realloc_if_needed end " << std::endl;
                 if (ev_reset)
                     dependencies.push_back(ev_reset);
             }
         }
 
+        // std::cout << "[debug] " << id() << " assert is_static? " << _impl_params->get_output_layout().is_static() << std::endl;
         OPENVINO_ASSERT(_impl_params->get_output_layout().is_static(),
                         "[GPU] Can't execute ", primitive_id, " primitive as output layout is dynamic in runtime");
     }
@@ -1672,9 +1694,13 @@ event::ptr primitive_inst::execute(const std::vector<event::ptr>& events) {
 
     // Output buffer may be changed under the following conditions, so we need to set args to kernel on each iteration
     if ((is_dynamic() && need_args_update) || has_mutable_input() || is_output() || has_dynamic_dependencies_insts(this)) {
-        set_arguments();
+        if (!_node->is_type<sync_tensor>()) { // skip set args for sync_tensor p2p kernel
+            set_arguments();
+        }
     }
+    // std::cout << "[debug] " << id() << " on_execute start " << std::endl;
     on_execute();
+    // std::cout << "[debug] " << id() << " on_execute end " << std::endl;
 
     if (!_node->is_type<condition>() && !_node->is_type<loop>()) {
         for (size_t i = 0; i < _outputs.size(); ++i) {
@@ -1723,7 +1749,9 @@ event::ptr primitive_inst::execute(const std::vector<event::ptr>& events) {
 
     {
         GPU_DEBUG_PROFILED_STAGE(instrumentation::pipeline_stage::inference);
+        // std::cout << "[debug] " << id() << " _impl->execute start " << std::endl;
         auto ev = _impl->execute(dependencies, *this);
+        // std::cout << "[debug] " << id() << " _impl->execute end " << std::endl;
 
         GPU_DEBUG_IF(!debug_config->dump_profiling_data.empty()) {
             get_network().get_stream().wait_for_events({ev});
@@ -1746,7 +1774,9 @@ void primitive_inst::set_arguments() {
     OV_ITT_SCOPED_TASK(ov::intel_gpu::itt::domains::intel_gpu_plugin, openvino::itt::handle("set_arguments: " + id()));
     GPU_DEBUG_PROFILED_STAGE(instrumentation::pipeline_stage::set_arguments);
     OPENVINO_ASSERT(_has_valid_input, id(), " has invalid/unset input");
+    // std::cout << "[debug] " << id() << " _impl->set_arguments start " << std::endl;
     _impl->set_arguments(*this);
+    // std::cout << "[debug] " << id() << " _impl->set_arguments end " << std::endl;
 }
 
 void primitive_inst::build_deps() {
@@ -1824,6 +1854,7 @@ primitive_inst::primitive_inst(network & network, program_node const& node, bool
         allocate_memory = _mem_allocated = available_allocate_memory(_impl_params->output_layouts);
     }
 
+    // std::cout << "[primitive_inst] if allocate_memory: " << allocate_memory << std::endl;
     if (allocate_memory) {
         // In case when output is mutable_data primitive, and other users dependencies are only used for
         // synchronization, The output memory of such primitive will be fused with mutable_data
@@ -1855,6 +1886,7 @@ primitive_inst::primitive_inst(network & network, program_node const& node, bool
             GPU_DEBUG_TRACE_DETAIL << id() << ": initialize impl with dynamic impl " << _impl->get_kernel_name() << std::endl;
             _dynamic_impl = _impl->clone();
             const int64_t shape_elements = node.get_total_shape_info_size();
+            // std::cout << "[primitive_inst] allocate_memory shape_elements: " << shape_elements << std::endl;
             _shape_info_memory = _network.get_engine().allocate_memory(layout{{shape_elements}, data_types::i32, format::bfyx});
         }
     }
@@ -1872,6 +1904,7 @@ primitive_inst::primitive_inst(network & network, program_node const& node, bool
 }
 
 memory::ptr primitive_inst::allocate_internal_buffer(size_t idx, bool reset) {
+    // std::cout << "[debug] " << id() << " allocate_internal_buffers start " << std::endl;
     if (_impl == nullptr || _outputs.empty() || _outputs[0] == nullptr)
         return nullptr;
     const auto& ibuf_layouts = _impl->get_internal_buffer_layouts();
@@ -1897,12 +1930,14 @@ memory::ptr primitive_inst::allocate_internal_buffer(size_t idx, bool reset) {
     const auto& inst_deps = _network.get_primitives(_node->get_dependencies());
 
     auto total_device_mem_size = std::accumulate(inst_deps.begin(), inst_deps.end(), size_t(0), device_mem_acc);
+    // std::cout << "[debug] " << id() << " allocate_internal_buffers total_device_mem_size: " << total_device_mem_size << std::endl;
     for (const auto& output : _outputs) {
         if (output->get_allocation_type() == allocation_type::usm_device)
             total_device_mem_size += output->size();
     }
 
     int64_t available_device_mem_size = engine.get_device_info().max_global_mem_size - total_device_mem_size;
+    // std::cout << "[debug] " << id() << " allocate_internal_buffers available_device_mem_size: " << available_device_mem_size << std::endl;
     // check if there is any device mem input
     if (engine.supports_allocation(allocation_type::usm_device)) {
         for (const auto& dep : inst_deps) {
@@ -2109,6 +2144,7 @@ memory::ptr primitive_inst::allocate_output(engine& _engine,
                                             bool is_output_buffer,
                                             memory* curr_memory,
                                             bool runtime_alloc) {
+    // std::cout << "[primitive_inst] allocate_output enter, get_output_layout idx: " << idx << std::endl;
     auto layout = impl_params.get_output_layout(idx);
     OPENVINO_ASSERT(layout.is_static() || layout.has_upper_bound(), "[GPU] Can't allocate output for dynamic layout");
     auto device_mem_acc = [&](size_t a, const cldnn::layout& l) {
@@ -2125,6 +2161,7 @@ memory::ptr primitive_inst::allocate_output(engine& _engine,
     const auto& total_device_input_mem_size = std::accumulate(impl_params.input_layouts.begin(), impl_params.input_layouts.end(), (uint64_t)0, device_mem_acc);
     if (total_device_input_mem_size > _engine.get_device_info().max_global_mem_size)
         usm_device_allocatable = false;
+    // std::cout << "[primitive_inst] allocate_output usm_device_allocatable: " << usm_device_allocatable << std::endl;
 
     bool reusable_across_network = (runtime_alloc && _node.is_dynamic_output_layout())
                                     || (!_node.is_dynamic_output_layout() && !user_requesting_mem_reuse_false(_node));
@@ -2139,17 +2176,31 @@ memory::ptr primitive_inst::allocate_output(engine& _engine,
     // Also if the successor of a node is an cpu, then memory needs to be lockable.
     bool is_cpu = _node.get_selected_impl() ? _node.get_selected_impl()->is_cpu() :
                                               _node.get_preferred_impl_type() == impl_types::cpu;
+    // std::cout << "[primitive_inst] allocate_output is_cpu: " << is_cpu << std::endl;
     auto use_lockable_memory =
         is_output_buffer || is_cpu ||
         has_any_cpu_user_not_shape_of(_node.get_users()) ||
         !_engine.supports_allocation(allocation_type::usm_device) ||
-        (_node.is_shape_infer_dep() && _engine.get_device_info().dev_type == device_type::integrated_gpu) ||
-        // lockable memory for FC is TP enabled, as we need to do allreduce/allgather for outputs, to be optimized further
-        (_node.is_type<fully_connected>() && _node.as<fully_connected>().w_size != 1);
+        (_node.is_shape_infer_dep() && _engine.get_device_info().dev_type == device_type::integrated_gpu);
+        // // lockable memory for FC is TP enabled, as we need to do allreduce/allgather for outputs, to be optimized further
+        // (_node.is_type<fully_connected>() && _node.as<fully_connected>().w_size != 1);
+    // std::cout << "[primitive_inst:" << _node.id() << "] allocate_output use_lockable_memory: " << use_lockable_memory << std::endl;
     const auto& lockable_mem_type = _engine.get_lockable_preferred_memory_allocation_type(layout.format.is_image_2d());
 
     auto alloc_type = use_lockable_memory ? lockable_mem_type
                     : !usm_device_allocatable ? lockable_mem_type : allocation_type::usm_device;
+    // std::cout << "[primitive_inst:" << _node.id() << "] allocate_output 1 alloc_type: " << alloc_type << ", is_internal: " << is_internal << std::endl;
+    // if (_node.is_type<sync_tensor>()) {
+    //     alloc_type = allocation_type::usm_host;
+    // }
+
+    if (_node.is_type<fully_connected>() && _node.as<fully_connected>().w_size != 1) {
+        alloc_type = allocation_type::cl_mem;
+    }
+    if (_node.is_type<sync_tensor>()) {
+        alloc_type = allocation_type::cl_mem;
+    }
+    // std::cout << "[primitive_inst:" << _node.id() << "] allocate_output 2 alloc_type: " << alloc_type << ", is_internal: " << is_internal << std::endl;
 
     if (is_internal) {
         bool is_reorder_weights = _node.is_type<reorder>() && _node.as<reorder>().get_primitive()->weights_reorder_params;
@@ -2159,6 +2210,7 @@ memory::ptr primitive_inst::allocate_output(engine& _engine,
             if (is_internal && is_reorder_weights &&
                 _engine.supports_allocation(allocation_type::usm_device))
                 alloc_type = allocation_type::usm_device;
+            // std::cout << "[primitive_inst] allocate_output get_memory_from_pool 1 alloc_type: " << alloc_type << std::endl;
             return get_memory_from_pool(_engine,
                                         net_id,
                                         pool,
@@ -2179,6 +2231,7 @@ memory::ptr primitive_inst::allocate_output(engine& _engine,
         GPU_DEBUG_LOG << "[" << _node.id() << ": output]" << std::endl;
         return ov::intel_gpu::allocate_memory_evenif_zero_bytes(_engine, layout, alloc_type, reset);
     } else {
+        std::cout << "[primitive_inst] allocate_output get_memory_from_pool 2 alloc_type: " << alloc_type << std::endl;
         return get_memory_from_pool(_engine,
                                     net_id,
                                     pool,
@@ -2193,10 +2246,12 @@ memory::ptr primitive_inst::allocate_output(engine& _engine,
 }
 
 std::vector<memory::ptr> primitive_inst::allocate_outputs(kernel_impl_params* updated_params, bool reset_mem, bool runtime_alloc) {
+    // std::cout << "[primitive_inst] allocate_outputs " << std::endl;
     std::vector<memory::ptr> outputs;
     auto impl_params = updated_params != nullptr ? *updated_params : *_impl_params;
     auto& out_layouts = impl_params.output_layouts;
     for (size_t i = 0; i < get_node().get_outputs_count() ; ++i) {
+        // std::cout << "[primitive_inst] allocate_outputs i: " << i << std::endl;
         // skip mem alloc for current rank, as it will share in on_execute
         auto skip_alloc = [&](int index) {
             if (out_layouts[index].is_dynamic() && !out_layouts[index].has_upper_bound())
@@ -2208,9 +2263,12 @@ std::vector<memory::ptr> primitive_inst::allocate_outputs(kernel_impl_params* up
         if (skip_alloc(i)) {
             outputs.push_back(memory::ptr());
         } else {
+            // std::cout << "[primitive_inst] allocate_outputs i: " << i << ", size: " << _outputs.size() << std::endl;
             auto current_memory_ptr = _outputs.size() > i ? output_memory_ptr(i).get() : nullptr;
+            // std::cout << "[primitive_inst] allocate_outputs current_memory_ptr: " << current_memory_ptr << std::endl;
             auto is_output = is_output_buffer(this, runtime_alloc);
 
+            // std::cout << "[primitive_inst] allocate_outputs i: " << i << " start, outputs.size: " << outputs.size() << std::endl;
             outputs.push_back(allocate_output(_network.get_engine(),
                                             _network.get_memory_pool(),
                                             *_node,

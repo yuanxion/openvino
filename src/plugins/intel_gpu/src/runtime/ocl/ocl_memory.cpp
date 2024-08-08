@@ -36,7 +36,8 @@ static int get_cl_map_type(mem_lock_type type) {
 gpu_buffer::gpu_buffer(ocl_engine* engine,
                        const layout& layout)
     : lockable_gpu_mem(), memory(engine, layout, allocation_type::cl_mem, nullptr)
-    , _buffer(engine->get_cl_context(), CL_MEM_READ_WRITE, size()) {
+    , _buffer(engine->get_cl_context(), CL_MEM_READ_WRITE, size() < 8 * 1024 ? 8 * 1024 : size()) {
+    printf("[gpu_buffer] size(): %ld, < 8 * 1024 ? \n", size());
     m_mem_tracker = std::make_shared<MemoryTracker>(engine, _buffer.get(), layout.bytes_count(), allocation_type::cl_mem);
 }
 
@@ -613,6 +614,7 @@ event::ptr gpu_usm::copy_from(stream& stream, const void* host_ptr, bool blockin
         dst_ptr = reinterpret_cast<void*>(tmp_dst_ptr);
     }
     data_size = (data_size == 0) ? _bytes_count : data_size;
+    // printf("[ocl memory] gpu_usm _bytes_count: %ld, data_size: %ld\n", _bytes_count, data_size);
     auto ev = blocking ? stream.create_user_event(true) : stream.create_base_event();
     cl::Event* ev_ocl = blocking ? nullptr : &downcast<ocl_event>(ev.get())->get();
     try {
