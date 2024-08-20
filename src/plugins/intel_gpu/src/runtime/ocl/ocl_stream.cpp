@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <iostream>
 
 // NOTE: Due to buggy scope transition of warnings we need to disable warning in place of use/instantation
 //       of some types (even though we already disabled them in scope of definition of these types).

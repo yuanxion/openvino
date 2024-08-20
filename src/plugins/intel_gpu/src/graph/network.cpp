@@ -442,6 +442,21 @@ network::network(program::ptr program, stream::ptr stream, uint16_t stream_id, o
 
 network::~network() {
     GPU_DEBUG_IF(debug_configuration::get_instance()->host_time_profiling) {
+        if (tp_host_times["fc"].size() >= 2) {
+            double first = static_cast<double>(tp_host_times["fc"][0]);
+            double avg = static_cast<double>(
+                std::accumulate(tp_host_times["fc"].begin() + 1, tp_host_times["fc"].end(), (size_t)0, std::plus<size_t>()));
+            avg /= (tp_host_times["fc"].size() - 1);
+            std::string resolution = " us";
+            if (avg > 1000.0) {
+                resolution = " ms";
+                avg /= 1000.0;
+                first /= 1000.0;
+            }
+            GPU_DEBUG_COUT << "Network[" << net_id << "] First infer total fc host time: " << first << resolution << std::endl;
+            GPU_DEBUG_COUT << "Network[" << net_id << "] total fc avg host time: " << avg << resolution << std::endl;
+        }
+
         if (tp_host_times["sync_tensor"].size() >= 2) {
             double first = static_cast<double>(tp_host_times["sync_tensor"][0]);
             double avg = static_cast<double>(
@@ -456,6 +471,48 @@ network::~network() {
             GPU_DEBUG_COUT << "Network[" << net_id << "] First infer total sync tensor host time: " << first << resolution << std::endl;
             GPU_DEBUG_COUT << "Network[" << net_id << "] total sync tensor avg host time: " << avg << resolution << std::endl;
         }
+
+        // more profile for sync_tensor details
+        if (tp_host_times["ts_exec"].size() >= 2) {
+            std::vector<std::string> ts_items = {"ts_exec", "ts_event_wait", "ts_ctxs", "ts_sync_wait", "ts_sendbuf",
+                "ts_pre_p2p", "ts_p2p_kernel", "ts_post_p2p"};
+
+            for (const auto& item : ts_items) {
+                // iter
+                double sum_iter_first = static_cast<double>(tp_host_times[item][0]);
+                double avg_iter_first = sum_iter_first;
+                // each
+                size_t sum_each_first = tp_host_times[item + "_count"][0];
+                double avg_each_first = sum_iter_first / sum_each_first;
+
+                // iter
+                double sum_iter_left = static_cast<double>(
+                    std::accumulate(tp_host_times[item].begin() + 1, tp_host_times[item].end(), (size_t)0, std::plus<size_t>()));
+                double avg_iter_left = sum_iter_left / (tp_host_times[item].size() - 1);
+                // each
+                size_t sum_each_left = std::accumulate(tp_host_times[item + "_count"].begin() + 1,
+                    tp_host_times[item + "_count"].end(), (size_t)0, std::plus<size_t>());
+                double avg_each_left = sum_iter_left / sum_each_left;
+
+                std::string resolution = " us";
+                if (avg_iter_left > 1000.0) {
+                    resolution = " ms";
+                    sum_iter_first /= 1000.0;
+                    avg_iter_first /= 1000.0;
+                    avg_each_first /= 1000.0;
+                    sum_iter_left /= 1000.0;
+                    avg_iter_left /= 1000.0;
+                    avg_each_left /= 1000.0;
+                }
+                GPU_DEBUG_COUT << "Network[" << net_id << "] st First total " << item << " host time: " << sum_iter_first << resolution << std::endl;
+                GPU_DEBUG_COUT << "Network[" << net_id << "] st First avg.  " << item << " host time (iter): " << avg_iter_first << resolution << std::endl;
+                GPU_DEBUG_COUT << "Network[" << net_id << "] st First avg.  " << item << " host time (each): " << avg_each_first << resolution << std::endl;
+                GPU_DEBUG_COUT << "Network[" << net_id << "] st Other total " << item << " host time: " << sum_iter_left << resolution << std::endl;
+                GPU_DEBUG_COUT << "Network[" << net_id << "] st Other avg.  " << item << " host time (iter): " << avg_iter_left << resolution << std::endl;
+                GPU_DEBUG_COUT << "Network[" << net_id << "] st Other avg.  " << item << " host time (each): " << avg_each_left << resolution << std::endl;
+            }
+        }
+
         if (tp_host_times["concat"].size() >= 2) {
             double first = static_cast<double>(tp_host_times["concat"][0]);
             double avg = static_cast<double>(
@@ -469,6 +526,47 @@ network::~network() {
             }
             GPU_DEBUG_COUT << "Network[" << net_id << "] First infer total concat host time: " << first << resolution << std::endl;
             GPU_DEBUG_COUT << "Network[" << net_id << "] total concat avg host time: " << avg << resolution << std::endl;
+        }
+        // more profile for concat details
+        if (tp_host_times["ts_exec"].size() >= 2) {
+            std::vector<std::string> concat_ts_items = {"concat_ts_pre", "concat_ts_in_place_concat", "concat_ts_update_shape", "concat_ts_check_skip",
+                "concat_ts_do_runtime", "concat_ts_subgraph_exec", "concat_ts_dependencies1", "concat_ts_dependencies1_check", "concat_ts_set_args",
+                "concat_ts_on_exec", "concat_ts_dependencies2", "concat_ts_impl_exec", "concat_ts_wait_event", "concat_ts_end"};
+
+            for (const auto& item : concat_ts_items) {
+                // iter
+                double sum_iter_first = static_cast<double>(tp_host_times[item][0]);
+                double avg_iter_first = sum_iter_first;
+                // each
+                size_t sum_each_first = tp_host_times[item + "_count"][0];
+                double avg_each_first = sum_iter_first / sum_each_first;
+
+                // iter
+                double sum_iter_left = static_cast<double>(
+                    std::accumulate(tp_host_times[item].begin() + 1, tp_host_times[item].end(), (size_t)0, std::plus<size_t>()));
+                double avg_iter_left = sum_iter_left / (tp_host_times[item].size() - 1);
+                // each
+                size_t sum_each_left = std::accumulate(tp_host_times[item + "_count"].begin() + 1,
+                    tp_host_times[item + "_count"].end(), (size_t)0, std::plus<size_t>());
+                double avg_each_left = sum_iter_left / sum_each_left;
+
+                std::string resolution = " us";
+                if (avg_iter_left > 1000.0) {
+                    resolution = " ms";
+                    sum_iter_first /= 1000.0;
+                    avg_iter_first /= 1000.0;
+                    avg_each_first /= 1000.0;
+                    sum_iter_left /= 1000.0;
+                    avg_iter_left /= 1000.0;
+                    avg_each_left /= 1000.0;
+                }
+                GPU_DEBUG_COUT << "Network[" << net_id << "] concat First total " << item << " host time: " << sum_iter_first << resolution << std::endl;
+                GPU_DEBUG_COUT << "Network[" << net_id << "] concat First avg.  " << item << " host time (iter): " << avg_iter_first << resolution << std::endl;
+                GPU_DEBUG_COUT << "Network[" << net_id << "] concat First avg.  " << item << " host time (each): " << avg_each_first << resolution << std::endl;
+                GPU_DEBUG_COUT << "Network[" << net_id << "] concat Other total " << item << " host time: " << sum_iter_left << resolution << std::endl;
+                GPU_DEBUG_COUT << "Network[" << net_id << "] concat Other avg.  " << item << " host time (iter): " << avg_iter_left << resolution << std::endl;
+                GPU_DEBUG_COUT << "Network[" << net_id << "] concat Other avg.  " << item << " host time (each): " << avg_each_left << resolution << std::endl;
+            }
         }
     }
     if (_program != nullptr)
@@ -1053,13 +1151,22 @@ void network::execute_impl(const std::vector<event::ptr>& events) {
     const size_t flush_frequency = needs_flushing ? 16 : 0;
     size_t executed_prims = 0;
     std::map<std::string, std::vector<int64_t>> tp_host_times_each_iter;
+    std::map<std::string, std::vector<int64_t>> sync_tensor_timestamps;
+    std::vector<std::string> ts_items = {"ts_exec", "ts_event_wait", "ts_ctxs", "ts_sync_wait", "ts_sendbuf",
+        "ts_pre_p2p", "ts_p2p_kernel", "ts_post_p2p"};
+    std::vector<std::string> concat_ts_items = {"concat_ts_pre", "concat_ts_in_place_concat", "concat_ts_update_shape", "concat_ts_check_skip",
+        "concat_ts_do_runtime", "concat_ts_subgraph_exec", "concat_ts_dependencies1", "concat_ts_dependencies1_check", "concat_ts_set_args",
+        "concat_ts_on_exec", "concat_ts_dependencies2", "concat_ts_impl_exec", "concat_ts_wait_event", "concat_ts_end"};
+
+    tp_host_times["fc"];
     tp_host_times["sync_tensor"];
     tp_host_times["concat"];
+    tp_host_times_each_iter["fc"];
     tp_host_times_each_iter["sync_tensor"];
     tp_host_times_each_iter["concat"];
     for (auto& inst : _exec_order) {
         auto start = std::chrono::high_resolution_clock::now();
-        if (inst->get_node().is_type<sync_tensor>() || inst->get_node().is_type<concatenation>()) {
+        if (inst->get_node().is_type<fully_connected>() || inst->get_node().is_type<sync_tensor>() || inst->get_node().is_type<concatenation>()) {
             start = std::chrono::high_resolution_clock::now();
         }
         // Load binary dump for input layers
@@ -1206,28 +1313,65 @@ void network::execute_impl(const std::vector<event::ptr>& events) {
                 }
             }
         }
-        if (inst->get_node().is_type<sync_tensor>() || inst->get_node().is_type<concatenation>()) {
+        if (inst->get_node().is_type<fully_connected>() || inst->get_node().is_type<sync_tensor>() || inst->get_node().is_type<concatenation>()) {
             auto end = std::chrono::high_resolution_clock::now();
             GPU_DEBUG_IF(debug_configuration::get_instance()->host_time_profiling) {
-                if (inst->get_node().is_type<sync_tensor>()) {
+                if (inst->get_node().is_type<fully_connected>()) {
+                    tp_host_times_each_iter["fc"].push_back(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
+                } else if (inst->get_node().is_type<sync_tensor>()) {
                     tp_host_times_each_iter["sync_tensor"].push_back(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
+                    // more profile for sync_tensor details
+                    std::map<std::string, std::vector<int64_t>>& timestamps = inst->get_host_timestamps();
+                    for (const auto& item : ts_items) {
+                        sync_tensor_timestamps[item].push_back(timestamps[item].back());
+                    }
                 } else {
                     tp_host_times_each_iter["concat"].push_back(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
+                    // more profile for concat details
+                    std::map<std::string, std::vector<int64_t>>& timestamps = inst->get_host_timestamps();
+                    for (const auto& item : concat_ts_items) {
+                        sync_tensor_timestamps[item].push_back(timestamps[item].back());
+                    }
                 }
             }
         }
     }
     // statistic for each iter
     GPU_DEBUG_IF(debug_configuration::get_instance()->host_time_profiling) {
+        if (tp_host_times_each_iter["fc"].size() >= 1) {
+            const auto begin = std::begin(tp_host_times_each_iter["fc"]);
+            const auto end = std::end(tp_host_times_each_iter["fc"]);
+            tp_host_times["fc"].push_back(std::accumulate(begin, end, (size_t)0, std::plus<size_t>()));
+        }
+
         if (tp_host_times_each_iter["sync_tensor"].size() >= 1) {
             const auto begin = std::begin(tp_host_times_each_iter["sync_tensor"]);
             const auto end = std::end(tp_host_times_each_iter["sync_tensor"]);
             tp_host_times["sync_tensor"].push_back(std::accumulate(begin, end, (size_t)0, std::plus<size_t>()));
+
+            // more profile for sync_tensor details
+            for (const auto& item : ts_items) {
+                const auto item_begin = std::begin(sync_tensor_timestamps[item]);
+                const auto item_end = std::end(sync_tensor_timestamps[item]);
+                size_t count = sync_tensor_timestamps[item].size();
+                auto sum_iter = std::accumulate(item_begin, item_end, (size_t)0, std::plus<size_t>());
+                tp_host_times[item].push_back(sum_iter);
+                tp_host_times[item + "_count"].push_back(count);
+            }
         }
         if (tp_host_times_each_iter["concat"].size() >= 1) {
             const auto begin = std::begin(tp_host_times_each_iter["concat"]);
             const auto end = std::end(tp_host_times_each_iter["concat"]);
             tp_host_times["concat"].push_back(std::accumulate(begin, end, (size_t)0, std::plus<size_t>()));
+            // more profile for concat details
+            for (const auto& item : concat_ts_items) {
+                const auto item_begin = std::begin(sync_tensor_timestamps[item]);
+                const auto item_end = std::end(sync_tensor_timestamps[item]);
+                size_t count = sync_tensor_timestamps[item].size();
+                auto sum_iter = std::accumulate(item_begin, item_end, (size_t)0, std::plus<size_t>());
+                tp_host_times[item].push_back(sum_iter);
+                tp_host_times[item + "_count"].push_back(count);
+            }
         }
     }
     // print '-data_shape' option for benchmark_app
