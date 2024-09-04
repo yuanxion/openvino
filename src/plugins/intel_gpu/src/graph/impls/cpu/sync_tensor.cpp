@@ -572,39 +572,69 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
         return sync_events;
     }
 
-    void do_self_rank_reduce(cl_command_queue& queue, size_t element_count, cl_mem& src, std::vector<uint8_t>& srcBuf, size_t w_rank) {
+
+    void check_typed_values(const ov::element::Type_t& data_type, size_t element_count,
+        std::vector<uint8_t>& srcBuf, size_t w_rank) {
+        printf("[do_self_rank_reduce: %ld] size: %ld \n", w_rank, srcBuf.size());
+        switch (data_type) {
+        case ov::element::f16: {
+            uint16_t* ptr = reinterpret_cast<uint16_t*> (srcBuf.data());
+            for (size_t i = 0; i < element_count; ++i) {
+                ov::float16 val = ov::float16::from_bits(ptr[i]);
+                std::cout << " [" << i << "] " << val << std::endl;
+            }
+            break;
+        }
+        case ov::element::i8: {
+            int8_t* ptr = reinterpret_cast<int8_t*> (srcBuf.data());
+            for (size_t i = 0; i < element_count; ++i) {
+                std::cout << " [" << i << "] " << ptr[i] << std::endl;
+            }
+            break;
+        }
+        case ov::element::f32: {
+            float* ptr = reinterpret_cast<float*> (srcBuf.data());
+            for (size_t i = 0; i < element_count; ++i) {
+                std::cout << " [" << i << "] " << ptr[i] << std::endl;
+            }
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
+    void do_self_rank_reduce(cl_command_queue& queue, const ov::element::Type_t& data_type, size_t element_count,
+        cl_mem& src, std::vector<uint8_t>& srcBuf, size_t w_rank) {
         cl_int err;
         err = clEnqueueReadBuffer(queue, src, CL_TRUE, 0, srcBuf.size(), srcBuf.data(), 0, NULL, NULL);
         CHECK_OCL_ERROR_EXIT(err, "clEnqueueReadBuffer failed");
-        clFinish(queue);
+        // clFinish(queue);
 
-        uint16_t* ptr = reinterpret_cast<uint16_t*> (srcBuf.data());
-        printf("[do_self_rank_reduce: %ld] size: %ld \n", w_rank, srcBuf.size());
-        for (size_t i = 0; i < element_count; ++i) {
-            ov::float16 f = ov::float16::from_bits(ptr[i]);
-            std::cout << " [" << i << "] " << f.to_string();
-        }
-        std::cout << std::endl;
+        check_typed_values(data_type, element_count, srcBuf, w_rank);
     }
 
-    void do_self_rank_all_reduce(cl_command_queue& queue, size_t element_count, cl_mem& dst, std::vector<uint8_t>& dstBuf, size_t w_rank) {
+    void do_self_rank_all_reduce(cl_command_queue& queue, const ov::element::Type_t& data_type, size_t element_count,
+        cl_mem& dst, std::vector<uint8_t>& dstBuf, size_t w_rank) {
         cl_int err;
         err = clEnqueueWriteBuffer(queue, dst, CL_TRUE, 0, dstBuf.size(), dstBuf.data(), 0, NULL, NULL);
         CHECK_OCL_ERROR_EXIT(err, "clEnqueueWriteBuffer failed");
         // clFinish(queue);
 
-        // check
         std::vector<uint8_t> tempBuf(dstBuf.size(), 0);
         err = clEnqueueReadBuffer(queue, dst, CL_TRUE, 0, tempBuf.size(), tempBuf.data(), 0, NULL, NULL);
         CHECK_OCL_ERROR_EXIT(err, "clEnqueueReadBuffer failed");
         // clFinish(queue);
-        uint16_t* ptr = reinterpret_cast<uint16_t*> (tempBuf.data());
-        printf("[do_self_rank_all_reduce: %ld] size: %ld \n", w_rank, tempBuf.size());
-        for (size_t i = 0; i < element_count; ++i) {
-            ov::float16 f = ov::float16::from_bits(ptr[i]);
-            std::cout << " [" << i << "] " << f.to_string();
-        }
-        std::cout << std::endl;
+
+        check_typed_values(data_type, element_count, dstBuf, w_rank);
+
+        // uint16_t* ptr = reinterpret_cast<uint16_t*> (tempBuf.data());
+        // printf("[do_self_rank_all_reduce: %ld] size: %ld \n", w_rank, tempBuf.size());
+        // for (size_t i = 0; i < element_count; ++i) {
+        //     ov::float16 f = ov::float16::from_bits(ptr[i]);
+        //     std::cout << " [" << i << "] " << f.to_string();
+        // }
+        // std::cout << std::endl;
     }
 
     event::ptr execute_impl(const std::vector<event::ptr>& events, sync_tensor_inst& instance) override {
@@ -626,6 +656,8 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
         auto sub_mem_mgr = instance.get_network().get_sub_mem_mgr();
         auto id = sub_mem_mgr->get_memory_id(w_rank);
         sub_mem_mgr->set_memory_used(id, w_rank);
+        std::vector<uint8_t>& sharedBuf = sub_mem_mgr->sharedHostBuf;
+
         auto start_1 = perf_dump_start();
         while (true) {
             std::lock_guard<std::mutex> lock(sub_mem_mgr->_flagMutex);
@@ -652,16 +684,25 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
         auto dst_cl_buf = std::dynamic_pointer_cast<const ocl::gpu_buffer>(instance.output_memory_ptr(dst_rank))->get_buffer().get();
 
         size_t dst_size = instance.output_memory(dst_rank).size();
+        std::vector<uint8_t> srcBuf(dst_size, 0);
+
         size_t element_count = dst_size;
-        auto& data_type = instance.output_memory(dst_rank).get_layout().data_type;
+        // auto& data_type = instance.output_memory(dst_rank).get_layout().data_type;
+        const ov::element::Type_t& data_type = instance.output_memory(dst_rank).get_layout().data_type;
+        // using Type = typename ov::element_type_traits<data_type>::value_type;
+        auto bitwidth = ov::element::Type(data_type).bitwidth();
+
         switch (data_type) {
         case ov::element::f16:
+            std::cout << "f16 bits: " << bitwidth << std::endl;
             element_count /= 2;
             break;
         case ov::element::i8:
-            element_count /= 4;
+            std::cout << "i8 bits: " << bitwidth << std::endl;
             break;
         case ov::element::f32:
+            std::cout << "f32 bits: " << bitwidth << std::endl;
+            element_count /= 4;
             break;
         default:
             std::cout << "Unknow data type, exiting..." << std::endl;
@@ -669,9 +710,7 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
         }
 
         std::cout << "[sync_tensor: " << w_rank << "] dst_size: " << dst_size << ", element_count: " << element_count << std::endl;
-        std::vector<uint8_t> srcBuf(dst_size, 0);
-        do_self_rank_reduce(queue, element_count, src_cl_buf, srcBuf, w_rank);
-        std::vector<uint8_t>& sharedBuf = sub_mem_mgr->sharedHostBuf;
+        do_self_rank_reduce(queue, data_type, element_count, src_cl_buf, srcBuf, w_rank);
 
         // sub_mem_mgr->_memorys_table[id][w_rank].send_buf = instance.output_memory(w_rank).buffer_ptr();
         {
@@ -680,17 +719,42 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
                 sharedBuf.resize(dst_size);
             }
             // reduce
-            uint16_t* dst_ptr = reinterpret_cast<uint16_t*>(sharedBuf.data());
-            uint16_t* src_ptr = reinterpret_cast<uint16_t*>(srcBuf.data());
             std::cout << "[sync_tensor: " << w_rank << "] self reduce "<< std::endl;
-            for (size_t i = 0; i < element_count; ++i) {
-                ov::float16 f = ov::float16::from_bits(dst_ptr[i]);
-                std::cout << " [" << i << "] f = " << f.to_string();
-                f += ov::float16::from_bits(src_ptr[i]);
-                std::cout << " [" << i << "] f += " << f.to_string();
-                dst_ptr[i] = f.to_bits();
+            switch (data_type) {
+            case ov::element::f16: {
+                uint16_t* dst_ptr = reinterpret_cast<uint16_t*>(sharedBuf.data());
+                uint16_t* src_ptr = reinterpret_cast<uint16_t*>(srcBuf.data());
+                for (size_t i = 0; i < element_count; ++i) {
+                    ov::float16 f = ov::float16::from_bits(dst_ptr[i]);
+                    std::cout << " [" << i << "] f = " << f << std::endl;
+                    f += ov::float16::from_bits(src_ptr[i]);
+                    std::cout << " [" << i << "] f += " << f << std::endl;
+                    dst_ptr[i] = f.to_bits();
+                }
+                break;
             }
-            std::cout << std::endl;
+            case ov::element::i8: {
+                int8_t* dst_ptr = reinterpret_cast<int8_t*>(sharedBuf.data());
+                int8_t* src_ptr = reinterpret_cast<int8_t*>(srcBuf.data());
+                for (size_t i = 0; i < element_count; ++i) {
+                    dst_ptr[i] += src_ptr[i];
+                    std::cout << " [" << i << "] src: " << src_ptr[i] << ", dst_ptr: " << dst_ptr[i] << std::endl;
+                }
+                break;
+            }
+            case ov::element::f32: {
+                float* dst_ptr = reinterpret_cast<float*>(sharedBuf.data());
+                float* src_ptr = reinterpret_cast<float*>(srcBuf.data());
+                for (size_t i = 0; i < element_count; ++i) {
+                    dst_ptr[i] += src_ptr[i];
+                    std::cout << " [" << i << "] src: " << src_ptr[i] << ", dst_ptr: " << dst_ptr[i] << std::endl;
+                }
+                break;
+            }
+            default:
+                break;
+            }
+
             sub_mem_mgr->_memorys_table[id][w_rank].recv_bufs = instance.get_output_memorys();
             sub_mem_mgr->_memorys_table[id][w_rank].flag = true;
         }
@@ -741,7 +805,7 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
                     // }
                     // // p2p_helper.destory_remote_mem(dst_cl_buf);
 
-                    do_self_rank_all_reduce(queue, element_count, dst_cl_buf, sharedBuf, w_rank);
+                    do_self_rank_all_reduce(queue, data_type, element_count, dst_cl_buf, sharedBuf, w_rank);
                     wait_list[idx] = 0;
                 }
                 wait_size += wait_list[idx];
