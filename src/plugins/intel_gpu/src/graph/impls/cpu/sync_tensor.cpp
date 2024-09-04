@@ -140,353 +140,6 @@ static void perf_dump_done(const std::chrono::_V2::system_clock::time_point& sta
     }
 }
 
-class ocl_p2p_helper {
-public:
-    ocl_p2p_helper() {}
-    ~ocl_p2p_helper() {
-        if (inited_ == true) {
-            clReleaseKernel(kernel);
-            clReleaseProgram(program);
-        }
-    }
-
-    uint64_t derive_handle(cl_mem clbuf) {
-        cl_int err;
-        uint64_t fd;
-        err = clGetMemObjectInfo(clbuf, CL_MEM_ALLOCATION_HANDLE_INTEL, sizeof(fd), &fd, NULL);
-        CHECK_OCL_ERROR(err, "clGetMemObjectInfo - CL_MEM_ALLOCATION_HANDLE_INTEL failed");
-        return fd;
-    }
-
-    cl_mem map_remote_mem(cl_context context, cl_mem clbuf, size_t size) {
-        cl_int err;
-        const auto start = perf_dump_start();
-        uint64_t fd = derive_handle(clbuf);
-
-        // Create extMemBuffer of type cl_mem from fd.
-        cl_mem_properties extMemProperties[] = {(cl_mem_properties)CL_EXTERNAL_MEMORY_HANDLE_DMA_BUF_KHR,
-                                                (cl_mem_properties)fd,
-                                                0};
-        cl_mem extMemBuffer = clCreateBufferWithProperties(context, extMemProperties, 0, size, NULL, &err);
-        CHECK_OCL_ERROR(err, "clCreateBufferWithProperties - CL_EXTERNAL_MEMORY_HANDLE_DMA_BUF_KHR failed");
-
-        if (0) {
-            cl_mem_object_type type;
-            err = clGetMemObjectInfo(extMemBuffer, CL_MEM_TYPE, sizeof(type), &type, NULL);
-            CHECK_OCL_ERROR(err, "clGetMemObjectInfo - CL_MEM_TYPE failed");
-            printf("size = %ld, remote_type = %d\n", size, type);
-        }
-
-        perf_dump_done(start, std::string("derive_map_remote_mem host time"));
-        return extMemBuffer;
-    }
-
-    cl_mem map_remote_mem(cl_context context, uint64_t fd, size_t size) {
-        cl_int err;
-        const auto start = perf_dump_start();
-        // Create extMemBuffer of type cl_mem from fd.
-        cl_mem_properties extMemProperties[] = {(cl_mem_properties)CL_EXTERNAL_MEMORY_HANDLE_DMA_BUF_KHR,
-                                                (cl_mem_properties)fd,
-                                                0};
-        cl_mem extMemBuffer = clCreateBufferWithProperties(context, extMemProperties, 0, size, NULL, &err);
-        CHECK_OCL_ERROR(err, "clCreateBufferWithProperties - CL_EXTERNAL_MEMORY_HANDLE_DMA_BUF_KHR failed");
-
-        perf_dump_done(start, std::string("map_remote_mem host time"));
-        return extMemBuffer;
-    }
-
-    void destory_remote_mem(cl_mem clbuf) {
-        clReleaseMemObject(clbuf);
-    }
-
-    void remote_write(cldnn::stream& stream, cl_mem src, cl_mem dst, size_t elemCount) {
-        cl_int err;
-        const auto start = perf_dump_start();
-        auto& ocl_stream = downcast<ocl::ocl_stream>(stream);
-        // Use 4 bytes to copy in each work item
-        const char write_kernel_code[] = R"(
-            kernel void write_to_remote(const global int *src, global int *dst)
-            {
-                const int id = get_global_id(0);
-                //printf("write_to_remote: dst[%d] = %d, src[%d] = %d\n", id, dst[id], id, src[id]);
-                dst[id] = src[id];
-            })";
-        const char kernelName[] = "write_to_remote";
-
-        cl_uint knlcount = 1;
-        const char* knlstrList[] = {write_kernel_code};
-        size_t knlsizeList[] = {strlen(write_kernel_code)};
-
-        if (inited_ == false) {
-            cl_context context = ocl_stream.get_engine().get_cl_context().get();
-            program = clCreateProgramWithSource(context, knlcount, knlstrList, knlsizeList, &err);
-            CHECK_OCL_ERROR_EXIT(err, "clCreateProgramWithSource failed");
-
-            std::string buildopt = "-cl-std=CL2.0 -cl-intel-greater-than-4GB-buffer-required";
-            err = clBuildProgram(program, 0, NULL, buildopt.c_str(), NULL, NULL);
-            if (err < 0) {
-                size_t logsize = 0;
-                auto device = ocl_stream.get_engine().get_cl_device().get();
-                err = clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, NULL, &logsize);
-                CHECK_OCL_ERROR_EXIT(err, "clGetProgramBuildInfo failed");
-
-                std::vector<char> logbuf(logsize + 1, 0);
-                err = clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, logsize + 1, logbuf.data(), NULL);
-                CHECK_OCL_ERROR_EXIT(err, "clGetProgramBuildInfo failed");
-                printf("%s\n", logbuf.data());
-
-                exit(1);
-            }
-
-            kernel = clCreateKernel(program, kernelName, &err);
-            CHECK_OCL_ERROR_EXIT(err, "clCreateKernel failed");
-            inited_ = true;
-        }
-
-        if (0) {
-            // std::lock_guard<std::mutex> lock(debug_mutex);
-            size_t data_size = 0;
-            err = clGetMemObjectInfo(src, CL_MEM_SIZE, sizeof(size_t), &data_size, NULL);
-            CHECK_OCL_ERROR(err, "clGetMemObjectInfo - CL_MEM_SIZE failed");
-            printf("src: size = %ld, data_size = %ld\n", elemCount, data_size);
-
-            err = clGetMemObjectInfo(dst, CL_MEM_SIZE, sizeof(size_t), &data_size, NULL);
-            CHECK_OCL_ERROR(err, "clGetMemObjectInfo - CL_MEM_SIZE failed");
-            printf("dst: size = %ld, data_size = %ld\n", elemCount, data_size);
-        }
-
-        err = clSetKernelArg(kernel, 0, sizeof(cl_mem), &src);
-        CHECK_OCL_ERROR_EXIT(err, "clSetKernelArg src failed");
-
-        err = clSetKernelArg(kernel, 1, sizeof(cl_mem), &dst);
-        CHECK_OCL_ERROR_EXIT(err, "clSetKernelArg dst failed");
-
-        size_t global_size[] = {elemCount / 4};
-        auto queue = ocl_stream.get_cl_queue().get();
-        err = clEnqueueNDRangeKernel(queue, kernel, 1, nullptr, global_size, nullptr, 0, nullptr, nullptr);
-        CHECK_OCL_ERROR_EXIT(err, "clEnqueueNDRangeKernel failed");
-        clFinish(queue);  // todo: opt performance by removing clFinish
-
-        perf_dump_done(start, std::string("ocl p2p host time for") + std::to_string(elemCount) + std::string(" bytes"));
-    }
-
-    void finish(cldnn::stream& stream) {
-        auto& ocl_stream = downcast<ocl::ocl_stream>(stream);
-        auto queue = ocl_stream.get_cl_queue().get();
-        clFinish(queue);
-    }
-
-    event::ptr remote_copy(cldnn::stream& stream, cl_mem src, cl_mem dst, size_t size) {
-        const auto start = perf_dump_start();
-        auto& ocl_stream = downcast<ocl::ocl_stream>(stream);
-        auto queue = ocl_stream.get_cl_queue().get();
-        // auto usr_event = ocl_stream.create_user_event(false);
-        // cl_event& ret = std::dynamic_pointer_cast<ocl::ocl_event>(usr_event)->get().get();
-        cl_event ret;
-        clEnqueueCopyBuffer(queue, src, dst, 0, 0, size, 0, NULL, &ret);
-        // auto event = ocl_stream.create_event(cl::Event(ret));
-        // clFinish(queue);
-        perf_dump_done(start, std::string("p2p copy host time for") + std::to_string(size) + std::string(" bytes"));
-        // return usr_event;
-        return ocl_stream.create_event(cl::Event(ret));
-        // return stream.create_user_event(true);
-    }
-
-private:
-    bool inited_ = false;
-    cl_program program;
-    cl_kernel kernel;
-};
-
-#define KERNEL_DATA_TYPE_NUM 3
-typedef enum _kernel_data_type {
-    e_type_fp16 = 0,
-    e_type_int8 = 1,
-    e_type_fp32 = 2,
-} kernel_data_type;
-
-inline kernel_data_type element_type_to_kernel_data_type(ov::element::Type_t element_type) {
-    switch (element_type) {
-    case ov::element::f16:
-        return kernel_data_type::e_type_fp16;
-    case ov::element::i8:
-        return kernel_data_type::e_type_int8;
-    case ov::element::f32:
-        return kernel_data_type::e_type_fp32;
-    default:
-        printf("Error: unsupported element type for kernel adder - %s\n",
-               ov::element::Type(element_type).to_string().c_str());
-        break;
-    }
-    return kernel_data_type::e_type_int8;
-}
-
-static void dump_cl_buf(cl_command_queue queue, cl_mem clbuf, size_t count, size_t offset) {
-    cl_int err;
-    std::vector<float> outBuf(count, 0);
-    err = clEnqueueReadBuffer(queue, clbuf, CL_TRUE, offset, count * 4, outBuf.data(), 0, NULL, NULL);
-    CHECK_OCL_ERROR_EXIT(err, "clEnqueueReadBuffer failed");
-    clFinish(queue);
-
-    printf("The first %ld elements in cl_mem = %p are: \n", count, clbuf);
-    for (int i = 0; i < static_cast<int>(count); i++) {
-        printf("%f, ", outBuf[i]);
-        if (i && i % 16 == 0)
-            printf("\n");
-    }
-    printf("\n\n");
-}
-
-class simple_ocl_add {
-public:
-    simple_ocl_add() {}
-    ~simple_ocl_add() {
-        if (inited_ == true) {
-            if (kernels[kernel_data_type::e_type_fp16])
-                clReleaseKernel(kernels[kernel_data_type::e_type_fp16]);
-            if (kernels[kernel_data_type::e_type_int8])
-                clReleaseKernel(kernels[kernel_data_type::e_type_int8]);
-            clReleaseProgram(program);
-        }
-    }
-
-    cl_kernel create_kernel(cldnn::stream& stream, const char* kernel_code, const char* kernelName) {
-        cl_int err;
-        auto& ocl_stream = downcast<ocl::ocl_stream>(stream);
-
-        cl_uint knlcount = 1;
-        const char* knlstrList[] = {kernel_code};
-        size_t knlsizeList[] = {strlen(kernel_code)};
-
-        cl_context context = ocl_stream.get_engine().get_cl_context().get();
-        program = clCreateProgramWithSource(context, knlcount, knlstrList, knlsizeList, &err);
-        CHECK_OCL_ERROR_EXIT(err, "clCreateProgramWithSource failed");
-
-        std::string buildopt = "-cl-std=CL2.0 -cl-intel-greater-than-4GB-buffer-required";
-        err = clBuildProgram(program, 0, NULL, buildopt.c_str(), NULL, NULL);
-        if (err < 0) {
-            size_t logsize = 0;
-            auto device = ocl_stream.get_engine().get_cl_device().get();
-            err = clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, NULL, &logsize);
-            CHECK_OCL_ERROR_EXIT(err, "clGetProgramBuildInfo failed");
-
-            std::vector<char> logbuf(logsize + 1, 0);
-            err = clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, logsize + 1, logbuf.data(), NULL);
-            CHECK_OCL_ERROR_EXIT(err, "clGetProgramBuildInfo failed");
-            printf("%s\n", logbuf.data());
-
-            exit(1);
-        }
-
-        cl_kernel kernel = clCreateKernel(program, kernelName, &err);
-        CHECK_OCL_ERROR_EXIT(err, "clCreateKernel failed");
-        return kernel;
-    }
-
-    cl_kernel get_or_create_kernel_if_possible(cldnn::stream& stream, kernel_data_type type) {
-        if (type == kernel_data_type::e_type_fp16) {
-            if (kernels[type])
-                return kernels[type];
-            const char tensor_add_kernel_code_fp16[] = R"(
-            kernel void tensor_add_func_fp16(const global half *src, global half *dst)
-            {
-                const int id = get_global_id(0);
-                dst[id] += src[id];
-                // printf("tensor_add_func_fp16: dst[%d] = %f, src[%d] = %f\n", id, (float*)dst[id], id, (float*)src[id]);
-            })";
-            const char kernel_name_fp16[] = "tensor_add_func_fp16";
-            kernels[type] = create_kernel(stream, tensor_add_kernel_code_fp16, kernel_name_fp16);
-            return kernels[type];
-        } else if (type == kernel_data_type::e_type_int8) {
-            if (kernels[type])
-                return kernels[type];
-            const char tensor_add_kernel_code_int8[] = R"(
-            kernel void tensor_add_func_int8(const global char *src, global char *dst)
-            {
-                const int id = get_global_id(0);
-                dst[id] += src[id];
-                // printf("tensor_add_func_int8: dst[%d] = %d, src[%d] = %d\n", id, dst[id], id, src[id]);
-            })";
-            const char kernel_name_int8[] = "tensor_add_func_int8";
-            kernels[type] = create_kernel(stream, tensor_add_kernel_code_int8, kernel_name_int8);
-            return kernels[type];
-        } else if (type == kernel_data_type::e_type_fp32) {
-            if (kernels[type])
-                return kernels[type];
-            const char tensor_add_kernel_code_fp32[] = R"(
-            kernel void tensor_add_func_fp32(const global float *src, global float *dst)
-            {
-                const int id = get_global_id(0);
-                dst[id] += src[id];
-                // printf("tensor_add_func_fp32: dst[%d] = %f, src[%d] = %f\n", id, dst[id], id, src[id]);
-            })";
-            const char kernel_name_fp32[] = "tensor_add_func_fp32";
-            kernels[type] = create_kernel(stream, tensor_add_kernel_code_fp32, kernel_name_fp32);
-            return kernels[type];
-        } else {
-            printf("error: unsuport adder kernel data type %d\n", static_cast<int>(type));
-            exit(1);
-        }
-
-        return kernels[type];
-    }
-
-    event::ptr tensor_add(cldnn::stream& stream,
-                          cl_mem src,
-                          cl_mem dst,
-                          size_t element_count,
-                          kernel_data_type data_type) {
-        cl_int err;
-        auto& ocl_stream = downcast<ocl::ocl_stream>(stream);
-        const auto start = perf_dump_start();
-
-        cl_kernel kernel = get_or_create_kernel_if_possible(stream, data_type);
-        err = clSetKernelArg(kernel, 0, sizeof(cl_mem), &src);
-        CHECK_OCL_ERROR_EXIT(err, "clSetKernelArg src failed");
-
-        err = clSetKernelArg(kernel, 1, sizeof(cl_mem), &dst);
-        CHECK_OCL_ERROR_EXIT(err, "clSetKernelArg dst failed");
-
-        size_t global_size[] = {element_count};
-        auto queue = ocl_stream.get_cl_queue().get();
-        // auto wait_event = std::dynamic_pointer_cast<ocl::ocl_event>(event)->get().get();
-        // auto usr_event = ocl_stream.create_user_event(false);
-        // cl_event ret = std::dynamic_pointer_cast<ocl::ocl_event>(usr_event)->get().get();
-        // cl_event ret;
-
-        err = clEnqueueNDRangeKernel(queue, kernel, 1, nullptr, global_size, nullptr, 0, nullptr, nullptr /*&ret*/);
-        CHECK_OCL_ERROR_EXIT(err, "clEnqueueNDRangeKernel failed");
-        clFinish(queue);
-
-        perf_dump_done(start, std::string("tensor add host time"));
-        // return ocl_stream.create_event(cl::Event(ret));
-        // return usr_event;
-        return stream.create_user_event(true);
-    }
-
-    void finish(cldnn::stream& stream) {
-        auto& ocl_stream = downcast<ocl::ocl_stream>(stream);
-        auto queue = ocl_stream.get_cl_queue().get();
-        clFinish(queue);
-    }
-
-private:
-    bool inited_ = false;
-    cl_program program;
-    cl_kernel kernels[KERNEL_DATA_TYPE_NUM];
-};
-
-static ocl_p2p_helper p2p_helper_instances[4];  // max substream number
-static simple_ocl_add adder_instances[4];
-
-inline ocl_p2p_helper& get_ocl_p2p_instance(size_t id) {
-    return p2p_helper_instances[id];
-}
-
-inline simple_ocl_add& get_adder_instance(size_t id) {
-    return adder_instances[id];
-}
-
 struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
     using parent = typed_primitive_impl<sync_tensor>;
     using parent::parent;
@@ -515,67 +168,9 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
         parent::load(ib);
     }
 
-    void wait_p2p_done(ov::intel_gpu::SubMemoryManager::ptr& sub_mem_mgr, int id, size_t w_size, int32_t w_rank) {
-        // wait for all reduce data are ready
-        std::vector<int> copy_list(w_size, 1);
-        copy_list[w_rank] = 0;
-        while (true) {
-            for (size_t idx = 0; idx < w_size; idx++) {
-                if (idx != static_cast<size_t>(w_rank) && copy_list[idx]) {
-                    // Wait for reduce data has been ready
-                    auto& remote_ocl_stream =
-                        downcast<ocl::ocl_stream>(*sub_mem_mgr->_memorys_table[id][idx].stream_ptr);
-                    auto event = sub_mem_mgr->_memorys_table[id][idx].events[w_rank];
-                    if (event) {
-                        remote_ocl_stream.finish();
-                        // event->wait();
-                        copy_list[idx] = 0;
-                        {
-                            std::lock_guard<std::mutex> lock(sub_mem_mgr->_flagMutex);
-                            sub_mem_mgr->_memorys_table[id][idx].events[w_rank] = nullptr;
-                        }
-                    }
-                }
-            }
-            auto left_size =
-                std::accumulate(copy_list.begin(), copy_list.end(), static_cast<size_t>(1), std::multiplies<size_t>());
-            if (left_size == 0)
-                break;
-        }
-    }
-
-    std::vector<cldnn::event::ptr> propagate_p2p_events(ov::intel_gpu::SubMemoryManager::ptr& sub_mem_mgr,
-                                                        int id,
-                                                        size_t w_size,
-                                                        int32_t w_rank) {
-        std::vector<cldnn::event::ptr> sync_events;
-        // wait for all reduce data are ready
-        std::vector<int> copy_list(w_size, 1);
-        copy_list[w_rank] = 0;
-        while (true) {
-            for (size_t idx = 0; idx < w_size; idx++) {
-                if (idx != static_cast<size_t>(w_rank) && copy_list[idx]) {
-                    // Wait for reduce data has been ready
-                    auto event = sub_mem_mgr->_memorys_table[id][idx].events[w_rank];
-                    if (event) {
-                        sync_events.emplace_back(event);
-                        copy_list[idx] = 0;
-                    }
-                }
-            }
-            auto left_size =
-                std::accumulate(copy_list.begin(), copy_list.end(), static_cast<size_t>(1), std::multiplies<size_t>());
-            if (left_size == 0)
-                break;
-        }
-
-        return sync_events;
-    }
-
-
     void check_typed_values(const ov::element::Type_t& data_type, size_t element_count,
         std::vector<uint8_t>& srcBuf, size_t w_rank) {
-        printf("[do_self_rank_reduce: %ld] size: %ld \n", w_rank, srcBuf.size());
+        printf("[check_typed_values: %ld] size: %ld \n", w_rank, srcBuf.size());
         switch (data_type) {
         case ov::element::f16: {
             uint16_t* ptr = reinterpret_cast<uint16_t*> (srcBuf.data());
@@ -604,12 +199,11 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
         }
     }
 
-    void do_self_rank_reduce(cl_command_queue& queue, const ov::element::Type_t& data_type, size_t element_count,
+    void read_cl_buf(cl_command_queue& queue, const ov::element::Type_t& data_type, size_t element_count,
         cl_mem& src, std::vector<uint8_t>& srcBuf, size_t w_rank) {
         cl_int err;
         err = clEnqueueReadBuffer(queue, src, CL_TRUE, 0, srcBuf.size(), srcBuf.data(), 0, NULL, NULL);
         CHECK_OCL_ERROR_EXIT(err, "clEnqueueReadBuffer failed");
-        // clFinish(queue);
 
         check_typed_values(data_type, element_count, srcBuf, w_rank);
     }
@@ -619,22 +213,11 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
         cl_int err;
         err = clEnqueueWriteBuffer(queue, dst, CL_TRUE, 0, dstBuf.size(), dstBuf.data(), 0, NULL, NULL);
         CHECK_OCL_ERROR_EXIT(err, "clEnqueueWriteBuffer failed");
-        // clFinish(queue);
 
-        std::vector<uint8_t> tempBuf(dstBuf.size(), 0);
-        err = clEnqueueReadBuffer(queue, dst, CL_TRUE, 0, tempBuf.size(), tempBuf.data(), 0, NULL, NULL);
-        CHECK_OCL_ERROR_EXIT(err, "clEnqueueReadBuffer failed");
-        // clFinish(queue);
-
-        check_typed_values(data_type, element_count, dstBuf, w_rank);
-
-        // uint16_t* ptr = reinterpret_cast<uint16_t*> (tempBuf.data());
-        // printf("[do_self_rank_all_reduce: %ld] size: %ld \n", w_rank, tempBuf.size());
-        // for (size_t i = 0; i < element_count; ++i) {
-        //     ov::float16 f = ov::float16::from_bits(ptr[i]);
-        //     std::cout << " [" << i << "] " << f.to_string();
-        // }
-        // std::cout << std::endl;
+        // std::vector<uint8_t> tempBuf(dstBuf.size(), 0);
+        // err = clEnqueueReadBuffer(queue, dst, CL_TRUE, 0, tempBuf.size(), tempBuf.data(), 0, NULL, NULL);
+        // CHECK_OCL_ERROR_EXIT(err, "clEnqueueReadBuffer failed");
+        // check_typed_values(data_type, element_count, dstBuf, w_rank);
     }
 
     event::ptr execute_impl(const std::vector<event::ptr>& events, sync_tensor_inst& instance) override {
@@ -674,9 +257,7 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
         perf_dump_done(start_1,
                        std::string("rank[") + std::to_string(w_rank) + std::string("] sync_tensor wait data ready"));
 
-        auto p2p_helper = get_ocl_p2p_instance(w_rank);
         auto& ocl_stream = downcast<ocl::ocl_stream>(stream);
-        // auto local_context = ocl_stream.get_engine().get_cl_context().get();
         auto queue = ocl_stream.get_cl_queue().get();
 
         int dst_rank = (w_rank + 1) % w_size;
@@ -687,9 +268,7 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
         std::vector<uint8_t> srcBuf(dst_size, 0);
 
         size_t element_count = dst_size;
-        // auto& data_type = instance.output_memory(dst_rank).get_layout().data_type;
         const ov::element::Type_t& data_type = instance.output_memory(dst_rank).get_layout().data_type;
-        // using Type = typename ov::element_type_traits<data_type>::value_type;
         auto bitwidth = ov::element::Type(data_type).bitwidth();
 
         switch (data_type) {
@@ -710,9 +289,8 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
         }
 
         std::cout << "[sync_tensor: " << w_rank << "] dst_size: " << dst_size << ", element_count: " << element_count << std::endl;
-        do_self_rank_reduce(queue, data_type, element_count, src_cl_buf, srcBuf, w_rank);
+        read_cl_buf(queue, data_type, element_count, src_cl_buf, srcBuf, w_rank);
 
-        // sub_mem_mgr->_memorys_table[id][w_rank].send_buf = instance.output_memory(w_rank).buffer_ptr();
         {
             std::lock_guard<std::mutex> lock(sub_mem_mgr->_flagMutex);
             if (sharedBuf.size() != dst_size) {
@@ -755,18 +333,7 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
                 break;
             }
 
-            sub_mem_mgr->_memorys_table[id][w_rank].recv_bufs = instance.get_output_memorys();
             sub_mem_mgr->_memorys_table[id][w_rank].flag = true;
-        }
-
-        if (0) {
-            std::lock_guard<std::mutex> lock(debug_mutex);
-            int i = 0;
-            for (auto& mem : instance.get_output_memorys()) {
-                auto src_cl_buf = std::dynamic_pointer_cast<const ocl::gpu_buffer>(mem)->get_buffer().get();
-                printf("Init output memory %d, rank %d\n", i++, w_rank);
-                dump_cl_buf(ocl_stream.get_cl_queue().get(), src_cl_buf, mem->count(), 0);
-            }
         }
 
         std::vector<int> wait_list(w_size, 1);
@@ -780,37 +347,19 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
             int wait_size = 0;
             for (int idx = 0; idx < static_cast<int>(w_size); idx++) {
                 if (idx != w_rank && wait_list[idx] > 0 && sub_mem_mgr->_memorys_table[id][idx].flag) {
-                    // // auto& remote_ocl_stream =
-                    // // downcast<ocl::ocl_stream>(*sub_mem_mgr->_memorys_table[id][idx].stream_ptr); auto remote_context
-                    // // = remote_ocl_stream.get_engine().get_cl_context().get();
-                    // auto src_cl_buf =
-                    //     std::dynamic_pointer_cast<const ocl::gpu_buffer>(instance.output_memory_ptr(w_rank))
-                    //         ->get_buffer()
-                    //         .get();
-                    // cldnn::memory::ptr dst_mem = sub_mem_mgr->_memorys_table[id][idx].recv_bufs[w_rank];
-                    // auto dst_cl_buf_remote =
-                    //     std::dynamic_pointer_cast<const ocl::gpu_buffer>(dst_mem)->get_buffer().get();
-
-                    // data_size = dst_mem->size();
-                    // auto dst_cl_buf = p2p_helper.map_remote_mem(local_context, dst_cl_buf_remote, data_size);
-                    // sync_event = p2p_helper.remote_copy(stream, src_cl_buf, dst_cl_buf, data_size);
-                    // {
-                    //     std::lock_guard<std::mutex> lock(sub_mem_mgr->_flagMutex);
-                    //     sub_mem_mgr->_memorys_table[id][idx].events[w_rank] = sync_event;
-                    // }
-                    // if (0) {
-                    //     std::lock_guard<std::mutex> lock(debug_mutex);
-                    //     printf("Write output memory (rank=%d):\n", w_rank);
-                    //     dump_cl_buf(ocl_stream.get_cl_queue().get(), dst_cl_buf, dst_mem->count(), 0);
-                    // }
-                    // // p2p_helper.destory_remote_mem(dst_cl_buf);
-
-                    do_self_rank_all_reduce(queue, data_type, element_count, dst_cl_buf, sharedBuf, w_rank);
                     wait_list[idx] = 0;
                 }
                 wait_size += wait_list[idx];
             }
             if (wait_size == 0) {
+                // data on all ranks are ready
+                if (instance.get_impl_params()->need_add) {
+                    // all_reduce
+                    do_self_rank_all_reduce(queue, data_type, element_count, dst_cl_buf, sharedBuf, w_rank);
+                } else {
+                    // all_gather
+                }
+
                 break;
             }
         }
@@ -819,53 +368,7 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
                            std::to_string(data_size) + " bytes",
                        false);
 
-        if (0) {
-            std::lock_guard<std::mutex> lock(debug_mutex);
-            int i = 0;
-            for (auto& mem : instance.get_output_memorys()) {
-                auto src_cl_buf = std::dynamic_pointer_cast<const ocl::gpu_buffer>(mem)->get_buffer().get();
-                printf("Output memory %d, rank %d\n", i++, w_rank);
-                dump_cl_buf(ocl_stream.get_cl_queue().get(), src_cl_buf, mem->count(), 0);
-            }
-        }
-
         std::cout << "[sync_tensor: " << w_rank << "] need_add: " << instance.get_impl_params()->need_add << std::endl;
-        std::vector<cldnn::event::ptr> sync_events;
-        if (instance.get_impl_params()->need_add) {
-            auto start_3 = perf_dump_start();
-            auto add_worker = get_adder_instance(w_rank);
-            auto dst_mem = std::dynamic_pointer_cast<const ocl::gpu_buffer>(instance.output_memory_ptr(w_rank));
-            auto dst_cl_buf = dst_mem->get_buffer().get();
-            // auto data_size = dst_mem->size();
-            // wait for all reduce data are ready
-            wait_p2p_done(sub_mem_mgr, id, w_size, w_rank);
-            for (size_t idx = 0; idx < w_size; idx++) {
-                if (idx != static_cast<size_t>(w_rank)) {
-                    auto src_cl_buf = std::dynamic_pointer_cast<const ocl::gpu_buffer>(instance.output_memory_ptr(idx))
-                                          ->get_buffer()
-                                          .get();
-                    sync_event =
-                        add_worker.tensor_add(stream,
-                                              src_cl_buf,
-                                              dst_cl_buf,
-                                              dst_mem->count(),
-                                              element_type_to_kernel_data_type(dst_mem->get_layout().data_type));
-                    sync_events.emplace_back(sync_event);
-                }
-            }
-            // add_worker.finish(stream);
-            perf_dump_done(start_3,
-                           std::string("rank[") + std::to_string(w_rank) + std::string("] sync_tensor allreduce add"),
-                           false);
-
-            if (0) {
-                std::lock_guard<std::mutex> lock(debug_mutex);
-                printf("Add output memory (rank=%d):\n", w_rank);
-                dump_cl_buf(ocl_stream.get_cl_queue().get(), dst_cl_buf, dst_mem->count(), 0);
-            }
-        } else {
-            sync_events = propagate_p2p_events(sub_mem_mgr, id, w_size, w_rank);
-        }
 
         {
             std::lock_guard<std::mutex> lock(sub_mem_mgr->_flagMutex);
@@ -877,13 +380,6 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
             } else if (events.size() == 1) {
                 return events[0];
             }
-        }
-        perf_dump_done(start,
-                       std::string("rank[") + std::to_string(w_rank) + std::string("] sync_tensor total"),
-                       false);
-
-        for (auto& evt : sync_events) {
-            evt->wait();
         }
         return stream.create_user_event(true);
         // return sync_events.size() > 0 ? stream.group_events(sync_events) : stream.create_user_event(true);
