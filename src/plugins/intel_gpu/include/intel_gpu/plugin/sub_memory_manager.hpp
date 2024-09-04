@@ -59,6 +59,7 @@ public:
     std::vector<std::vector<MemoryInfo>> _memorys_table;
     std::vector<size_t> _use_count;
     std::mutex _flagMutex;
+    std::vector<uint8_t> sharedHostBuf;
 };
 }  // namespace intel_gpu
 }  // namespace ov

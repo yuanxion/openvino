@@ -17,6 +17,8 @@
 #include "runtime/ocl/ocl_stream.hpp"
 #include "sync_tensor_inst.h"
 
+#include "openvino/core/type/float16.hpp"
+
 namespace cldnn {
 namespace cpu {
 
@@ -570,6 +572,41 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
         return sync_events;
     }
 
+    void do_self_rank_reduce(cl_command_queue& queue, size_t element_count, cl_mem& src, std::vector<uint8_t>& srcBuf, size_t w_rank) {
+        cl_int err;
+        err = clEnqueueReadBuffer(queue, src, CL_TRUE, 0, srcBuf.size(), srcBuf.data(), 0, NULL, NULL);
+        CHECK_OCL_ERROR_EXIT(err, "clEnqueueReadBuffer failed");
+        clFinish(queue);
+
+        uint16_t* ptr = reinterpret_cast<uint16_t*> (srcBuf.data());
+        printf("[do_self_rank_reduce: %ld] size: %ld \n", w_rank, srcBuf.size());
+        for (size_t i = 0; i < element_count; ++i) {
+            ov::float16 f = ov::float16::from_bits(ptr[i]);
+            std::cout << " [" << i << "] " << f.to_string();
+        }
+        std::cout << std::endl;
+    }
+
+    void do_self_rank_all_reduce(cl_command_queue& queue, size_t element_count, cl_mem& dst, std::vector<uint8_t>& dstBuf, size_t w_rank) {
+        cl_int err;
+        err = clEnqueueWriteBuffer(queue, dst, CL_TRUE, 0, dstBuf.size(), dstBuf.data(), 0, NULL, NULL);
+        CHECK_OCL_ERROR_EXIT(err, "clEnqueueWriteBuffer failed");
+        // clFinish(queue);
+
+        // check
+        std::vector<uint8_t> tempBuf(dstBuf.size(), 0);
+        err = clEnqueueReadBuffer(queue, dst, CL_TRUE, 0, tempBuf.size(), tempBuf.data(), 0, NULL, NULL);
+        CHECK_OCL_ERROR_EXIT(err, "clEnqueueReadBuffer failed");
+        // clFinish(queue);
+        uint16_t* ptr = reinterpret_cast<uint16_t*> (tempBuf.data());
+        printf("[do_self_rank_all_reduce: %ld] size: %ld \n", w_rank, tempBuf.size());
+        for (size_t i = 0; i < element_count; ++i) {
+            ov::float16 f = ov::float16::from_bits(ptr[i]);
+            std::cout << " [" << i << "] " << f.to_string();
+        }
+        std::cout << std::endl;
+    }
+
     event::ptr execute_impl(const std::vector<event::ptr>& events, sync_tensor_inst& instance) override {
         OV_ITT_SCOPED_TASK(ov::intel_gpu::itt::domains::intel_gpu_plugin, "sync_tensor::execute_impl");
         auto& stream = instance.get_network().get_stream();
@@ -607,10 +644,56 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
 
         auto p2p_helper = get_ocl_p2p_instance(w_rank);
         auto& ocl_stream = downcast<ocl::ocl_stream>(stream);
-        auto local_context = ocl_stream.get_engine().get_cl_context().get();
+        // auto local_context = ocl_stream.get_engine().get_cl_context().get();
+        auto queue = ocl_stream.get_cl_queue().get();
+
+        int dst_rank = (w_rank + 1) % w_size;
+        auto src_cl_buf = std::dynamic_pointer_cast<const ocl::gpu_buffer>(instance.output_memory_ptr(w_rank))->get_buffer().get();
+        auto dst_cl_buf = std::dynamic_pointer_cast<const ocl::gpu_buffer>(instance.output_memory_ptr(dst_rank))->get_buffer().get();
+
+        size_t dst_size = instance.output_memory(dst_rank).size();
+        size_t element_count = dst_size;
+        auto& data_type = instance.output_memory(dst_rank).get_layout().data_type;
+        switch (data_type) {
+        case ov::element::f16:
+            element_count /= 2;
+            break;
+        case ov::element::i8:
+            element_count /= 4;
+            break;
+        case ov::element::f32:
+            break;
+        default:
+            std::cout << "Unknow data type, exiting..." << std::endl;
+            exit(-1);
+        }
+
+        std::cout << "[sync_tensor: " << w_rank << "] dst_size: " << dst_size << ", element_count: " << element_count << std::endl;
+        std::vector<uint8_t> srcBuf(dst_size, 0);
+        do_self_rank_reduce(queue, element_count, src_cl_buf, srcBuf, w_rank);
+        std::vector<uint8_t>& sharedBuf = sub_mem_mgr->sharedHostBuf;
+
         // sub_mem_mgr->_memorys_table[id][w_rank].send_buf = instance.output_memory(w_rank).buffer_ptr();
-        sub_mem_mgr->_memorys_table[id][w_rank].recv_bufs = instance.get_output_memorys();
-        sub_mem_mgr->_memorys_table[id][w_rank].flag = true;
+        {
+            std::lock_guard<std::mutex> lock(sub_mem_mgr->_flagMutex);
+            if (sharedBuf.size() != dst_size) {
+                sharedBuf.resize(dst_size);
+            }
+            // reduce
+            uint16_t* dst_ptr = reinterpret_cast<uint16_t*>(sharedBuf.data());
+            uint16_t* src_ptr = reinterpret_cast<uint16_t*>(srcBuf.data());
+            std::cout << "[sync_tensor: " << w_rank << "] self reduce "<< std::endl;
+            for (size_t i = 0; i < element_count; ++i) {
+                ov::float16 f = ov::float16::from_bits(dst_ptr[i]);
+                std::cout << " [" << i << "] f = " << f.to_string();
+                f += ov::float16::from_bits(src_ptr[i]);
+                std::cout << " [" << i << "] f += " << f.to_string();
+                dst_ptr[i] = f.to_bits();
+            }
+            std::cout << std::endl;
+            sub_mem_mgr->_memorys_table[id][w_rank].recv_bufs = instance.get_output_memorys();
+            sub_mem_mgr->_memorys_table[id][w_rank].flag = true;
+        }
 
         if (0) {
             std::lock_guard<std::mutex> lock(debug_mutex);
@@ -627,34 +710,38 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
         wait_list[w_rank] = 0;  // no need to wait for itself
         size_t data_size = 0;
         event::ptr sync_event = nullptr;
+        std::cout << "[sync_tensor: " << w_rank << "] wait flag... "<< std::endl;
+
         while (true) {
             int wait_size = 0;
             for (int idx = 0; idx < static_cast<int>(w_size); idx++) {
                 if (idx != w_rank && wait_list[idx] > 0 && sub_mem_mgr->_memorys_table[id][idx].flag) {
-                    // auto& remote_ocl_stream =
-                    // downcast<ocl::ocl_stream>(*sub_mem_mgr->_memorys_table[id][idx].stream_ptr); auto remote_context
-                    // = remote_ocl_stream.get_engine().get_cl_context().get();
-                    auto src_cl_buf =
-                        std::dynamic_pointer_cast<const ocl::gpu_buffer>(instance.output_memory_ptr(w_rank))
-                            ->get_buffer()
-                            .get();
-                    cldnn::memory::ptr dst_mem = sub_mem_mgr->_memorys_table[id][idx].recv_bufs[w_rank];
-                    auto dst_cl_buf_remote =
-                        std::dynamic_pointer_cast<const ocl::gpu_buffer>(dst_mem)->get_buffer().get();
+                    // // auto& remote_ocl_stream =
+                    // // downcast<ocl::ocl_stream>(*sub_mem_mgr->_memorys_table[id][idx].stream_ptr); auto remote_context
+                    // // = remote_ocl_stream.get_engine().get_cl_context().get();
+                    // auto src_cl_buf =
+                    //     std::dynamic_pointer_cast<const ocl::gpu_buffer>(instance.output_memory_ptr(w_rank))
+                    //         ->get_buffer()
+                    //         .get();
+                    // cldnn::memory::ptr dst_mem = sub_mem_mgr->_memorys_table[id][idx].recv_bufs[w_rank];
+                    // auto dst_cl_buf_remote =
+                    //     std::dynamic_pointer_cast<const ocl::gpu_buffer>(dst_mem)->get_buffer().get();
 
-                    data_size = dst_mem->size();
-                    auto dst_cl_buf = p2p_helper.map_remote_mem(local_context, dst_cl_buf_remote, data_size);
-                    sync_event = p2p_helper.remote_copy(stream, src_cl_buf, dst_cl_buf, data_size);
-                    {
-                        std::lock_guard<std::mutex> lock(sub_mem_mgr->_flagMutex);
-                        sub_mem_mgr->_memorys_table[id][idx].events[w_rank] = sync_event;
-                    }
-                    if (0) {
-                        std::lock_guard<std::mutex> lock(debug_mutex);
-                        printf("Write output memory (rank=%d):\n", w_rank);
-                        dump_cl_buf(ocl_stream.get_cl_queue().get(), dst_cl_buf, dst_mem->count(), 0);
-                    }
-                    // p2p_helper.destory_remote_mem(dst_cl_buf);
+                    // data_size = dst_mem->size();
+                    // auto dst_cl_buf = p2p_helper.map_remote_mem(local_context, dst_cl_buf_remote, data_size);
+                    // sync_event = p2p_helper.remote_copy(stream, src_cl_buf, dst_cl_buf, data_size);
+                    // {
+                    //     std::lock_guard<std::mutex> lock(sub_mem_mgr->_flagMutex);
+                    //     sub_mem_mgr->_memorys_table[id][idx].events[w_rank] = sync_event;
+                    // }
+                    // if (0) {
+                    //     std::lock_guard<std::mutex> lock(debug_mutex);
+                    //     printf("Write output memory (rank=%d):\n", w_rank);
+                    //     dump_cl_buf(ocl_stream.get_cl_queue().get(), dst_cl_buf, dst_mem->count(), 0);
+                    // }
+                    // // p2p_helper.destory_remote_mem(dst_cl_buf);
+
+                    do_self_rank_all_reduce(queue, element_count, dst_cl_buf, sharedBuf, w_rank);
                     wait_list[idx] = 0;
                 }
                 wait_size += wait_list[idx];
@@ -678,6 +765,7 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
             }
         }
 
+        std::cout << "[sync_tensor: " << w_rank << "] need_add: " << instance.get_impl_params()->need_add << std::endl;
         std::vector<cldnn::event::ptr> sync_events;
         if (instance.get_impl_params()->need_add) {
             auto start_3 = perf_dump_start();
