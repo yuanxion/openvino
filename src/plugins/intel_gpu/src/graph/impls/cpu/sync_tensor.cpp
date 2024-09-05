@@ -264,7 +264,7 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
 
         int dst_rank = (w_rank + 1) % w_size;
         auto src_cl_buf = std::dynamic_pointer_cast<const ocl::gpu_buffer>(instance.output_memory_ptr(w_rank))->get_buffer().get();
-        auto dst_cl_buf = std::dynamic_pointer_cast<const ocl::gpu_buffer>(instance.output_memory_ptr(dst_rank))->get_buffer().get();
+        // auto dst_cl_buf = std::dynamic_pointer_cast<const ocl::gpu_buffer>(instance.output_memory_ptr(dst_rank))->get_buffer().get();
 
         size_t data_size = instance.output_memory(dst_rank).size();
         std::vector<uint8_t> srcBuf(data_size, 0);
@@ -289,7 +289,11 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
 
         // std::cout << "[sync_tensor: " << w_rank << "] data_size: " << data_size << ", element_count: " << element_count << std::endl;
         read_cl_buf(queue, data_type, element_count, src_cl_buf, srcBuf, w_rank);
+        perf_dump_done(start_2,
+                       std::string("rank[") + std::to_string(w_rank) + std::string("] sync_tensor copy host cost ") +
+                           std::to_string(data_size) + " bytes");
 
+        auto start_3 = perf_dump_start();
         {
             std::lock_guard<std::mutex> lock(sub_mem_mgr->_flagMutex);
             if (sharedBuf.size() != data_size) {
@@ -334,12 +338,12 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
 
             sub_mem_mgr->_memorys_table[id][w_rank].flag = true;
         }
-        perf_dump_done(start_2,
-                       std::string("rank[") + std::to_string(w_rank) + std::string("] sync_tensor p2p write ") +
+        perf_dump_done(start_3,
+                       std::string("rank[") + std::to_string(w_rank) + std::string("] sync_tensor reduce ") +
                            std::to_string(data_size) + " bytes");
 
         std::vector<int> wait_list(w_size, 1);
-        auto start_3 = perf_dump_start();
+        auto start_4 = perf_dump_start();
         wait_list[w_rank] = 0;  // no need to wait for itself
         event::ptr sync_event = nullptr;
         std::cout << "[sync_tensor: " << w_rank << "] wait flag... "<< std::endl;
@@ -355,8 +359,8 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
             if (wait_size == 0) {
                 // data on all ranks are ready
                 if (instance.get_impl_params()->need_add) {
-                    // all_reduce
-                    do_self_rank_all_reduce(queue, data_type, element_count, dst_cl_buf, sharedBuf, w_rank);
+                    // all_reduce: write back
+                    do_self_rank_all_reduce(queue, data_type, element_count, src_cl_buf, sharedBuf, w_rank);
                 } else {
                     // all_gather
                 }
@@ -364,15 +368,16 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
                 break;
             }
         }
-        perf_dump_done(start_3,
-                       std::string("rank[") + std::to_string(w_rank) + std::string("] sync_tensor allreduce add"));
+        perf_dump_done(start_4,
+                       std::string("rank[") + std::to_string(w_rank) + std::string("] sync_tensor allreduce write_back"));
 
         {
             std::lock_guard<std::mutex> lock(sub_mem_mgr->_flagMutex);
             sub_mem_mgr->_use_count[id]++;
+            // reset sharedHostBuf after use
+            if (w_rank == 0)
+                sub_mem_mgr->sharedHostBuf.assign(data_size, 0);
         }
-        perf_dump_done(start,
-                       std::string("rank[") + std::to_string(w_rank) + std::string("] sync_tensor total"));
 
         if (pass_through_events) {
             if (events.size() > 1) {
@@ -381,6 +386,9 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
                 return events[0];
             }
         }
+        perf_dump_done(start,
+                       std::string("rank[") + std::to_string(w_rank) + std::string("] sync_tensor total"));
+
         return stream.create_user_event(true);
         // return sync_events.size() > 0 ? stream.group_events(sync_events) : stream.create_user_event(true);
     }
