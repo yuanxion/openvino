@@ -129,7 +129,7 @@ static const std::chrono::_V2::system_clock::time_point perf_dump_start() {
 
 static void perf_dump_done(const std::chrono::_V2::system_clock::time_point& start,
                            std::string str,
-                           bool enable = false) {
+                           bool enable = true) {
     if (enable) {
         const auto end = std::chrono::high_resolution_clock::now();
         const std::chrono::duration<double, std::milli> elapsed_1 = end - start;
@@ -205,7 +205,7 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
         err = clEnqueueReadBuffer(queue, src, CL_TRUE, 0, srcBuf.size(), srcBuf.data(), 0, NULL, NULL);
         CHECK_OCL_ERROR_EXIT(err, "clEnqueueReadBuffer failed");
 
-        check_typed_values(data_type, element_count, srcBuf, w_rank);
+        // check_typed_values(data_type, element_count, srcBuf, w_rank);
     }
 
     void do_self_rank_all_reduce(cl_command_queue& queue, const ov::element::Type_t& data_type, size_t element_count,
@@ -257,6 +257,8 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
         perf_dump_done(start_1,
                        std::string("rank[") + std::to_string(w_rank) + std::string("] sync_tensor wait data ready"));
 
+        auto start_2 = perf_dump_start();
+
         auto& ocl_stream = downcast<ocl::ocl_stream>(stream);
         auto queue = ocl_stream.get_cl_queue().get();
 
@@ -264,23 +266,20 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
         auto src_cl_buf = std::dynamic_pointer_cast<const ocl::gpu_buffer>(instance.output_memory_ptr(w_rank))->get_buffer().get();
         auto dst_cl_buf = std::dynamic_pointer_cast<const ocl::gpu_buffer>(instance.output_memory_ptr(dst_rank))->get_buffer().get();
 
-        size_t dst_size = instance.output_memory(dst_rank).size();
-        std::vector<uint8_t> srcBuf(dst_size, 0);
+        size_t data_size = instance.output_memory(dst_rank).size();
+        std::vector<uint8_t> srcBuf(data_size, 0);
 
-        size_t element_count = dst_size;
+        size_t element_count = data_size;
         const ov::element::Type_t& data_type = instance.output_memory(dst_rank).get_layout().data_type;
-        auto bitwidth = ov::element::Type(data_type).bitwidth();
+        // auto bitwidth = ov::element::Type(data_type).bitwidth();
 
         switch (data_type) {
         case ov::element::f16:
-            std::cout << "f16 bits: " << bitwidth << std::endl;
             element_count /= 2;
             break;
         case ov::element::i8:
-            std::cout << "i8 bits: " << bitwidth << std::endl;
             break;
         case ov::element::f32:
-            std::cout << "f32 bits: " << bitwidth << std::endl;
             element_count /= 4;
             break;
         default:
@@ -288,13 +287,13 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
             exit(-1);
         }
 
-        std::cout << "[sync_tensor: " << w_rank << "] dst_size: " << dst_size << ", element_count: " << element_count << std::endl;
+        // std::cout << "[sync_tensor: " << w_rank << "] data_size: " << data_size << ", element_count: " << element_count << std::endl;
         read_cl_buf(queue, data_type, element_count, src_cl_buf, srcBuf, w_rank);
 
         {
             std::lock_guard<std::mutex> lock(sub_mem_mgr->_flagMutex);
-            if (sharedBuf.size() != dst_size) {
-                sharedBuf.resize(dst_size);
+            if (sharedBuf.size() != data_size) {
+                sharedBuf.resize(data_size);
             }
             // reduce
             std::cout << "[sync_tensor: " << w_rank << "] self reduce "<< std::endl;
@@ -335,11 +334,13 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
 
             sub_mem_mgr->_memorys_table[id][w_rank].flag = true;
         }
+        perf_dump_done(start_2,
+                       std::string("rank[") + std::to_string(w_rank) + std::string("] sync_tensor p2p write ") +
+                           std::to_string(data_size) + " bytes");
 
         std::vector<int> wait_list(w_size, 1);
-        auto start_2 = perf_dump_start();
+        auto start_3 = perf_dump_start();
         wait_list[w_rank] = 0;  // no need to wait for itself
-        size_t data_size = 0;
         event::ptr sync_event = nullptr;
         std::cout << "[sync_tensor: " << w_rank << "] wait flag... "<< std::endl;
 
@@ -363,17 +364,16 @@ struct sync_tensor_impl : public typed_primitive_impl<sync_tensor> {
                 break;
             }
         }
-        perf_dump_done(start_2,
-                       std::string("rank[") + std::to_string(w_rank) + std::string("] sync_tensor p2p write ") +
-                           std::to_string(data_size) + " bytes",
-                       false);
-
-        std::cout << "[sync_tensor: " << w_rank << "] need_add: " << instance.get_impl_params()->need_add << std::endl;
+        perf_dump_done(start_3,
+                       std::string("rank[") + std::to_string(w_rank) + std::string("] sync_tensor allreduce add"));
 
         {
             std::lock_guard<std::mutex> lock(sub_mem_mgr->_flagMutex);
             sub_mem_mgr->_use_count[id]++;
         }
+        perf_dump_done(start,
+                       std::string("rank[") + std::to_string(w_rank) + std::string("] sync_tensor total"));
+
         if (pass_through_events) {
             if (events.size() > 1) {
                 return stream.group_events(events);

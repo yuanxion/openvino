@@ -301,6 +301,9 @@ std::shared_ptr<ov::ICompiledModel> Plugin::compile_model(const std::shared_ptr<
             config.register_device_context_for_tp(get_default_context(device_id));
             contexts_for_tp.insert({device_id, get_default_context(device_id)});
             std::cout << "Registered device with id GPU." << device_id << " for TP." << std::endl;
+            // only test no more than 4 GPUs for sync_tensor
+            if (config.get_context_for_tp().size() >= 4)
+                break;
         }
         if (config.get_context_for_tp().size() > 1) {
             std::cout << "***************************** enable tp *****************************\n";
