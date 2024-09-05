@@ -273,12 +273,12 @@ std::shared_ptr<ov::ICompiledModel> Plugin::compile_model(const std::shared_ptr<
                     }
                 }
             }
-            if (ret.size() > 2) {
-                GPU_DEBUG_LOG << "Will only select 2 devices for TP." << std::endl;
-                std::cout << "[WY-DEBUG][" << __FILE__ << ":" << __LINE__
-                          << "] will keep the first 2 device from list.";
-                ret = std::vector<std::string>(ret.begin(), ret.begin() + 2);
-            }
+            // if (ret.size() > 2) {
+            //     GPU_DEBUG_LOG << "Will only select 2 devices for TP." << std::endl;
+            //     std::cout << "[WY-DEBUG][" << __FILE__ << ":" << __LINE__
+            //               << "] will keep the first 2 device from list.";
+            //     ret = std::vector<std::string>(ret.begin(), ret.begin() + 2);
+            // }
         }
         return ret;
     };
