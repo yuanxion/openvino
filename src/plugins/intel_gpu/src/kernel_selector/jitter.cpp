@@ -1374,6 +1374,32 @@ JitConstants MakeActivationJitConstants(ActivationFunction activation_function,
     return jitConstants;
 }
 
+// MakeTypeJitConstants: Generates OpenCL type-related macro definitions for tensor data types
+//
+// This function creates JIT constants that define the OpenCL type and associated macros
+// for a given tensor. These macros are used throughout OpenCL kernel code.
+//
+// Parameters:
+//   - dataType: The input/output tensor data type (F16, F32, INT32, etc.)
+//   - macroName: The prefix for generated macros (e.g., "INPUT0", "INPUT1", "OUTPUT")
+//
+// Generated macros (example for macroName="INPUT1" and dataType=F32):
+//   - INPUT1_TYPE: OpenCL type name (e.g., "float", "half", "int")
+//   - INPUT1_VAL_MAX: Maximum value constant
+//   - INPUT1_VAL_MIN: Minimum value constant
+//   - INPUT1_VAL_ONE: Constant value 1 in the appropriate type
+//   - INPUT1_VAL_ZERO: Constant value 0 in the appropriate type
+//   - TO_INPUT1_TYPE(v): Type conversion macro
+//   - TO_INPUT1_TYPE_SAT(v): Saturating type conversion macro
+//   - AS_INPUT1_TYPE(v): Bitcast type conversion macro
+//   - INPUT1_MAX_FUNC: Max function name (max or fmax)
+//   - INPUT1_MIN_FUNC: Min function name (min or fmin)
+//   - INPUT1_ABS_FUNC: Absolute value function name (abs or fabs)
+//   - INPUT1_TYPE_SIZE: Size of the type in bytes
+//   - INPUT1_IS_FP: Whether the type is floating point (true/false)
+//
+// These macros are injected into the OpenCL kernel source before compilation,
+// enabling type-generic kernel code that works with multiple data types.
 JitConstants MakeTypeJitConstants(Datatype dataType, const std::string& macroName) {
     std::string type = "undefined";
     std::string max_val = "undefined";
