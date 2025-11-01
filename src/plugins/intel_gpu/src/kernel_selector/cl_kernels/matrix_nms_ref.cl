@@ -2,6 +2,29 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+// NOTE: INPUT0_TYPE, INPUT1_TYPE, and other INPUT*_TYPE macros are NOT defined in header files.
+// They are generated at runtime by the JIT (Just-In-Time) compilation system in:
+//   - src/plugins/intel_gpu/src/kernel_selector/jitter.cpp (MakeTypeJitConstants function)
+//   - src/plugins/intel_gpu/src/kernel_selector/kernel_base.cpp (MakeBaseParamsJitConstants function)
+//
+// For this kernel:
+//   - INPUT0_TYPE: Type of boxes input tensor (params.inputs[0].GetDType())
+//   - INPUT1_TYPE: Type of scores input tensor (params.inputs[1].GetDType())
+//
+// Supported types for INPUT1_TYPE (scores):
+//   - Datatype::F16 -> half
+//   - Datatype::F32 -> float
+//   - Datatype::INT32 -> int
+//
+// Generated macros include:
+//   - INPUT1_TYPE: The actual OpenCL type (e.g., "float", "half")
+//   - INPUT1_VAL_ZERO, INPUT1_VAL_ONE: Type-specific zero and one constants
+//   - INPUT1_VAL_MAX, INPUT1_VAL_MIN: Type-specific max/min values
+//   - INPUT1_GET_INDEX: Macro for accessing tensor elements
+//   - INPUT1_FEATURE_NUM, INPUT1_BATCH_NUM: Dimension sizes
+//
+// See INPUT_TYPE_MACROS_EXPLANATION.md for detailed documentation.
+
 #include "include/batch_headers/common.cl"
 
 #define NUM_BATCHES INPUT0_BATCH_NUM

@@ -129,8 +129,15 @@ bool MatrixNmsKernelRef::Validate(const Params& p) const {
 }
 
 JitConstants MatrixNmsKernelRef::GetJitConstants(const matrix_nms_params& params) const {
+    // Generate base JIT constants for all input/output tensors
+    // This call generates INPUT0_TYPE, INPUT1_TYPE, OUTPUT_TYPE, etc. based on tensor data types
+    //   - INPUT0 (params.inputs[0]): boxes tensor
+    //   - INPUT1 (params.inputs[1]): scores tensor
+    // The actual OpenCL type (float, half, int) for INPUT1_TYPE is determined by
+    // params.inputs[1].GetDType() and processed by MakeTypeJitConstants() in jitter.cpp
     JitConstants jit = MakeBaseParamsJitConstants(params);
 
+    // Add kernel-specific constants based on boxes data type
     const auto& boxes = params.inputs[0];
     switch (boxes.GetDType()) {
     case Datatype::F32:
