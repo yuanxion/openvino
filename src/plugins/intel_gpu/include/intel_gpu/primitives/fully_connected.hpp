@@ -178,7 +178,10 @@ struct fully_connected : public primitive_base<fully_connected> {
         seed = hash_combine(seed, !decompression_zero_point.is_valid());
         seed = hash_combine(seed, activation_scale.is_valid());
         seed = hash_combine(seed, activation_zero_point.is_valid());
-        seed = hash_combine(seed, activation_precomputed_reduction.is_valid());
+        // NOTE: activation_precomputed_reduction.is_valid() is intentionally excluded from hash
+        // to avoid changing hash values for primitives that don't use this feature,
+        // which would cause kernel cache key mismatches and performance regressions.
+        // seed = hash_combine(seed, activation_precomputed_reduction.is_valid());
         seed = hash_combine(seed, decompression_zero_point_scalar.has_value());
         seed = hash_combine(seed, decompression_zero_point_scalar.value_or(0.0f));
         return seed;
