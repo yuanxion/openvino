@@ -201,7 +201,9 @@ struct fully_connected : public primitive_base<fully_connected> {
                decompression_zero_point.is_valid() == rhs_casted.decompression_zero_point.is_valid() &&
                activation_scale.is_valid() == rhs_casted.activation_scale.is_valid() &&
                activation_zero_point.is_valid() == rhs_casted.activation_zero_point.is_valid() &&
-               activation_precomputed_reduction.is_valid() == rhs_casted.activation_precomputed_reduction.is_valid() &&
+               // NOTE: activation_precomputed_reduction.is_valid() is intentionally excluded
+               // to maintain consistency with hash() function
+               // activation_precomputed_reduction.is_valid() == rhs_casted.activation_precomputed_reduction.is_valid() &&
                decompression_zero_point_scalar.value_or(0.0f) == rhs_casted.decompression_zero_point_scalar.value_or(0.0f);
     }
 
