@@ -98,6 +98,17 @@ JitConstants KernelBase::MakeBaseParamsJitConstants(const base_params& params, b
     jit.Merge(MakeActivationJitConstants(params.activations, params.outputs[0].GetDType(), "", false, false, convert_input_to_output_dt));
 
     if (add_tensor_definitions) {
+        // Generate JIT constants for all input tensors
+        // Each input tensor params.inputs[i] generates a set of macros with prefix "INPUT{i}":
+        //   - INPUT{i}_TYPE: OpenCL data type (e.g., float, half, int)
+        //   - INPUT{i}_VAL_ZERO, INPUT{i}_VAL_ONE: Type-specific constants
+        //   - INPUT{i}_BATCH_NUM, INPUT{i}_FEATURE_NUM: Tensor dimensions
+        //   - INPUT{i}_GET_INDEX: Macro for indexing into the tensor
+        //   - ... and many more (see MakeTypeJitConstants in jitter.cpp)
+        //
+        // Example: For Matrix NMS kernel with 2 inputs:
+        //   - params.inputs[0] (boxes) -> INPUT0_TYPE, INPUT0_BATCH_NUM, etc.
+        //   - params.inputs[1] (scores) -> INPUT1_TYPE, INPUT1_BATCH_NUM, etc.
         for (size_t i = 0; i < params.inputs.size(); i++) {
             jit.AddConstant(MakeJitConstant("INPUT" + toCodeString(i), params.inputs[i]));
         }
