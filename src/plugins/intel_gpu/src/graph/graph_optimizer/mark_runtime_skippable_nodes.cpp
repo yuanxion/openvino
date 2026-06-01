@@ -24,6 +24,36 @@
 
 using namespace cldnn;
 
+namespace {
+
+bool has_onednn_fused_outer_dep_user(const program_node& node) {
+    const auto& node_id = node.id();
+
+    for (const auto* user : node.get_users()) {
+        // oneDNN fused post-ops may still consume this resample as an outer dependency
+        // even when the resample input/output layouts match.
+        const bool is_onednn_user = (user->get_selected_impl() && user->get_selected_impl()->is_onednn()) ||
+                                    user->get_preferred_impl_type() == impl_types::onednn;
+        if (!is_onednn_user)
+            continue;
+
+        auto impl_params = user->get_kernel_impl_params();
+        for (const auto& fused_desc : impl_params->fused_desc) {
+            if (!fused_desc.has_outer_dep())
+                continue;
+
+            for (const auto& dep : fused_desc.deps) {
+                if (dep.first == node_id)
+                    return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+}  // namespace
+
 void mark_runtime_skippable_nodes::run(program& p) {
     auto itr = p.get_processing_order().begin();
 
@@ -300,6 +330,11 @@ void mark_runtime_skippable_nodes::run(program& p) {
             // for static case, judge if input/output are same here.
             if (!node.is_dynamic()) {
                 can_be_optimized = node.get_input_layout(0) == node.get_output_layout(0);
+            }
+            // Keep the resample materialized when a oneDNN fused user reads it through
+            // fused_desc outer deps, otherwise optimize-out breaks the fused path.
+            if (has_onednn_fused_outer_dep_user(node)) {
+                can_be_optimized = false;
             }
             if (!node.has_fused_primitives() && can_be_optimized) {
                 node.can_be_optimized(true);
