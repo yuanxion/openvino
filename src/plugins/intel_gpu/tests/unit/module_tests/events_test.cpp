@@ -11,6 +11,7 @@
 
 #include "CL/cl.h"
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -18,6 +19,59 @@
 
 using namespace cldnn;
 using namespace ::tests;
+
+class cross_queue_event : public ::testing::TestWithParam<bool> {};
+
+TEST_P(cross_queue_event, native_barrier_preserves_upload_visibility) {
+    auto& engine = get_test_engine();
+    auto config = get_test_default_config(engine);
+    config.set_property(ov::enable_profiling(GetParam()),
+                        ov::intel_gpu::queue_type(QueueTypes::in_order));
+    auto transfer = engine.create_stream(config);
+    auto compute = engine.create_stream(config);
+    auto& transfer_queue = dynamic_cast<ocl::ocl_stream&>(*transfer).get_cl_queue();
+    auto& compute_queue = dynamic_cast<ocl::ocl_stream&>(*compute).get_cl_queue();
+    const auto& context = dynamic_cast<const ocl::ocl_engine&>(engine).get_cl_context();
+
+    std::array<uint32_t, 256> source{};
+    std::array<uint32_t, 256> result{};
+    for (size_t index = 0; index < source.size(); ++index) {
+        source[index] = static_cast<uint32_t>(index * 17 + 3);
+    }
+    cl::Buffer slot(context, CL_MEM_READ_WRITE, sizeof(source));
+    cl::Buffer output(context, CL_MEM_READ_WRITE, sizeof(source));
+    cl::Program program(context, "__kernel void consume(__global const uint* input, __global uint* output) { size_t index = get_global_id(0); output[index] = input[index]; }");
+    program.build();
+    cl::Kernel kernel(program, "consume");
+    kernel.setArg(0, slot);
+    kernel.setArg(1, output);
+    cl::UserEvent upload_gate(context);
+    std::vector<cl::Event> upload_deps{upload_gate};
+    cl::Event upload_done;
+    transfer_queue.enqueueWriteBuffer(slot, CL_FALSE, 0, sizeof(source), source.data(), &upload_deps, &upload_done);
+
+    std::vector<cl::Event> consumer_deps{upload_done};
+    compute_queue.enqueueBarrierWithWaitList(&consumer_deps);
+    cl::Event consumer_done;
+    compute_queue.enqueueNDRangeKernel(kernel, cl::NullRange, cl::NDRange(source.size()), cl::NullRange, nullptr, &consumer_done);
+    transfer->flush();
+    compute->flush();
+
+    auto consumer_status = consumer_done.getInfo<CL_EVENT_COMMAND_EXECUTION_STATUS>();
+    upload_gate.setStatus(CL_COMPLETE);
+    consumer_done.wait();
+    compute_queue.enqueueReadBuffer(output, CL_TRUE, 0, sizeof(result), result.data());
+
+    EXPECT_NE(consumer_status, CL_COMPLETE);
+    EXPECT_EQ(result, source);
+}
+
+INSTANTIATE_TEST_SUITE_P(les_capability,
+                         cross_queue_event,
+                         ::testing::Bool(),
+                         [](const ::testing::TestParamInfo<bool>& info) {
+                             return info.param ? "profiling_enabled" : "profiling_disabled";
+                         });
 
 namespace {
 // Synthesized start timestamps need the optional OpenCL 2.1 device/host timer; without
