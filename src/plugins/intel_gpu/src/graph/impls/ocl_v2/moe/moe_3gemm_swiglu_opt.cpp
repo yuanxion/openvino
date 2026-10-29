@@ -129,6 +129,9 @@ protected:
     [[nodiscard]] JitConstants get_jit_constants(const RuntimeParams& params) const override {
         auto jit = KernelGenerator::get_jit_constants(params);
         auto desc = params.typed_desc<moe_3gemm_fused_compressed>();
+        for (const auto* name : {"INPUT0_TYPE", "OUTPUT_TYPE", "OUTPUT1_TYPE", "OUTPUT2_TYPE", "OUTPUT3_TYPE", "OUTPUT4_TYPE", "OPTIONAL_SHAPE_INFO_ARG"}) {
+            jit.remove(name);
+        }
         jit.make("INPUT0_TYPE", "int");   // topk_id
         jit.make("OUTPUT_TYPE", "int");   // tokens_per_expert
         jit.make("OUTPUT1_TYPE", "int");  // experts_info_start_idx
@@ -235,6 +238,9 @@ protected:
         jit.make("BATCHES_PER_THREAD", batches_per_thread);
         jit.make("UNALIGNED_ELEMENTS", unaligned_elements);
 
+        for (const auto* name : {"INPUT0_TYPE", "INPUT1_TYPE", "OUTPUT_TYPE", "OPTIONAL_SHAPE_INFO_ARG"}) {
+            jit.remove(name);
+        }
         jit.make("INPUT0_TYPE", "half");
         jit.make("INPUT1_TYPE", "int");
         jit.make("OUTPUT_TYPE", "half");
@@ -317,6 +323,9 @@ protected:
         auto block_size = 4;
         auto [local_threads_count, batches_per_thread, unaligned_elements] = calc_thread_count(const_cast<RuntimeParams&>(params), block_size, hidden_size);
 
+        for (const auto* name : {"INPUT0_TYPE", "INPUT1_TYPE", "INPUT2_TYPE", "INPUT3_TYPE", "INPUT4_TYPE", "INPUT5_TYPE", "INPUT6_TYPE", "OUTPUT_TYPE", "OPTIONAL_SHAPE_INFO_ARG"}) {
+            jit.remove(name);
+        }
         jit.make("OPTIONAL_SHAPE_INFO_ARG", "");
         jit.make("ACTIVE_EXPERTS", desc->_config.top_k);
         jit.make("HIDDEN_SIZE", hidden_size);
@@ -359,6 +368,9 @@ protected:
         auto hidden_size = desc->_config.hidden_size;
         auto [local_threads_count, batches_per_thread, unaligned_elements] = calc_thread_count(const_cast<RuntimeParams&>(params), 4, hidden_size);
 
+        for (const auto* name : {"INPUT0_TYPE", "INPUT1_TYPE", "INPUT2_TYPE", "OUTPUT_TYPE", "OPTIONAL_SHAPE_INFO_ARG"}) {
+            jit.remove(name);
+        }
         jit.make("OPTIONAL_SHAPE_INFO_ARG", "");
         jit.make("ACTIVE_EXPERTS", desc->_config.top_k);
         jit.make("HIDDEN_SIZE", hidden_size);
