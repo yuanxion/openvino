@@ -3,7 +3,10 @@
 //
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <intel_gpu/primitives/data.hpp>
 #include <intel_gpu/primitives/fully_connected.hpp>
 #include <intel_gpu/primitives/moe_3gemm_fused_compressed.hpp>
@@ -417,9 +420,21 @@ struct Moe3GemmTestParams {
     size_t top_k;
     size_t group_size;
     bool is_signed = false;
+    size_t lru_expert_num = 0;
 };
 
-class moe_3gemm_compressed_gpu_random : public ::testing::TestWithParam<std::tuple<cldnn::MoERouterFused::RoutingType, Moe3GemmTestParams>> {};
+class moe_3gemm_compressed_gpu_random : public ::testing::TestWithParam<std::tuple<cldnn::MoERouterFused::RoutingType, Moe3GemmTestParams>> {
+protected:
+    std::filesystem::path offload_weights_path;
+
+    void TearDown() override {
+        if (!offload_weights_path.empty()) {
+            std::error_code error;
+            std::filesystem::remove(offload_weights_path, error);
+            EXPECT_FALSE(error) << error.message();
+        }
+    }
+};
 
 TEST_P(moe_3gemm_compressed_gpu_random, moe_accuracy_test_random) {
     const auto& [routing_type, param] = GetParam();
@@ -586,18 +601,52 @@ TEST_P(moe_3gemm_compressed_gpu_random, moe_accuracy_test_random) {
                                        input_info("w2_scale"),
                                        input_info("w2_zp")};
 
-    topology.add(moe_3gemm_fused_compressed("moe_3gemm_fused_compressed", moe_inputs, moe_config));
+    std::vector<size_t> weight_offsets;
+    if (param.lru_expert_num > 0) {
+        offload_weights_path = std::filesystem::temp_directory_path() /
+                               ("moe_offload_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".bin");
+        std::ofstream weights_file(offload_weights_path, std::ios::binary);
+        ASSERT_TRUE(weights_file.is_open());
+        auto write_tensor = [&](const auto& values) {
+            weight_offsets.push_back(static_cast<size_t>(weights_file.tellp()));
+            weights_file.write(reinterpret_cast<const char*>(values.data()), values.size() * sizeof(values[0]));
+        };
+        auto to_disk_order = [&](const auto& values, size_t output_channels, size_t groups) {
+            auto reordered = values;
+            for (size_t expert = 0; expert < config.num_experts; ++expert) {
+                for (size_t channel = 0; channel < output_channels; ++channel) {
+                    for (size_t group = 0; group < groups; ++group) {
+                        reordered[(expert * output_channels + channel) * groups + group] =
+                            values[(expert * groups + group) * output_channels + channel];
+                    }
+                }
+            }
+            return reordered;
+        };
+        write_tensor(w0_q_packed);
+        write_tensor(w1_q_packed);
+        write_tensor(w2_q_packed);
+        write_tensor(to_disk_order(w0_scale, config.inter_size, group_num));
+        write_tensor(to_disk_order(w1_scale, config.inter_size, group_num));
+        write_tensor(to_disk_order(w2_scale, config.hidden_size, group_num2));
+        write_tensor(ref.pack(to_disk_order(w0_zp, config.inter_size, group_num)));
+        write_tensor(ref.pack(to_disk_order(w1_zp, config.inter_size, group_num)));
+        write_tensor(ref.pack(to_disk_order(w2_zp, config.hidden_size, group_num2)));
+        weights_file.close();
+        ASSERT_TRUE(weights_file.good());
+    }
+    topology.add(moe_3gemm_fused_compressed("moe_3gemm_fused_compressed",
+                                          moe_inputs,
+                                          moe_config,
+                                          weight_offsets,
+                                          offload_weights_path,
+                                          param.lru_expert_num));
 
     auto net_config = get_test_default_config(engine);
     net_config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
     network network(engine, topology, net_config);
     network.set_input_data("hidden_states", hidden_states_mem);
     network.set_input_data("routing_weights", routing_weights_mem);
-
-    auto outputs = network.execute();
-    auto output_prim = outputs.begin()->second.get_memory();
-    get_test_stream().flush();
-    cldnn::mem_lock<ov::float16, mem_lock_type::read> output_ptr(output_prim, get_test_stream());
 
     auto ref_output = routing_type == cldnn::MoERouterFused::RoutingType::SIGMOID_BIAS
                           ? ref.run_reference_sigmoid(hidden_states, routing_weights, routing_bias_data, routing_eps_val, w0_qdq, w1_qdq, w2_qdq)
@@ -606,8 +655,15 @@ TEST_P(moe_3gemm_compressed_gpu_random, moe_accuracy_test_random) {
     // while the reference uses f32, leading to slightly larger numerical divergence than Softmax.
     const float base_tolerance = routing_type == cldnn::MoERouterFused::RoutingType::SIGMOID_BIAS ? 0.3f : 0.15f;
     const float tolerance = base_tolerance * (config.hidden_size / 128);
-    for (size_t i = 0; i < ref_output.size(); ++i) {
-        ASSERT_NEAR(static_cast<float>(output_ptr[i]), static_cast<float>(ref_output[i]), tolerance);
+    for (size_t iteration = 0; iteration < (param.lru_expert_num > 0 ? 3U : 1U); ++iteration) {
+        auto outputs = network.execute();
+        auto output_prim = outputs.begin()->second.get_memory();
+        get_test_stream().flush();
+        cldnn::mem_lock<ov::float16, mem_lock_type::read> output_ptr(output_prim, get_test_stream());
+        for (size_t index = 0; index < ref_output.size(); ++index) {
+            ASSERT_NEAR(static_cast<float>(output_ptr[index]), static_cast<float>(ref_output[index]), tolerance)
+                << "Mismatch at index " << index << ", iteration " << iteration;
+        }
     }
 }
 
@@ -627,6 +683,21 @@ INSTANTIATE_TEST_SUITE_P(smoke,
                                                               Moe3GemmTestParams{33, false, 128, 256, 4, 2, 128},
                                                               Moe3GemmTestParams{48, true, 128, 256, 4, 2, 128},
                                                               Moe3GemmTestParams{48, false, 128, 256, 4, 2, 128})));
+
+INSTANTIATE_TEST_SUITE_P(smoke_offload,
+    moe_3gemm_compressed_gpu_random,
+    ::testing::Combine(
+        ::testing::Values(cldnn::MoERouterFused::RoutingType::SOFTMAX, cldnn::MoERouterFused::RoutingType::SIGMOID_BIAS),
+        ::testing::Values(
+            Moe3GemmTestParams{1,  true, 256, 256, 4, 2, 128, false, 1},
+            Moe3GemmTestParams{1,  true, 256, 256, 4, 2, 128, false, 2},
+            Moe3GemmTestParams{4,  true, 256, 256, 4, 2, 128, false, 1},
+            Moe3GemmTestParams{4,  true, 256, 256, 4, 2, 128, false, 2},
+            Moe3GemmTestParams{4,  true, 256, 256, 4, 2, 128, false, 4},
+            Moe3GemmTestParams{48, true, 256, 256, 4, 2, 128, false, 1},
+            Moe3GemmTestParams{48, true, 256, 256, 4, 2, 128, false, 2},
+            Moe3GemmTestParams{48, true, 256, 256, 4, 2, 128, false, 4},
+            Moe3GemmTestParams{48, false,256, 256, 4, 2, 128, false, 2})));
 
 // Sub-128 weight quantization group size (e.g. trinity-mini afmoe uses group_size=64
 // with SIGMOID_BIAS routing). Limited to SIGMOID_BIAS to mirror real model usage and

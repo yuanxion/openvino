@@ -1434,10 +1434,13 @@ public:
         scratch.y = intermediates_memories[MOE_INTERNAL_BUFFER_DOWN_OUTPUT];
         // Routing weights scratch buffer (used in prefill paths and reused as shared_gate_vals in batched GEMV)
         scratch.routing_weights = intermediates_memories[MOE_INTERNAL_BUFFER_ROUTING_WEIGHTS];
-        if (token_num > 1) {
+        const auto desc = instance.get_typed_desc<moe_3gemm_fused_compressed>();
+        const bool single_token_fallback = desc->_otd.lru_expert_num > 0 &&
+                                           desc->_otd.lru_expert_num < static_cast<size_t>(desc->_config.top_k);
+        if (token_num > 1 || single_token_fallback) {
             scratch.x = intermediates_memories[MOE_INTERNAL_BUFFER_GATE_UP_INPUT];
             scratch.gate = intermediates_memories[MOE_INTERNAL_BUFFER_GATE_OUTPUT];
-            const auto& config = instance.get_typed_desc<moe_3gemm_fused_compressed>()->_config;
+            const auto& config = desc->_config;
             int expert_num = static_cast<int>(config.num_expert);
             scratch.expert_masks.resize(expert_num);
             for (int i = 0; i < expert_num; i++) {
