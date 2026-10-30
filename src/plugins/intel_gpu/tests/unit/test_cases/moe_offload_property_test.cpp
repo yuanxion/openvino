@@ -6,7 +6,12 @@
 #include "intel_gpu/runtime/internal_properties.hpp"
 #include "intel_gpu/primitives/activation.hpp"
 #include "intel_gpu/primitives/input_layout.hpp"
+#include "intel_gpu/primitives/eltwise.hpp"
+#include "intel_gpu/primitives/loop.hpp"
+#include "intel_gpu/primitives/moe_3gemm_fused_compressed.hpp"
+#include "intel_gpu/graph/program.hpp"
 #include "intel_gpu/runtime/les_context.hpp"
+#include "program_node.h"
 #include "runtime/ocl/ocl_engine.hpp"
 #include "runtime/ocl/ocl_stream.hpp"
 #include "runtime/ocl/ocl_event.hpp"
@@ -113,6 +118,139 @@ TEST(moe_les_network, non_moe_graph_creates_no_context_and_preserves_output) {
         EXPECT_FLOAT_EQ(values[1], 3.0f);
         EXPECT_EQ(network.get_les_epoch(), 0U);
     }
+}
+
+class moe_les_chain : public testing::Test {
+protected:
+    std::unique_ptr<cldnn::program> make_program(bool enabled = true) {
+        auto config = get_test_default_config(get_test_engine());
+        config.set_property(ov::intel_gpu::enable_les(enabled));
+        return std::make_unique<cldnn::program>(get_test_engine(), config);
+    }
+
+    void add(cldnn::program& program, const std::string& id,
+             const std::vector<std::string>& dependencies = {}, bool moe = false) {
+        std::vector<cldnn::input_info> inputs;
+        for (const auto& dependency : dependencies) {
+            inputs.emplace_back(dependency);
+        }
+        std::shared_ptr<cldnn::primitive> primitive;
+        if (moe) {
+            primitive = std::make_shared<cldnn::moe_3gemm_fused_compressed>(id, inputs, cldnn::MOECompressed::Config{});
+        } else if (inputs.empty()) {
+            primitive = std::make_shared<cldnn::input_layout>(id,
+                cldnn::layout{cldnn::data_types::f32, cldnn::format::bfyx, {1, 1, 1, 2}});
+        } else {
+            primitive = std::make_shared<cldnn::eltwise>(id, inputs, cldnn::eltwise_mode::sum);
+        }
+        auto& node = program.get_or_create(primitive);
+        for (const auto& dependency : dependencies) {
+            program.add_connection(program.get_node(dependency), node);
+        }
+    }
+
+    cldnn::program::les_moe_link find(const cldnn::program& program, const std::string& target) {
+        for (const auto& link : program.get_les_moe_links()) {
+            if (link.target_moe == target) {
+                return link;
+            }
+        }
+        ADD_FAILURE() << "Missing LES descriptor for " << target;
+        return {};
+    }
+};
+
+TEST_F(moe_les_chain, dense_gap_uses_nearest_moe_and_stable_ids) {
+    auto program = make_program();
+    add(*program, "hidden");
+    add(*program, "first", {"hidden"}, true);
+    add(*program, "dense", {"first", "hidden"});
+    add(*program, "second", {"dense"}, true);
+    add(*program, "residual", {"second", "dense"});
+    add(*program, "third", {"residual"}, true);
+    EXPECT_EQ(find(*program, "first").status, cldnn::program::les_link_status::no_predecessor);
+    auto second = find(*program, "second");
+    EXPECT_EQ(second.status, cldnn::program::les_link_status::candidate);
+    EXPECT_EQ(second.source_moe, "first");
+    EXPECT_EQ(second.proxy_hidden, "hidden");
+    EXPECT_EQ(second.target_hidden, "dense");
+    EXPECT_EQ(find(*program, "third").status, cldnn::program::les_link_status::candidate);
+    EXPECT_EQ(find(*program, "third").source_moe, "second");
+    EXPECT_EQ(program->get_les_moe_links().size(), 3U);
+}
+
+TEST_F(moe_les_chain, independent_chains_are_not_connected_by_order) {
+    auto program = make_program();
+    add(*program, "hidden");
+    add(*program, "a", {"hidden"}, true);
+    add(*program, "b", {"hidden"}, true);
+    add(*program, "c", {"b"}, true);
+    add(*program, "d", {"a"}, true);
+    EXPECT_EQ(find(*program, "c").source_moe, "b");
+    EXPECT_EQ(find(*program, "d").source_moe, "a");
+}
+
+TEST_F(moe_les_chain, merge_rejects_multiple_nearest_predecessors) {
+    auto program = make_program();
+    add(*program, "hidden");
+    add(*program, "left", {"hidden"}, true);
+    add(*program, "right", {"hidden"}, true);
+    add(*program, "merge", {"left", "right"});
+    add(*program, "target", {"merge"}, true);
+    auto link = find(*program, "target");
+    EXPECT_EQ(link.status, cldnn::program::les_link_status::ambiguous_predecessor);
+    EXPECT_TRUE(link.source_moe.empty());
+}
+
+TEST_F(moe_les_chain, fork_rejects_both_successors) {
+    auto program = make_program();
+    add(*program, "hidden");
+    add(*program, "source", {"hidden"}, true);
+    add(*program, "left", {"source"}, true);
+    add(*program, "right", {"source"}, true);
+    EXPECT_EQ(find(*program, "left").status, cldnn::program::les_link_status::branched_predecessor);
+    EXPECT_EQ(find(*program, "right").status, cldnn::program::les_link_status::branched_predecessor);
+}
+
+TEST_F(moe_les_chain, router_side_input_does_not_create_hidden_chain) {
+    auto program = make_program();
+    add(*program, "hidden");
+    add(*program, "unrelated", {"hidden"}, true);
+    add(*program, "target", {"hidden", "unrelated"}, true);
+    EXPECT_EQ(find(*program, "target").status, cldnn::program::les_link_status::no_predecessor);
+}
+
+TEST_F(moe_les_chain, control_flow_is_not_traversed) {
+    auto program = make_program();
+    add(*program, "hidden");
+    add(*program, "source", {"hidden"}, true);
+    auto boundary = std::make_shared<cldnn::loop>();
+    boundary->id = "boundary";
+    auto& node = program->get_or_create(boundary);
+    program->add_connection(program->get_node("source"), node);
+    add(*program, "target", {"boundary"}, true);
+    auto link = find(*program, "target");
+    EXPECT_EQ(link.status, cldnn::program::les_link_status::unsupported_topology);
+    EXPECT_TRUE(link.source_moe.empty());
+}
+
+TEST_F(moe_les_chain, missing_hidden_is_explicitly_unsupported) {
+    auto program = make_program();
+    add(*program, "source", {}, true);
+    add(*program, "target", {"source"}, true);
+    EXPECT_EQ(find(*program, "source").status, cldnn::program::les_link_status::unsupported_topology);
+    EXPECT_EQ(find(*program, "target").status, cldnn::program::les_link_status::unsupported_topology);
+}
+
+TEST_F(moe_les_chain, disabled_and_non_moe_programs_have_no_descriptors) {
+    auto disabled = make_program(false);
+    add(*disabled, "hidden");
+    add(*disabled, "moe", {"hidden"}, true);
+    EXPECT_TRUE(disabled->get_les_moe_links().empty());
+    auto plain = make_program();
+    add(*plain, "hidden");
+    add(*plain, "dense", {"hidden"});
+    EXPECT_TRUE(plain->get_les_moe_links().empty());
 }
 
 TEST(moe_les_network, transfer_lane_is_retained_until_active_upload_finishes) {
