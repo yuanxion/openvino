@@ -6,11 +6,14 @@
 #include <exception>
 #include <functional>
 #include <future>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
 
 namespace cldnn {
+
+class stream;
 
 class les_task_cancelled : public std::runtime_error {
 public:
@@ -24,7 +27,7 @@ public:
         std::shared_future<void> completion;
     };
 
-    explicit les_context(size_t queue_capacity);
+    explicit les_context(size_t queue_capacity, std::shared_ptr<stream> transfer_stream = {});
     ~les_context();
     les_context(const les_context&) = delete;
     les_context& operator=(const les_context&) = delete;
@@ -34,6 +37,7 @@ public:
     void wait();
     void cancel();
     void stop();
+    const std::shared_ptr<stream>& get_transfer_stream() const { return _transfer_stream; }
 
 private:
     struct task {
@@ -48,6 +52,7 @@ private:
     static void fail_tasks(std::deque<task>& tasks, std::exception_ptr error);
 
     const size_t _capacity;
+    std::shared_ptr<stream> _transfer_stream;
     std::mutex _mutex;
     std::mutex _control_mutex;
     std::condition_variable _changed;

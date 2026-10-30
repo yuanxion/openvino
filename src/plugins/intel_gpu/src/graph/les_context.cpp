@@ -4,7 +4,8 @@
 
 namespace cldnn {
 
-les_context::les_context(size_t queue_capacity) : _capacity(queue_capacity) {
+les_context::les_context(size_t queue_capacity, std::shared_ptr<stream> transfer_stream)
+    : _capacity(queue_capacity), _transfer_stream(std::move(transfer_stream)) {
     if (_capacity == 0 || _capacity > 1024) {
         throw std::invalid_argument("LES queue capacity must be in [1, 1024]");
     }

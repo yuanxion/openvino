@@ -6,6 +6,13 @@
 #include "intel_gpu/runtime/internal_properties.hpp"
 #include "intel_gpu/primitives/activation.hpp"
 #include "intel_gpu/primitives/input_layout.hpp"
+#include "intel_gpu/runtime/les_context.hpp"
+#include "runtime/ocl/ocl_engine.hpp"
+#include "runtime/ocl/ocl_stream.hpp"
+#include "runtime/ocl/ocl_event.hpp"
+
+#include <chrono>
+#include <future>
 
 namespace ov::test {
 
@@ -105,6 +112,43 @@ TEST(moe_les_network, non_moe_graph_creates_no_context_and_preserves_output) {
         EXPECT_FLOAT_EQ(values[1], 3.0f);
         EXPECT_EQ(network.get_les_epoch(), 0U);
     }
+}
+
+TEST(moe_les_network, transfer_lane_is_retained_until_active_upload_finishes) {
+    auto& engine = get_test_engine();
+    auto config = get_test_default_config(engine);
+    config.set_property(ov::intel_gpu::queue_type(cldnn::QueueTypes::in_order));
+    auto transfer = engine.create_stream(config);
+    std::weak_ptr<cldnn::stream> lifetime = transfer;
+    auto context = std::make_unique<cldnn::les_context>(2, std::move(transfer));
+    auto memory = engine.allocate_memory(cldnn::layout{cldnn::data_types::f32, cldnn::format::bfyx, {1, 1, 1, 2}});
+    cl::UserEvent gate(dynamic_cast<cldnn::ocl::ocl_engine&>(engine).get_cl_context());
+    std::promise<void> submitted;
+    auto ready = submitted.get_future();
+    auto ticket = context->submit(context->begin_epoch(), [&, lane = context->get_transfer_stream(), memory] {
+        std::vector<float> source{2.0f, 3.0f};
+        dynamic_cast<cldnn::ocl::ocl_stream&>(*lane).enqueue_external_barrier({std::make_shared<cldnn::ocl::ocl_event>(gate)});
+        auto uploaded = memory->copy_from(*lane, source.data(), false);
+        lane->flush();
+        submitted.set_value();
+        uploaded->wait();
+    });
+    auto status = ready.wait_for(std::chrono::seconds(5));
+    if (status != std::future_status::ready) {
+        gate.setStatus(CL_COMPLETE);
+        ASSERT_EQ(status, std::future_status::ready);
+    }
+    auto destroyed = std::async(std::launch::async, [owned = std::move(context)]() mutable { owned.reset(); });
+    auto blocked = destroyed.wait_for(std::chrono::milliseconds(20));
+    gate.setStatus(CL_COMPLETE);
+    EXPECT_EQ(blocked, std::future_status::timeout);
+    ASSERT_EQ(destroyed.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    destroyed.get();
+    EXPECT_THROW(ticket.completion.get(), cldnn::les_task_cancelled);
+    EXPECT_TRUE(lifetime.expired());
+    cldnn::mem_lock<float, cldnn::mem_lock_type::read> values(memory, tests::get_test_stream());
+    EXPECT_FLOAT_EQ(values[0], 2.0f);
+    EXPECT_FLOAT_EQ(values[1], 3.0f);
 }
 
 }  // namespace ov::test
