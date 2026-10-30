@@ -22,6 +22,8 @@ public:
         std::vector<size_t> slots;
         std::vector<uint32_t> missing_experts;
         std::vector<size_t> missing_slots;
+        std::vector<size_t> ready_pairs;
+        std::vector<size_t> missing_pairs;
     };
 
     explicit ExpertSlotReservations(size_t capacity);

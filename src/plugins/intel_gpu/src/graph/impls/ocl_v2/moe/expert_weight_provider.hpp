@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <vector>
 
 #include "intel_gpu/primitives/moe_3gemm_fused_compressed.hpp"
@@ -21,6 +22,12 @@ namespace ov::intel_gpu::ocl::moe {
 
 /// Slot indices produced by a simultaneous acquisition (parallel to the input experts vector).
 using ExpertSlotLease = std::vector<size_t>;
+
+struct ExpertDemand {
+    ExpertSlotLease slots;
+    std::vector<size_t> ready_pairs;
+    std::vector<size_t> missing_pairs;
+};
 
 /// Lightweight view of routed expert weight/scale/zp triplets for 3 GEMMs.
 struct RoutedWeightViews {
@@ -49,6 +56,8 @@ public:
     virtual std::shared_ptr<IExpertWeightProvider> clone() const = 0;
     virtual void set_les_context(cldnn::les_context*, uint64_t) {}
     virtual void set_consumer(cldnn::event::ptr) {}
+    virtual std::optional<ExpertDemand> begin_les_demand(const std::vector<uint32_t>&) { return std::nullopt; }
+    virtual void finish_les_demand(cldnn::stream&) { throw std::logic_error("No LES demand is supported"); }
 
     // Releases any pinning established by the most recent acquisition.
     virtual void release() = 0;

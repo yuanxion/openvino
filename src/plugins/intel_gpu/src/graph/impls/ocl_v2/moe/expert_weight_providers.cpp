@@ -37,6 +37,12 @@ OffloadExpertWeightProvider::OffloadExpertWeightProvider(size_t capacity,
       _cache(std::make_shared<LRUCache>(capacity)),
       _weight_reader(_weights_path) {}
 
+OffloadExpertWeightProvider::~OffloadExpertWeightProvider() {
+    if (_upload_completion.valid()) {
+        _upload_completion.wait();
+    }
+}
+
 void OffloadExpertWeightProvider::bind(cldnn::moe_weights& resident) {
     _resident = &resident;
     _cache->set_initialized();
@@ -66,11 +72,22 @@ void OffloadExpertWeightProvider::set_consumer(cldnn::event::ptr consumer) {
 
 void OffloadExpertWeightProvider::release() {
     std::exception_ptr error;
+    if (_upload_completion.valid()) {
+        try {
+            _upload_completion.get();
+        } catch (...) {
+            error = std::current_exception();
+        }
+        _upload_completion = {};
+    }
+    _upload_events.reset();
     if (_consumer) {
         try {
             _consumer->wait();
         } catch (...) {
-            error = std::current_exception();
+            if (!error) {
+                error = std::current_exception();
+            }
         }
         _consumer.reset();
     }
@@ -78,12 +95,23 @@ void OffloadExpertWeightProvider::release() {
         _reservations->release(*_reservation);
         _reservation.reset();
     }
+    _demand_finished = false;
     if (error) {
         std::rethrow_exception(error);
     }
 }
 
 std::optional<ExpertSlotLease> OffloadExpertWeightProvider::acquire_les(const std::vector<uint32_t>& experts, cldnn::stream& stream) {
+    auto demand = begin_les_demand(experts);
+    if (!demand) {
+        return std::nullopt;
+    }
+    finish_les_demand(stream);
+    return std::move(demand->slots);
+}
+
+std::optional<ExpertDemand> OffloadExpertWeightProvider::begin_les_demand(const std::vector<uint32_t>& experts) {
+    OPENVINO_ASSERT(_les_context && _reservations, "LES demand requires a context");
     release();
     _reservation = _reservations->reserve(experts, _les_epoch);
     if (!_reservation) {
@@ -91,10 +119,11 @@ std::optional<ExpertSlotLease> OffloadExpertWeightProvider::acquire_les(const st
     }
     try {
         OPENVINO_ASSERT(_resident && _les_context->get_transfer_stream(), "LES provider is not bound to a transfer lane");
-        auto events = std::make_shared<std::vector<cldnn::event::ptr>>();
+        ExpertDemand demand{_reservation->slots, _reservation->ready_pairs, _reservation->missing_pairs};
+        _upload_events = std::make_shared<std::vector<cldnn::event::ptr>>();
         if (!_reservation->missing_experts.empty()) {
             auto task = _les_context->submit(_les_epoch,
-                [this, events, transfer = _les_context->get_transfer_stream(), weights = *_resident,
+            [this, events = _upload_events, transfer = _les_context->get_transfer_stream(), weights = *_resident,
                  missing = _reservation->missing_experts, slots = _reservation->missing_slots]() mutable {
                     if (auto* perf = moe_otd::get_perf_counters()) {
                         perf->les_worker_tasks.fetch_add(1, std::memory_order_relaxed);
@@ -102,9 +131,22 @@ std::optional<ExpertSlotLease> OffloadExpertWeightProvider::acquire_les(const st
                     *events = moe_otd::fill_weights_memory_async(*transfer, _config, _weight_bin_offsets, _weight_reader,
                                                                weights, missing, slots);
                 });
-            task.completion.get();
-            dynamic_cast<cldnn::ocl::ocl_stream&>(stream).enqueue_external_barrier(*events);
+            _upload_completion = std::move(task.completion);
         }
+        return demand;
+    } catch (...) {
+        release();
+        throw;
+    }
+}
+
+void OffloadExpertWeightProvider::finish_les_demand(cldnn::stream& stream) {
+    OPENVINO_ASSERT(_reservation && !_demand_finished, "LES demand is missing or already finished");
+    try {
+        if (_upload_completion.valid()) {
+            _upload_completion.get();
+        }
+        dynamic_cast<cldnn::ocl::ocl_stream&>(stream).enqueue_external_barrier(*_upload_events);
         OPENVINO_ASSERT(_reservations->complete(*_reservation), "LES reservation became stale before GPUReady");
         if (auto* perf = moe_otd::get_perf_counters()) {
             auto unique_slots = _reservation->slots;
@@ -113,10 +155,11 @@ std::optional<ExpertSlotLease> OffloadExpertWeightProvider::acquire_les(const st
             perf->gpu_hits.fetch_add(unique_slots.size() - _reservation->missing_slots.size(), std::memory_order_relaxed);
             perf->gpu_misses.fetch_add(_reservation->missing_slots.size(), std::memory_order_relaxed);
         }
-        return _reservation->slots;
+        _demand_finished = true;
+        _upload_completion = {};
+        _upload_events.reset();
     } catch (...) {
-        _reservations->release(*_reservation);
-        _reservation.reset();
+        release();
         throw;
     }
 }
