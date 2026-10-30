@@ -34,11 +34,18 @@ struct OtdPerfCounters {
     std::atomic<uint64_t> les_worker_tasks{0};
     std::atomic<uint64_t> les_upload_chunks{0};
     std::atomic<uint64_t> les_upload_bytes{0};
+    std::atomic<uint64_t> les_waves{0};
+    std::atomic<uint64_t> les_ready_pairs{0};
+    std::atomic<uint64_t> les_missing_pairs{0};
+    std::atomic<uint64_t> les_shared_pairs{0};
 
     void dump() const;
 };
 
 OtdPerfCounters* get_perf_counters();
+bool les_trace_enabled();
+uint64_t les_device_time(cldnn::stream& stream);
+void les_trace_interval(const char* kind, uint64_t start, uint64_t end);
 
 class ParallelWeightReader {
 public:

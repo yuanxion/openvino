@@ -17,6 +17,7 @@
 #include <intel_gpu/runtime/memory.hpp>
 #include <intel_gpu/runtime/les_context.hpp>
 #include <iostream>
+#include <cstring>
 #include <numeric>
 
 #include "../../common/random_generator.hpp"
@@ -424,6 +425,7 @@ struct Moe3GemmTestParams {
     size_t lru_expert_num = 0;
     bool enable_les = false;
     bool profiling = false;
+    bool exhaustive_masks = false;
 };
 
 class moe_3gemm_compressed_gpu_random : public ::testing::TestWithParam<std::tuple<cldnn::MoERouterFused::RoutingType, Moe3GemmTestParams>> {
@@ -677,6 +679,71 @@ TEST_P(moe_3gemm_compressed_gpu_random, moe_accuracy_test_random) {
     network.set_input_data("hidden_states", hidden_states_mem);
     network.set_input_data("routing_weights", routing_weights_mem);
 
+    std::unique_ptr<cldnn::network> unsplit;
+    if (param.enable_les && param.lru_expert_num > 0 && param.seq_len <= 32) {
+        cldnn::topology baseline_topology;
+        for (const auto& entry : topology.get_primitives()) {
+            if (entry.first != "moe_3gemm_fused_compressed") {
+                baseline_topology.add_primitive(entry.second);
+            }
+        }
+        baseline_topology.add(moe_3gemm_fused_compressed("moe_3gemm_fused_compressed", moe_inputs, moe_config,
+                                                        weight_offsets, offload_weights_path, config.num_experts));
+        auto baseline_config = net_config.clone();
+        baseline_config.set_property(ov::intel_gpu::enable_les(false));
+        unsplit = std::make_unique<cldnn::network>(engine, baseline_topology, baseline_config);
+        unsplit->set_input_data("hidden_states", hidden_states_mem);
+    }
+    if (param.exhaustive_masks) {
+        ASSERT_TRUE(unsplit);
+        auto final_routing = routing_weights;
+        for (size_t pair = 0; pair < final_routing.size(); ++pair) {
+            const auto expert = pair % config.num_experts;
+            final_routing[pair] = ov::float16(expert < 8 ? 8.0f + (expert + pair / config.num_experts) % 8 : -8.0f);
+        }
+        auto final_memory = create_f16_tensor_3d(final_routing, config.batch_size, config.seq_len, config.num_experts);
+        unsplit->set_input_data("routing_weights", final_memory);
+        auto baseline_output = unsplit->execute().begin()->second.get_memory();
+        cldnn::mem_lock<ov::float16, mem_lock_type::read> baseline_values(baseline_output, unsplit->get_stream());
+        for (uint32_t mask = 0; mask < 256; ++mask) {
+            SCOPED_TRACE(mask);
+            cldnn::network masked(network.get_program());
+            auto warm_routing = routing_weights;
+            size_t hot = 0;
+            for (size_t expert = 0; expert < 8; ++expert) {
+                hot += (mask >> expert) & 1U;
+            }
+            for (size_t pair = 0; pair < warm_routing.size(); ++pair) {
+                auto expert = pair % config.num_experts;
+                const bool selected = expert < 8 ? (mask & (1U << expert)) != 0 : expert < 16 - hot;
+                warm_routing[pair] = ov::float16(selected ? 8.0f : -8.0f);
+            }
+            auto warm_memory = create_f16_tensor_3d(warm_routing, config.batch_size, config.seq_len, config.num_experts);
+            masked.set_input_data("hidden_states", hidden_states_mem);
+            masked.set_input_data("routing_weights", warm_memory);
+            masked.execute();
+            masked.set_input_data("routing_weights", final_memory);
+            if (mask == 85) {
+                std::ifstream original(offload_weights_path, std::ios::binary);
+                ASSERT_TRUE(original.is_open());
+                std::vector<char> saved_weights((std::istreambuf_iterator<char>(original)), std::istreambuf_iterator<char>());
+                original.close();
+                std::filesystem::resize_file(offload_weights_path, 0);
+                EXPECT_ANY_THROW(masked.execute());
+                std::ofstream restored(offload_weights_path, std::ios::binary);
+                restored.write(saved_weights.data(), saved_weights.size());
+                restored.close();
+                ASSERT_TRUE(restored.good());
+            }
+            auto output = masked.execute().begin()->second.get_memory();
+            cldnn::mem_lock<ov::float16, mem_lock_type::read> values(output, masked.get_stream());
+            for (size_t index = 0; index < config.seq_len * config.hidden_size; ++index) {
+                ASSERT_EQ(std::memcmp(&values[index], &baseline_values[index], sizeof(ov::float16)), 0) << index;
+            }
+        }
+        return;
+    }
+
     auto ref_output = routing_type == cldnn::MoERouterFused::RoutingType::SIGMOID_BIAS
                           ? ref.run_reference_sigmoid(hidden_states, routing_weights, routing_bias_data, routing_eps_val, w0_qdq, w1_qdq, w2_qdq)
                           : ref.run_reference_softmax(hidden_states, routing_weights, w0_qdq, w1_qdq, w2_qdq);
@@ -724,6 +791,15 @@ TEST_P(moe_3gemm_compressed_gpu_random, moe_accuracy_test_random) {
         auto output_prim = outputs.begin()->second.get_memory();
         get_test_stream().flush();
         cldnn::mem_lock<ov::float16, mem_lock_type::read> output_ptr(output_prim, get_test_stream());
+        if (unsplit) {
+            unsplit->set_input_data("routing_weights", independent && iteration % 2 ? alternate_memory : routing_weights_mem);
+            auto baseline_output = unsplit->execute().begin()->second.get_memory();
+            cldnn::mem_lock<ov::float16, mem_lock_type::read> baseline_values(baseline_output, unsplit->get_stream());
+            for (size_t index = 0; index < ref_output.size(); ++index) {
+                ASSERT_EQ(std::memcmp(&output_ptr[index], &baseline_values[index], sizeof(ov::float16)), 0)
+                    << "Bitwise split/unsplit mismatch at " << index << ", iteration " << iteration;
+            }
+        }
         const auto& expected = independent && iteration % 2 ? alternate_reference : ref_output;
         for (size_t index = 0; index < expected.size(); ++index) {
             ASSERT_NEAR(static_cast<float>(output_ptr[index]), static_cast<float>(expected[index]), tolerance)
@@ -776,6 +852,15 @@ INSTANTIATE_TEST_SUITE_P(smoke_les_p2,
             }
             return parameters;
         }())));
+
+INSTANTIATE_TEST_SUITE_P(smoke_les_p3_masks,
+    moe_3gemm_compressed_gpu_random,
+    ::testing::Combine(
+        ::testing::Values(cldnn::MoERouterFused::RoutingType::SOFTMAX, cldnn::MoERouterFused::RoutingType::SIGMOID_BIAS),
+        ::testing::Values(Moe3GemmTestParams{1, true, 128, 128, 16, 8, 128, false, 8, true, true, true},
+                          Moe3GemmTestParams{4, true, 128, 128, 16, 8, 128, false, 8, true, true, true},
+                          Moe3GemmTestParams{1, false, 128, 128, 16, 8, 128, false, 8, true, true, true},
+                          Moe3GemmTestParams{4, false, 128, 128, 16, 8, 128, false, 8, true, true, true})));
 
 INSTANTIATE_TEST_SUITE_P(smoke_offload,
     moe_3gemm_compressed_gpu_random,
@@ -836,7 +921,17 @@ INSTANTIATE_TEST_SUITE_P(smoke_batched_gemv_hidden_not_multiple_of_1024,
 
 class moe_3gemm_compressed_gpu_u4 : public ::testing::TestWithParam<cldnn::MoERouterFused::RoutingType> {};
 
-class moe_3gemm_compressed_gpu_shared_random : public ::testing::TestWithParam<Moe3GemmTestParams> {};
+class moe_3gemm_compressed_gpu_shared_random : public ::testing::TestWithParam<Moe3GemmTestParams> {
+protected:
+    std::filesystem::path offload_weights_path;
+    void TearDown() override {
+        if (!offload_weights_path.empty()) {
+            std::error_code error;
+            std::filesystem::remove(offload_weights_path, error);
+            EXPECT_FALSE(error) << error.message();
+        }
+    }
+};
 
 TEST_P(moe_3gemm_compressed_gpu_shared_random, moe_accuracy_test_shared_expert_random) {
     auto param = GetParam();
@@ -939,6 +1034,9 @@ TEST_P(moe_3gemm_compressed_gpu_shared_random, moe_accuracy_test_shared_expert_r
 
     auto hidden_states_mem = create_f16_tensor(hidden_states, config.batch_size, config.seq_len, config.hidden_size, 1);
     auto routing_weights_mem = create_f16_tensor(routing_weights, config.batch_size, config.seq_len, config.num_experts, 1);
+    routing_weights_mem = engine.reinterpret_buffer(*routing_weights_mem,
+        layout{ov::PartialShape{static_cast<int64_t>(config.batch_size), static_cast<int64_t>(config.seq_len),
+                                 static_cast<int64_t>(config.num_experts)}, data_types::f16, format::bfyx});
 
     size_t group_num = config.hidden_size / config.group_size;
     size_t group_num2 = config.inter_size / config.group_size;
@@ -1080,7 +1178,67 @@ TEST_P(moe_3gemm_compressed_gpu_shared_random, moe_accuracy_test_shared_expert_r
     for (size_t i = 0; i < ref_output.size(); ++i) {
         EXPECT_NEAR(static_cast<float>(output_ptr[i]), static_cast<float>(ref_output[i]), tolerance);
     }
+    if (param.enable_les) {
+        ASSERT_EQ(group_num, 1U);
+        ASSERT_EQ(group_num2, 1U);
+        offload_weights_path = std::filesystem::temp_directory_path() /
+            ("moe_shared_les_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".bin");
+        std::ofstream file(offload_weights_path, std::ios::binary);
+        ASSERT_TRUE(file.is_open());
+        std::vector<size_t> offsets;
+        for (const auto& memory : std::vector<memory::ptr>{w0_weight_mem, w1_weight_mem, w2_weight_mem,
+                                                         w0_scale_mem, w1_scale_mem, w2_scale_mem,
+                                                         w0_zp_mem, w1_zp_mem, w2_zp_mem}) {
+            offsets.push_back(static_cast<size_t>(file.tellp()));
+            std::vector<uint8_t> bytes(memory->size());
+            memory->copy_to(get_test_stream(), bytes.data(), 0, 0, bytes.size(), true);
+            file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        }
+        file.close();
+        ASSERT_TRUE(file.good());
+        auto offloaded = *std::static_pointer_cast<moe_3gemm_fused_compressed>(topology.at("moe_3gemm_fused_compressed"));
+        offloaded._otd.lru_expert_num = param.lru_expert_num;
+        offloaded._otd.weight_bin_offsets = offsets;
+        offloaded._otd.weights_path = offload_weights_path;
+        cldnn::topology split_topology;
+        for (const auto& entry : topology.get_primitives()) {
+            if (entry.first != offloaded.id) {
+                split_topology.add_primitive(entry.second);
+            }
+        }
+        split_topology.add(offloaded);
+        auto split_config = net_config.clone();
+        split_config.set_property({ov::intel_gpu::enable_les(true), ov::intel_gpu::offload_ratio(50),
+                                   ov::enable_profiling(param.profiling), ov::num_streams(1)});
+        cldnn::network split(engine, split_topology, split_config);
+        split.set_input_data("hidden_states", hidden_states_mem);
+        split.set_input_data("routing_weights", routing_weights_mem);
+        for (size_t iteration = 0; iteration < 3; ++iteration) {
+            auto result = split.execute().begin()->second.get_memory();
+            cldnn::mem_lock<ov::float16, mem_lock_type::read> values(result, split.get_stream());
+            for (size_t index = 0; index < ref_output.size(); ++index) {
+                ASSERT_EQ(std::memcmp(&values[index], &output_ptr[index], sizeof(ov::float16)), 0)
+                    << "Shared split mismatch " << index << ", iteration " << iteration;
+            }
+        }
+    }
 }
+
+INSTANTIATE_TEST_SUITE_P(smoke_les_p3_shared,
+    moe_3gemm_compressed_gpu_shared_random,
+    ::testing::ValuesIn([] {
+        std::vector<Moe3GemmTestParams> parameters;
+        for (bool u4 : {false, true}) {
+            for (size_t tokens : {1U, 4U}) {
+                for (size_t capacity : {1U, 4U}) {
+                    for (bool profiling : {false, true}) {
+                        parameters.push_back({tokens, u4, 128, 128, 4, 2, 128, false, capacity, true, profiling});
+                    }
+                }
+            }
+        }
+        return parameters;
+    }()));
 
 INSTANTIATE_TEST_SUITE_P(smoke,
                          moe_3gemm_compressed_gpu_shared_random,
