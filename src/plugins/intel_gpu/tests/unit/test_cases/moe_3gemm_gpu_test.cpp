@@ -16,6 +16,7 @@
 #include <intel_gpu/runtime/memory.hpp>
 #include <intel_gpu/runtime/les_context.hpp>
 #include <iostream>
+#include <cstring>
 #include <numeric>
 
 #include "../../common/random_generator.hpp"
@@ -605,6 +606,8 @@ struct Moe3GemmTestParams {
     bool is_signed = false;
     bool enable_les = false;
     bool profiling = false;
+    bool exhaustive_masks = false;
+    size_t lru_expert_num = 0;
 };
 
 class moe_3gemm_compressed_gpu_random : public ::testing::TestWithParam<std::tuple<cldnn::MoERouterFused::RoutingType, Moe3GemmTestParams>> {};
@@ -875,7 +878,17 @@ INSTANTIATE_TEST_SUITE_P(smoke_batched_gemv_hidden_not_multiple_of_1024,
 
 class moe_3gemm_compressed_gpu_u4 : public ::testing::TestWithParam<cldnn::MoERouterFused::RoutingType> {};
 
-class moe_3gemm_compressed_gpu_shared_random : public ::testing::TestWithParam<Moe3GemmTestParams> {};
+class moe_3gemm_compressed_gpu_shared_random : public ::testing::TestWithParam<Moe3GemmTestParams> {
+protected:
+    std::filesystem::path offload_weights_path;
+    void TearDown() override {
+        if (!offload_weights_path.empty()) {
+            std::error_code error;
+            std::filesystem::remove(offload_weights_path, error);
+            EXPECT_FALSE(error) << error.message();
+        }
+    }
+};
 
 TEST_P(moe_3gemm_compressed_gpu_shared_random, moe_accuracy_test_shared_expert_random) {
     auto param = GetParam();
@@ -978,6 +991,9 @@ TEST_P(moe_3gemm_compressed_gpu_shared_random, moe_accuracy_test_shared_expert_r
 
     auto hidden_states_mem = create_f16_tensor(hidden_states, config.batch_size, config.seq_len, config.hidden_size, 1);
     auto routing_weights_mem = create_f16_tensor(routing_weights, config.batch_size, config.seq_len, config.num_experts, 1);
+    routing_weights_mem = engine.reinterpret_buffer(*routing_weights_mem,
+        layout{ov::PartialShape{static_cast<int64_t>(config.batch_size), static_cast<int64_t>(config.seq_len),
+                                 static_cast<int64_t>(config.num_experts)}, data_types::f16, format::bfyx});
 
     size_t group_num = config.hidden_size / config.group_size;
     size_t group_num2 = config.inter_size / config.group_size;
@@ -1102,6 +1118,12 @@ TEST_P(moe_3gemm_compressed_gpu_shared_random, moe_accuracy_test_shared_expert_r
 
     auto net_config = get_test_default_config(engine);
     net_config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
+    cldnn::topology offload_topology;
+    if (param.enable_les) {
+        for (const auto& entry : topology.get_primitives()) {
+            offload_topology.add_primitive(entry.second->clone());
+        }
+    }
     network network(engine, topology, net_config);
     network.set_input_data("hidden_states", hidden_states_mem);
     network.set_input_data("routing_weights", routing_weights_mem);
@@ -1119,7 +1141,67 @@ TEST_P(moe_3gemm_compressed_gpu_shared_random, moe_accuracy_test_shared_expert_r
     for (size_t i = 0; i < ref_output.size(); ++i) {
         EXPECT_NEAR(static_cast<float>(output_ptr[i]), static_cast<float>(ref_output[i]), tolerance);
     }
+    if (param.enable_les) {
+        ASSERT_EQ(group_num, 1U);
+        ASSERT_EQ(group_num2, 1U);
+        offload_weights_path = std::filesystem::temp_directory_path() /
+            ("moe_shared_les_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".bin");
+        std::ofstream file(offload_weights_path, std::ios::binary);
+        ASSERT_TRUE(file.is_open());
+        std::vector<size_t> offsets;
+        for (const auto& memory : std::vector<memory::ptr>{w0_weight_mem, w1_weight_mem, w2_weight_mem,
+                                                         w0_scale_mem, w1_scale_mem, w2_scale_mem,
+                                                         w0_zp_mem, w1_zp_mem, w2_zp_mem}) {
+            offsets.push_back(static_cast<size_t>(file.tellp()));
+            std::vector<uint8_t> bytes(memory->size());
+            memory->copy_to(get_test_stream(), bytes.data(), 0, 0, bytes.size(), true);
+            file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        }
+        file.close();
+        ASSERT_TRUE(file.good());
+        auto offloaded = *std::static_pointer_cast<moe_3gemm_fused_compressed>(offload_topology.at("moe_3gemm_fused_compressed"));
+        offloaded._otd.lru_expert_num = param.lru_expert_num;
+        offloaded._otd.weight_bin_offsets = offsets;
+        offloaded._otd.weights_path = offload_weights_path;
+        cldnn::topology split_topology;
+        for (const auto& entry : offload_topology.get_primitives()) {
+            if (entry.first != offloaded.id) {
+                split_topology.add_primitive(entry.second);
+            }
+        }
+        split_topology.add(offloaded);
+        auto split_config = net_config.clone();
+        split_config.set_property({ov::intel_gpu::enable_les(true), ov::intel_gpu::offload_ratio(50),
+                                   ov::enable_profiling(param.profiling), ov::num_streams(1)});
+        cldnn::network split(engine, split_topology, split_config);
+        split.set_input_data("hidden_states", hidden_states_mem);
+        split.set_input_data("routing_weights", routing_weights_mem);
+        for (size_t iteration = 0; iteration < 3; ++iteration) {
+            auto result = split.execute().begin()->second.get_memory();
+            cldnn::mem_lock<ov::float16, mem_lock_type::read> values(result, split.get_stream());
+            for (size_t index = 0; index < ref_output.size(); ++index) {
+                ASSERT_EQ(std::memcmp(&values[index], &output_ptr[index], sizeof(ov::float16)), 0)
+                    << "Shared split mismatch " << index << ", iteration " << iteration;
+            }
+        }
+    }
 }
+
+INSTANTIATE_TEST_SUITE_P(smoke_les_p3_shared,
+    moe_3gemm_compressed_gpu_shared_random,
+    ::testing::ValuesIn([] {
+        std::vector<Moe3GemmTestParams> parameters;
+        for (bool u4 : {false, true}) {
+            for (size_t tokens : {1U, 4U}) {
+                for (size_t capacity : {1U, 4U}) {
+                    for (bool profiling : {false, true}) {
+                        parameters.push_back({tokens, u4, 128, 128, 4, 2, 128, false, true, profiling, false, capacity});
+                    }
+                }
+            }
+        }
+        return parameters;
+    }()));
 
 INSTANTIATE_TEST_SUITE_P(smoke,
                          moe_3gemm_compressed_gpu_shared_random,
