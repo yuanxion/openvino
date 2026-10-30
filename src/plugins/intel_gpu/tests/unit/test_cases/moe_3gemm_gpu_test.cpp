@@ -15,6 +15,7 @@
 #include <intel_gpu/runtime/engine.hpp>
 #include <intel_gpu/runtime/layout.hpp>
 #include <intel_gpu/runtime/memory.hpp>
+#include <intel_gpu/runtime/les_context.hpp>
 #include <iostream>
 #include <numeric>
 
@@ -422,6 +423,7 @@ struct Moe3GemmTestParams {
     bool is_signed = false;
     size_t lru_expert_num = 0;
     bool enable_les = false;
+    bool profiling = false;
 };
 
 class moe_3gemm_compressed_gpu_random : public ::testing::TestWithParam<std::tuple<cldnn::MoERouterFused::RoutingType, Moe3GemmTestParams>> {
@@ -647,16 +649,19 @@ TEST_P(moe_3gemm_compressed_gpu_random, moe_accuracy_test_random) {
     net_config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
     if (param.enable_les) {
         net_config.set_property({ov::intel_gpu::enable_les(true),
+                                 ov::enable_profiling(param.profiling),
                                  ov::intel_gpu::les_queue_capacity(2),
                                  ov::intel_gpu::offload_ratio(param.lru_expert_num > 0 ? 50 : 0)});
     }
     network network(engine, topology, net_config);
     EXPECT_EQ(network.get_les_context() != nullptr, param.enable_les && param.lru_expert_num > 0);
+    std::unique_ptr<cldnn::network> independent;
     if (network.get_les_context()) {
-        cldnn::network independent(network.get_program());
-        ASSERT_NE(independent.get_les_context(), nullptr);
-        EXPECT_NE(network.get_les_context(), independent.get_les_context());
-        EXPECT_EQ(independent.get_les_epoch(), 0U);
+        independent = std::make_unique<cldnn::network>(network.get_program());
+        ASSERT_NE(independent->get_les_context(), nullptr);
+        EXPECT_NE(network.get_les_context(), independent->get_les_context());
+        EXPECT_NE(network.get_les_context()->get_transfer_stream(), independent->get_les_context()->get_transfer_stream());
+        EXPECT_EQ(independent->get_les_epoch(), 0U);
         if (routing_type == cldnn::MoERouterFused::RoutingType::SOFTMAX && param.seq_len == 1) {
             auto invalid = net_config.clone();
             invalid.set_property(ov::num_streams(2));
@@ -679,14 +684,49 @@ TEST_P(moe_3gemm_compressed_gpu_random, moe_accuracy_test_random) {
     // while the reference uses f32, leading to slightly larger numerical divergence than Softmax.
     const float base_tolerance = routing_type == cldnn::MoERouterFused::RoutingType::SIGMOID_BIAS ? 0.3f : 0.15f;
     const float tolerance = base_tolerance * (config.hidden_size / 128);
+    memory::ptr alternate_memory;
+    std::vector<ov::float16> alternate_reference;
+    if (independent) {
+        auto alternate_routing = routing_weights;
+        for (size_t index = 0; index < alternate_routing.size(); ++index) {
+            alternate_routing[index] = ov::float16(index % config.num_experts >= 2 ? 8.0f : -8.0f);
+        }
+        alternate_memory = create_f16_tensor_3d(alternate_routing, config.batch_size, config.seq_len, config.num_experts);
+        alternate_reference = routing_type == cldnn::MoERouterFused::RoutingType::SIGMOID_BIAS
+            ? ref.run_reference_sigmoid(hidden_states, alternate_routing, routing_bias_data, routing_eps_val, w0_qdq, w1_qdq, w2_qdq)
+            : ref.run_reference_softmax(hidden_states, alternate_routing, w0_qdq, w1_qdq, w2_qdq);
+        independent->set_input_data("hidden_states", hidden_states_mem);
+        independent->set_input_data("routing_weights", alternate_memory);
+        if (routing_type == cldnn::MoERouterFused::RoutingType::SOFTMAX && param.seq_len == 1 &&
+            param.lru_expert_num == 1 && !param.profiling) {
+            auto hidden_path = offload_weights_path.string() + ".retry";
+            std::filesystem::rename(offload_weights_path, hidden_path);
+            EXPECT_ANY_THROW(network.execute());
+            std::filesystem::rename(hidden_path, offload_weights_path);
+        }
+    }
     for (size_t iteration = 0; iteration < (param.lru_expert_num > 0 ? 3U : 1U); ++iteration) {
+        if (independent) {
+            auto other_output = independent->execute().begin()->second.get_memory();
+            cldnn::mem_lock<ov::float16, mem_lock_type::read> values(other_output, independent->get_stream());
+            for (size_t index = 0; index < alternate_reference.size(); ++index) {
+                ASSERT_NEAR(static_cast<float>(values[index]), static_cast<float>(alternate_reference[index]), tolerance);
+            }
+            network.set_input_data("routing_weights", iteration % 2 ? alternate_memory : routing_weights_mem);
+        }
+        auto previous_epoch = network.get_les_epoch();
         auto outputs = network.execute();
-        EXPECT_EQ(network.get_les_epoch(), network.get_les_context() ? iteration + 1 : 0U);
+        if (network.get_les_context()) {
+            EXPECT_GT(network.get_les_epoch(), previous_epoch);
+        } else {
+            EXPECT_EQ(network.get_les_epoch(), 0U);
+        }
         auto output_prim = outputs.begin()->second.get_memory();
         get_test_stream().flush();
         cldnn::mem_lock<ov::float16, mem_lock_type::read> output_ptr(output_prim, get_test_stream());
-        for (size_t index = 0; index < ref_output.size(); ++index) {
-            ASSERT_NEAR(static_cast<float>(output_ptr[index]), static_cast<float>(ref_output[index]), tolerance)
+        const auto& expected = independent && iteration % 2 ? alternate_reference : ref_output;
+        for (size_t index = 0; index < expected.size(); ++index) {
+            ASSERT_NEAR(static_cast<float>(output_ptr[index]), static_cast<float>(expected[index]), tolerance)
                 << "Mismatch at index " << index << ", iteration " << iteration;
         }
     }
@@ -718,6 +758,24 @@ INSTANTIATE_TEST_SUITE_P(smoke_les,
             Moe3GemmTestParams{1, true, 256, 256, 4, 2, 128, false, 1, true},
             Moe3GemmTestParams{4, true, 256, 256, 4, 2, 128, false, 2, true},
             Moe3GemmTestParams{48, true, 256, 256, 4, 2, 128, false, 1, true})));
+
+INSTANTIATE_TEST_SUITE_P(smoke_les_p2,
+    moe_3gemm_compressed_gpu_random,
+    ::testing::Combine(
+        ::testing::Values(cldnn::MoERouterFused::RoutingType::SOFTMAX, cldnn::MoERouterFused::RoutingType::SIGMOID_BIAS),
+        ::testing::ValuesIn([] {
+            std::vector<Moe3GemmTestParams> parameters;
+            for (bool u4 : {false, true}) {
+                for (size_t tokens : {1U, 4U, 48U}) {
+                    for (size_t capacity : {1U, 2U, 4U}) {
+                        for (bool profiling : {false, true}) {
+                            parameters.push_back({tokens, u4, 256, 256, 4, 2, 128, false, capacity, true, profiling});
+                        }
+                    }
+                }
+            }
+            return parameters;
+        }())));
 
 INSTANTIATE_TEST_SUITE_P(smoke_offload,
     moe_3gemm_compressed_gpu_random,

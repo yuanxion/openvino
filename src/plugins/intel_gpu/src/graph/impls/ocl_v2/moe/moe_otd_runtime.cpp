@@ -327,7 +327,11 @@ std::vector<cldnn::event::ptr> fill_weights_memory_async(cldnn::stream& transfer
                     buffer.upload->wait();
                 }
                 auto bytes = std::min(chunk_bytes, plan.bytes - offset);
-                buffer.bytes.resize(bytes);
+                if (buffer.bytes.capacity() < bytes) {
+                    buffer.bytes = std::vector<uint8_t>(bytes);
+                } else {
+                    buffer.bytes.resize(bytes);
+                }
                 weight_reader.read(reinterpret_cast<char*>(buffer.bytes.data()), bytes, plan.source + offset);
                 maybe_transpose_scale_zp(config, plan.component, plan.memory->get_layout(), buffer.bytes, bytes);
                 buffer.upload = plan.memory->copy_from(transfer_stream, buffer.bytes.data(), 0, plan.destination + offset, bytes, false);

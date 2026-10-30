@@ -22,6 +22,7 @@ namespace ov::intel_gpu::ocl::moe {
 // for the network lifetime. This is the behaviour of the non-offloaded (ratio=0) path.
 class ResidentExpertWeightProvider : public IExpertWeightProvider {
 public:
+    std::shared_ptr<IExpertWeightProvider> clone() const override { return std::make_shared<ResidentExpertWeightProvider>(); }
     void release() override {}
     size_t resident_capacity() const override {
         return 0;
@@ -72,7 +73,10 @@ public:
         return true;
     }
 
-    void release() override {}
+    void release() override;
+    std::shared_ptr<IExpertWeightProvider> clone() const override;
+    void set_les_context(cldnn::les_context* context, uint64_t epoch) override;
+    void set_consumer(cldnn::event::ptr consumer) override;
     void bind(cldnn::moe_weights& resident) override;
     bool is_bound() const override {
         return _bound;
@@ -98,6 +102,12 @@ private:
     moe_otd::ParallelWeightReader _weight_reader;
     cldnn::moe_weights* _resident = nullptr;
     bool _bound = false;
+    cldnn::les_context* _les_context = nullptr;
+    uint64_t _les_epoch = 0;
+    std::unique_ptr<ExpertSlotReservations> _reservations;
+    std::optional<ExpertSlotReservations::Ticket> _reservation;
+    cldnn::event::ptr _consumer;
+    std::optional<ExpertSlotLease> acquire_les(const std::vector<uint32_t>& experts, cldnn::stream& stream);
 };
 
 }  // namespace ov::intel_gpu::ocl::moe
