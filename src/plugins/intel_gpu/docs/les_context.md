@@ -1,4 +1,4 @@
-# LES Context: Stage 1 / P1-P3
+# LES Context And Chain Discovery
 
 P1 introduced a default-off, network-local Host task service. P2 moved
 expert reads, unchanged repacking and nonblocking uploads to its worker and
@@ -97,7 +97,8 @@ and ratio 0 or 50 creates no context and preserves its output.
 | Stage 1 / P2.3 | `0b7014a295` | 14 upload/provider tests passed |
 | Stage 1 / P2.4 | `9a8dcff850` | 303 complete focused tests, 80 LES-on forced-fallback tests, source Qwen ratio-80 LES-on smoke passed |
 | Stage 1 / P3.1a | `94d1eaae6d` | Canonical pair snapshots and nonblocking demand foundation; 307 focused tests and 80 forced-fallback cases passed |
-| Stage 1 / P3.1b-P3.3 | This commit | Masked GEMV, ready-first demand overlap, bounded multi-wave execution; 331 focused tests, 104 forced-fallback cases, source model and actual overlap trace passed |
+| Stage 1 / P3.1b-P3.3 | `000d056bf2` | Masked GEMV, ready-first demand overlap, bounded multi-wave execution; 331 focused tests, 104 forced-fallback cases, source model and actual overlap trace passed |
+| Stage 2 / P4.1a | This commit | Read-only static MoE chain candidates; 16 targeted integration, 339 focused and 104 forced-fallback tests passed |
 
 P1.3 validation used the source Debug/OCL build on Intel Arc Lunar Lake with
 assertions and existing numerical tolerances unchanged. All listed runs had
@@ -338,3 +339,48 @@ runs have uncontrolled page cache and are not a general speedup guarantee. LES
 remains default-off; Decode overhead needs performance tuning. ZE remains
 unsupported, larger-Prefill split and cross-layer prediction/pooling are not P3,
 and the previously documented TSan environment limitation is unchanged.
+
+## P4.1a: Static Chain Candidates Only
+
+`program::get_les_moe_links()` queries the program dependency graph and returns
+value descriptors containing source/target MoE IDs, the source's hidden-input ID
+(`proxy_hidden`), the target's hidden-input ID, and a status. It does not infer
+causality from execution order or node names. LES-off and internal programs
+return no descriptors. Callers must query the completed graph; results are
+snapshots, not references to mutable graph nodes or live runtime bindings.
+
+Discovery starts at each MoE's hidden input, not its routing or weight inputs.
+It traverses ordinary dependencies, stops at MoEs and constant data, and rejects
+loop/condition boundaries. It removes older MoE ancestors exposed by residual
+bypasses before testing uniqueness. Multiple independent nearest predecessors
+are ambiguous; a predecessor reaching multiple next MoEs is branched, including
+when another successor is ambiguous. Neither case is a usable chain candidate.
+Missing hidden dependencies are explicitly unsupported, and a chain root has
+`no_predecessor`. IDs are returned in deterministic target-ID order, not layer
+execution order. No graph edges, output tensors, memory plans or cache bytes
+are changed. The query stores no graph pointers and runs only when requested.
+
+`candidate` means topological adjacency only, not permission to launch prediction.
+It does not validate Router weights/bias/routing semantics, OTD eligibility,
+single-token shapes or hidden-buffer lifetime. No runtime consumer, proxy-router
+kernel or speculative I/O is enabled by this step. Unsupported graphs remain on
+the existing asynchronous-demand path. The current algorithm conservatively
+rejects branches rather than guessing a chain, and may return no useful candidate
+on more complex models.
+
+Eight graph tests cover ordinary-layer/residual gaps, nearest-predecessor
+selection, independent chains, merges, forks, Router-side dependencies, a loop
+boundary, missing hidden inputs, LES-off and non-MoE graphs. Existing real MoE
+fixtures also query their optimized program and retain all original numerical
+and bitwise checks. Final Debug/OCL verification passed 339 tests in 28 suites
+and the overlapping 104-case forced-fallback subset, zero failures/skips; the
+16-case targeted run is included, not additive. The plugin was relinked. The
+residual probe first failed as intended and passed after ancestor filtering.
+
+P4 remains incomplete. Next is Router descriptor qualification and compile/import
+parity, followed by isolated single-token proxy prediction, epoch/shape checks,
+activation lifetime protection and offline recall comparisons before prefetch.
+Cache serialization was not changed; warm/cold imported-chain equivalence and a
+new real-model P4 discovery run have not been verified. P3 model evidence above
+is historical, not validation of a predictor. Full-suite, ZE and TSan limits
+remain unchanged.
