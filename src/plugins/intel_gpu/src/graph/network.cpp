@@ -1064,7 +1064,10 @@ void network::initialize_les() {
     OPENVINO_ASSERT(config.get_offload_ratio() < 100, "LES requires OFFLOAD_RATIO in [1, 99]");
     OPENVINO_ASSERT(config.get_num_streams() == 1, "LES requires NUM_STREAMS=1");
     OPENVINO_ASSERT(!config.get_record_replay(), "LES does not support record/replay");
-    _les_context = std::make_unique<les_context>(config.get_les_queue_capacity());
+    OPENVINO_ASSERT(_engine.runtime_type() == runtime_types::ocl, "LES asynchronous loading currently requires the OCL backend");
+    auto transfer_config = config.clone();
+    transfer_config.set_property(ov::intel_gpu::queue_type(QueueTypes::in_order));
+    _les_context = std::make_unique<les_context>(config.get_les_queue_capacity(), _engine.create_stream(transfer_config));
 }
 
 std::map<primitive_id, network_output> network::execute(const std::vector<event::ptr>& dependencies) {

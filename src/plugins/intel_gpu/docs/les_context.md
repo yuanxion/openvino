@@ -86,7 +86,8 @@ and ratio 0 or 50 creates no context and preserves its output.
 | Stage 1 / P1.1 | `580cb907ba` | Default-off configuration; 184 focused OCL tests passed |
 | Stage 1 / P1.2 | `736dc82af2` | 12 worker tests, the same 12 under TSan, 17 integrated configuration/lifecycle tests passed |
 | Stage 1 / P1.3 | `903156e707` | 26 P1-focused tests, 205 complete focused tests, 8 LES-on forced-fallback tests passed |
-| Stage 1 / P2.1a | This commit | 12 cross-queue event tests and 215 complete focused OCL tests passed |
+| Stage 1 / P2.1a | `a75f2d0b7e` | 12 cross-queue event tests and 215 complete focused OCL tests passed |
+| Stage 1 / P2.1b | This commit | 12 CPU worker tests and 27 integrated LES/lane tests passed |
 
 P1.3 validation used the source Debug/OCL build on Intel Arc Lunar Lake with
 assertions and existing numerical tolerances unchanged. All listed runs had
@@ -115,8 +116,8 @@ prove completion across independent producer queues. P2 upload aggregation must
 provide the individual weight, scale and zero-point completion events instead.
 The caller remains responsible for source-memory, staging and slot lifetimes.
 
-This is the first P2.1 substep, not asynchronous expert loading. Transfer-lane
-ownership, ZE adaptation and the P2.2-P2.4 reservation/upload pipeline are pending.
+This is the first P2.1 substep, not asynchronous expert loading. ZE adaptation
+and the P2.2-P2.4 reservation/upload pipeline are pending.
 Production weight-loading and the default execution path do not yet call this API.
 
 Validation on the source Debug/OCL Lunar Lake build passed 12 cross-queue event
@@ -128,3 +129,20 @@ on and off. They also cover missing handles, grouped native events, context
 mismatch, known errors and errors arising after barrier enqueue. No sleeps or
 queue finish are used to establish visibility. This is not the full GPU suite,
 ZE validation or a performance/overlap result.
+
+## P2.1b: Transfer-Lane Ownership
+
+Each eligible network creates a separate in-order transfer stream owned by its
+LES context. The context remains backend-neutral; its CPU-only tests do not
+require GPU headers or libraries. Destruction joins the worker before releasing
+the stream. A GPU task must drain every upload it issues before returning or
+unwinding, so stop/join also covers its staging and device work. The generic Host
+task API itself cannot infer outstanding DMA from a callback.
+
+The current asynchronous LES backend is explicitly OCL-only. LES-on eligible ZE
+networks fail construction rather than using unverified event semantics; LES-off
+and resident/non-MoE networks retain the existing path. A gated real-upload test
+checks that context destruction waits for active device work, retains the stream
+and source data, and releases the stream only after completion. The 27 integrated
+tests also include the existing LES-on numerical checks. No dedicated copy-engine
+selection or overlap performance is implied by creating a separate queue.
