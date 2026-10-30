@@ -85,7 +85,8 @@ and ratio 0 or 50 creates no context and preserves its output.
 |---|---|---|
 | Stage 1 / P1.1 | `580cb907ba` | Default-off configuration; 184 focused OCL tests passed |
 | Stage 1 / P1.2 | `736dc82af2` | 12 worker tests, the same 12 under TSan, 17 integrated configuration/lifecycle tests passed |
-| Stage 1 / P1.3 | This commit | 26 P1-focused tests, 205 complete focused tests, 8 LES-on forced-fallback tests passed |
+| Stage 1 / P1.3 | `903156e707` | 26 P1-focused tests, 205 complete focused tests, 8 LES-on forced-fallback tests passed |
+| Stage 1 / P2.1a | This commit | 12 cross-queue event tests and 215 complete focused OCL tests passed |
 
 P1.3 validation used the source Debug/OCL build on Intel Arc Lunar Lake with
 assertions and existing numerical tolerances unchanged. All listed runs had
@@ -93,3 +94,37 @@ zero failures and skips; the subsets overlap and are not additive. The fallback
 run disabled both `OV_GPU_MOE_USE_GROUPED_GEMM_PREFILL` and
 `OV_GPU_MOE_USE_MICRO_GEMM_PREFILL`. The complete focused run is not the full GPU
 unit suite, and no new ZE LES or real-model performance claim is made.
+
+## P2.1a: Strict OCL External Dependencies
+
+The opt-in `ocl_stream::enqueue_external_barrier(deps)` queues a device barrier
+for individual native OpenCL events, independently of profiling and the stream's
+normal synchronization mode. Unlike the legacy dependency conversion, it rejects
+null dependencies, missing native handles, grouped events, foreign contexts and
+events already known to have failed. All dependencies are validated before the
+barrier is enqueued. An empty list is a no-op, not an all-queue wait.
+
+Callers must explicitly flush producer queues so their events can progress.
+Returning from this method means only that the barrier was enqueued. Subsequent
+commands cannot consume the uploaded data before its dependencies complete;
+execution errors arising later must still be observed through a real completion
+event. There is no Host wait or compute-queue finish in this method.
+
+Grouped events are rejected because their representative native handle does not
+prove completion across independent producer queues. P2 upload aggregation must
+provide the individual weight, scale and zero-point completion events instead.
+The caller remains responsible for source-memory, staging and slot lifetimes.
+
+This is the first P2.1 substep, not asynchronous expert loading. Transfer-lane
+ownership, ZE adaptation and the P2.2-P2.4 reservation/upload pipeline are pending.
+Production weight-loading and the default execution path do not yet call this API.
+
+Validation on the source Debug/OCL Lunar Lake build passed 12 cross-queue event
+tests, including the two original native controls, and 215 complete focused
+tests. Both runs had zero failures and skips; the subsets overlap. The external
+visibility checks split the input between two independently gated producer
+queues and use both in-order and out-of-order compute queues, with profiling
+on and off. They also cover missing handles, grouped native events, context
+mismatch, known errors and errors arising after barrier enqueue. No sleeps or
+queue finish are used to establish visibility. This is not the full GPU suite,
+ZE validation or a performance/overlap result.
