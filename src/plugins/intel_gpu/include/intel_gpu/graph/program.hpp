@@ -163,6 +163,21 @@ public:
     bool is_body_program() const { return _is_body_program; }
     bool can_be_optimized() const { return _can_be_optimized; }
     bool is_internal_program() const { return is_internal; }
+    enum class les_link_status {
+        candidate,
+        no_predecessor,
+        ambiguous_predecessor,
+        branched_predecessor,
+        unsupported_topology
+    };
+    struct les_moe_link {
+        primitive_id source_moe;
+        primitive_id target_moe;
+        primitive_id proxy_hidden;
+        primitive_id target_hidden;
+        les_link_status status = les_link_status::no_predecessor;
+    };
+    std::vector<les_moe_link> get_les_moe_links() const;
     const nodes_ordering& get_processing_order() const;
     nodes_ordering& get_processing_order();
     const std::vector<primitive_id>& get_allocating_order(bool forced_update = false);

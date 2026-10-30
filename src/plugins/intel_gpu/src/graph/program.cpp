@@ -87,6 +87,7 @@
 #include "intel_gpu/graph/serialization/map_serializer.hpp"
 
 #include "intel_gpu/primitives/rnn.hpp"
+#include "intel_gpu/primitives/moe_3gemm_fused_compressed.hpp"
 
 // TODO: Remove once we have interface for kernels cache
 #include "impls/ocl/kernels_cache.hpp"
@@ -497,6 +498,107 @@ void program::set_options() {
     static std::atomic<uint32_t> id_gen{0};
     prog_id = ++id_gen;
     assert(prog_id != 0);
+}
+
+std::vector<program::les_moe_link> program::get_les_moe_links() const {
+    std::vector<les_moe_link> links;
+    if (!_config.get_enable_les() || is_internal) {
+        return links;
+    }
+    std::map<primitive_id, size_t> successor_counts;
+    for (const auto& entry : nodes_map) {
+        const auto& target = *entry.second;
+        if (!target.is_type<moe_3gemm_fused_compressed>()) {
+            continue;
+        }
+        les_moe_link link;
+        link.target_moe = entry.first;
+        if (target.get_dependencies().empty()) {
+            link.status = les_link_status::unsupported_topology;
+            links.push_back(std::move(link));
+            continue;
+        }
+        auto* hidden = target.get_dependencies().front().first;
+        link.target_hidden = hidden->id();
+        std::vector<const program_node*> pending{hidden};
+        std::set<const program_node*> visited;
+        std::set<primitive_id> predecessors;
+        bool unsupported = false;
+        while (!pending.empty()) {
+            const auto* node = pending.back();
+            pending.pop_back();
+            if (!visited.insert(node).second || node->is_constant() || node->is_type<data>()) {
+                continue;
+            }
+            if (node->is_type<moe_3gemm_fused_compressed>()) {
+                predecessors.insert(node->id());
+                continue;
+            }
+            if (node->is_type<loop>() || node->is_type<condition>()) {
+                unsupported = true;
+                continue;
+            }
+            for (const auto& dependency : node->get_dependencies()) {
+                pending.push_back(dependency.first);
+            }
+        }
+        std::set<primitive_id> older_predecessors;
+        for (const auto& predecessor : predecessors) {
+            const auto& source = get_node(predecessor);
+            pending.clear();
+            visited.clear();
+            if (!source.get_dependencies().empty()) {
+                pending.push_back(source.get_dependencies().front().first);
+            }
+            while (!pending.empty()) {
+                const auto* node = pending.back();
+                pending.pop_back();
+                if (!visited.insert(node).second || node->is_constant() || node->is_type<data>() ||
+                    node->is_type<loop>() || node->is_type<condition>()) {
+                    continue;
+                }
+                if (node->is_type<moe_3gemm_fused_compressed>()) {
+                    if (predecessors.count(node->id())) {
+                        older_predecessors.insert(node->id());
+                    }
+                    if (!node->get_dependencies().empty()) {
+                        pending.push_back(node->get_dependencies().front().first);
+                    }
+                } else {
+                    for (const auto& dependency : node->get_dependencies()) {
+                        pending.push_back(dependency.first);
+                    }
+                }
+            }
+        }
+        for (const auto& predecessor : older_predecessors) {
+            predecessors.erase(predecessor);
+        }
+        for (const auto& predecessor : predecessors) {
+            ++successor_counts[predecessor];
+        }
+        if (unsupported) {
+            link.status = les_link_status::unsupported_topology;
+        } else if (predecessors.size() > 1) {
+            link.status = les_link_status::ambiguous_predecessor;
+        } else if (predecessors.size() == 1) {
+            link.source_moe = *predecessors.begin();
+            const auto& source = get_node(link.source_moe);
+            if (source.get_dependencies().empty()) {
+                link.status = les_link_status::unsupported_topology;
+            } else {
+                link.proxy_hidden = source.get_dependencies().front().first->id();
+                link.status = les_link_status::candidate;
+            }
+        }
+        links.push_back(std::move(link));
+    }
+    for (auto& link : links) {
+        if (link.status == les_link_status::candidate && successor_counts.at(link.source_moe) != 1) {
+            link.status = les_link_status::branched_predecessor;
+        }
+    }
+    return links;
 }
 
 void program::build_program(bool is_internal) {

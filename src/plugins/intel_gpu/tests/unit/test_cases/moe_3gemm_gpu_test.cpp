@@ -679,6 +679,17 @@ TEST_P(moe_3gemm_compressed_gpu_random, moe_accuracy_test_random) {
     network.set_input_data("hidden_states", hidden_states_mem);
     network.set_input_data("routing_weights", routing_weights_mem);
 
+    auto les_links = network.get_program()->get_les_moe_links();
+    if (param.enable_les) {
+        ASSERT_EQ(les_links.size(), 1U);
+        EXPECT_EQ(les_links.front().target_moe, "moe_3gemm_fused_compressed");
+        EXPECT_EQ(les_links.front().status, cldnn::program::les_link_status::no_predecessor);
+        EXPECT_FALSE(les_links.front().target_hidden.empty());
+        EXPECT_TRUE(les_links.front().source_moe.empty());
+    } else {
+        EXPECT_TRUE(les_links.empty());
+    }
+
     std::unique_ptr<cldnn::network> unsplit;
     if (param.enable_les && param.lru_expert_num > 0 && param.seq_len <= 32) {
         cldnn::topology baseline_topology;
