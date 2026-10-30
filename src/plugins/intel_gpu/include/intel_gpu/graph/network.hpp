@@ -34,6 +34,8 @@ struct MLIRGpuRuntime;
 
 namespace cldnn {
 
+class les_context;
+
 /// @brief Represents network output returned by @ref network::get_output().
 struct network_output {
     /// @brief Returns @ref event associated with the output.
@@ -245,6 +247,8 @@ public:
     bool is_reuse_variable_mem() { return _reuse_variable_mem; }
 
     const ExecutionConfig& get_config() const { return _program->get_config(); }
+    les_context* get_les_context() const { return _les_context.get(); }
+    uint64_t get_les_epoch() const { return _les_epoch; }
 
     std::shared_ptr<ShapePredictor> get_shape_predictor() { return _shape_predictor; }
     void set_shape_predictor(std::shared_ptr<ShapePredictor> shape_predictor) { _shape_predictor = shape_predictor; }
@@ -301,6 +305,11 @@ private:
     output_chains_map _remote_output_chains;
 
     std::shared_ptr<ShapePredictor> _shape_predictor;
+    std::unique_ptr<les_context> _les_context;
+    uint64_t _les_epoch = 0;
+
+    void initialize_les();
+    std::map<primitive_id, network_output> execute_graph(const std::vector<event::ptr>& dependencies);
 
     /// @brief Invalidate the recording of the previous iteration
     void invalidate_recording();

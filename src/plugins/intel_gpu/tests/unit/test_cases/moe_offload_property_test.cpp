@@ -4,6 +4,8 @@
 
 #include "test_utils/test_utils.h"
 #include "intel_gpu/runtime/internal_properties.hpp"
+#include "intel_gpu/primitives/activation.hpp"
+#include "intel_gpu/primitives/input_layout.hpp"
 
 namespace ov::test {
 
@@ -82,6 +84,28 @@ TEST(moe_les_config, accepts_capacity_boundaries) {
     EXPECT_EQ(config.get_les_queue_capacity(), 1U);
     config.set_property(ov::intel_gpu::les_queue_capacity(1024));
     EXPECT_EQ(config.get_les_queue_capacity(), 1024U);
+}
+
+TEST(moe_les_network, non_moe_graph_creates_no_context_and_preserves_output) {
+    auto& engine = get_test_engine();
+    cldnn::layout input_layout{cldnn::data_types::f32, cldnn::format::bfyx, {1, 1, 1, 2}};
+    auto input = engine.allocate_memory(input_layout);
+    tests::set_values(input, std::vector<float>{-2.0f, 3.0f});
+    cldnn::topology topology;
+    topology.add(cldnn::input_layout("input", input_layout));
+    topology.add(cldnn::activation("output", cldnn::input_info("input"), cldnn::activation_func::relu));
+    for (size_t ratio : {0U, 50U}) {
+        auto config = get_test_default_config(engine);
+        config.set_property({ov::intel_gpu::enable_les(true), ov::intel_gpu::offload_ratio(ratio)});
+        cldnn::network network(engine, topology, config);
+        EXPECT_EQ(network.get_les_context(), nullptr);
+        network.set_input_data("input", input);
+        auto output = network.execute().at("output").get_memory();
+        cldnn::mem_lock<float, cldnn::mem_lock_type::read> values(output, network.get_stream());
+        EXPECT_FLOAT_EQ(values[0], 0.0f);
+        EXPECT_FLOAT_EQ(values[1], 3.0f);
+        EXPECT_EQ(network.get_les_epoch(), 0U);
+    }
 }
 
 }  // namespace ov::test
