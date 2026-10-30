@@ -9,10 +9,39 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
 
 #include "intel_gpu/runtime/debug_configuration.hpp"
+#include "runtime/ocl/ocl_stream.hpp"
 
 namespace ov::intel_gpu::ocl::moe_otd {
+
+bool les_trace_enabled() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("MOE_LES_TRACE");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+uint64_t les_device_time(cldnn::stream& stream) {
+    auto queue = dynamic_cast<cldnn::ocl::ocl_stream&>(stream).get_cl_queue().get();
+    cl_device_id device = nullptr;
+    OPENVINO_ASSERT(clGetCommandQueueInfo(queue, CL_QUEUE_DEVICE, sizeof(device), &device, nullptr) == CL_SUCCESS,
+                    "LES trace cannot query queue device");
+    cl_ulong device_time = 0;
+    cl_ulong host_time = 0;
+    OPENVINO_ASSERT(clGetDeviceAndHostTimer(device, &device_time, &host_time) == CL_SUCCESS,
+                    "LES trace requires device/host timer support");
+    return device_time;
+}
+
+void les_trace_interval(const char* kind, uint64_t start, uint64_t end) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    GPU_DEBUG_INFO << "[LES_TRACE] {\"kind\":\"" << kind << "\",\"start_ns\":" << start
+                   << ",\"end_ns\":" << end << "}" << std::endl;
+}
 
 void OtdPerfCounters::dump() const {
     const auto hits = gpu_hits.load(std::memory_order_relaxed);
@@ -30,7 +59,11 @@ void OtdPerfCounters::dump() const {
                    << ", created_onednn_kernels=" << created_onednn_kernels.load(std::memory_order_relaxed)
                    << ", les_worker_tasks=" << les_worker_tasks.load(std::memory_order_relaxed)
                    << ", les_upload_chunks=" << les_upload_chunks.load(std::memory_order_relaxed)
-                   << ", les_upload_bytes=" << les_upload_bytes.load(std::memory_order_relaxed) << std::endl;
+                   << ", les_upload_bytes=" << les_upload_bytes.load(std::memory_order_relaxed)
+                   << ", les_waves=" << les_waves.load(std::memory_order_relaxed)
+                   << ", les_ready_pairs=" << les_ready_pairs.load(std::memory_order_relaxed)
+                   << ", les_missing_pairs=" << les_missing_pairs.load(std::memory_order_relaxed)
+                   << ", les_shared_pairs=" << les_shared_pairs.load(std::memory_order_relaxed) << std::endl;
 }
 
 OtdPerfCounters* get_perf_counters() {
@@ -332,7 +365,11 @@ std::vector<cldnn::event::ptr> fill_weights_memory_async(cldnn::stream& transfer
                 } else {
                     buffer.bytes.resize(bytes);
                 }
+                const auto read_start = les_trace_enabled() ? les_device_time(transfer_stream) : 0;
                 weight_reader.read(reinterpret_cast<char*>(buffer.bytes.data()), bytes, plan.source + offset);
+                if (les_trace_enabled()) {
+                    les_trace_interval("read", read_start, les_device_time(transfer_stream));
+                }
                 maybe_transpose_scale_zp(config, plan.component, plan.memory->get_layout(), buffer.bytes, bytes);
                 buffer.upload = plan.memory->copy_from(transfer_stream, buffer.bytes.data(), 0, plan.destination + offset, bytes, false);
                 OPENVINO_ASSERT(buffer.upload, "LES upload did not return a completion event");

@@ -1,10 +1,10 @@
 # LES Context: Stage 1 / P1-P3
 
-P1 introduced a default-off, network-local Host task service. P2 now moves
+P1 introduced a default-off, network-local Host task service. P2 moved
 expert reads, unchanged repacking and nonblocking uploads to its worker and
-separate OCL transfer lane. All required weights become ready before the
-original MoE kernels run. P3 split computation and layer-level overlap are not
-implemented.
+separate OCL transfer lane, initially waiting for all weights before the
+original MoE kernels ran. P3 adds ready-first masked GEMV execution for the
+existing Decode/small-batch GEMV path; larger Prefill retains P2 scheduling.
 
 ## Configuration
 
@@ -96,7 +96,8 @@ and ratio 0 or 50 creates no context and preserves its output.
 | Stage 1 / P2.2 | `e5a06299d5` | 31 reservation/LRU/provider tests passed |
 | Stage 1 / P2.3 | `0b7014a295` | 14 upload/provider tests passed |
 | Stage 1 / P2.4 | `9a8dcff850` | 303 complete focused tests, 80 LES-on forced-fallback tests, source Qwen ratio-80 LES-on smoke passed |
-| Stage 1 / P3.1a | This commit | Canonical pair snapshots and nonblocking demand foundation; 307 focused tests and 80 forced-fallback cases passed |
+| Stage 1 / P3.1a | `94d1eaae6d` | Canonical pair snapshots and nonblocking demand foundation; 307 focused tests and 80 forced-fallback cases passed |
+| Stage 1 / P3.1b-P3.3 | This commit | Masked GEMV, ready-first demand overlap, bounded multi-wave execution; 331 focused tests, 104 forced-fallback cases, source model and actual overlap trace passed |
 
 P1.3 validation used the source Debug/OCL build on Intel Arc Lunar Lake with
 assertions and existing numerical tolerances unchanged. All listed runs had
@@ -270,8 +271,70 @@ upload destruction. Final Debug/OCL evidence: 24 reservation/LRU tests,
 cases passed with zero failures/skips. Subsets overlap. A test-fixture file/layout
 size mismatch was corrected without weakening production range validation.
 
-This is only the P3 foundation. Production kernels still execute through the
-P2 all-ready wrapper. Pair-mask GEMV kernels, actual ready-first Pass A/B,
-small-capacity multi-wave scheduling, bitwise split/unsplit comparisons and
-trace-proven layer-level I/O/compute overlap remain pending. The P2 real-model
-smoke is historical evidence, not a run of this new P3 foundation.
+At the P3.1a milestone, production kernels still used the P2 all-ready wrapper.
+Its 307-test and P2 real-model evidence must not be interpreted as validation
+of split GPU execution. The remaining P3 integration is described below.
+
+## P3.1b-P3.3: Ready-First GEMV And Multi-Wave Execution
+
+LES-off GEMV retains its original kernels and arguments. Eligible LES-on GEMV
+uses separate masked gate/up and down variants. A zero mask makes the entire
+workgroup return before reading weights or scratch; selected workgroups keep
+the original arithmetic and write the original token/rank scratch positions.
+The original reduction runs exactly once after all routed pairs finish. Shared
+expert work is selected only in the first wave's Pass A, once per token.
+
+After the real routing dependencies complete, the Host reads Top-k without the
+old unconditional compute-queue finish. A wave selects at most the slot capacity
+in unique experts and includes every still-pending pair of each selected expert.
+Reservation pins hits before assigning misses; missing reads/repacking/uploads
+start on the worker. Pass A runs the already-ready pairs while this work proceeds.
+Finish observes upload completion and installs the strict barrier; Pass B runs
+only missing pairs. Both passes write canonical positions, independent of order.
+
+Each wave requests a real kernel completion event, flushes compute and waits for
+that consumer before releasing temporary slot/mask buffers or reusing slots.
+This is a narrow event wait, not a steady-state whole-queue finish. All-cold or
+all-hot demands skip the empty routed pass. Capacity-one execution makes forward
+progress through bounded waves rather than switching to a different accumulation
+kernel. Exceptions drain compute and worker activity before releasing buffers;
+cleanup retains the original error. The initial per-network ownership finish
+and legacy larger-Prefill waits remain; this is not a claim that every finish
+was removed from the plugin.
+
+Final Debug/OCL verification on Lunar Lake passed 331 tests in 27 suites and
+104 LES-on forced-fallback cases, with zero failures/skips. The eight Top-8 GPU
+cases each exhaust all 256 masks with U4/U8, 1/4 tokens and both routing modes;
+outputs are compared bitwise to the original unsplit GEMV. Existing LES matrix
+cases also compare bitwise for GEMV-sized inputs, including 1/2/4-slot multi-wave
+execution and profiling off/on. Sixteen shared-expert cases compare bitwise with
+unsplit shared GEMV across U4/U8, 1/4 tokens, 1/4 slots and profiling off/on.
+Mixed mask 0x55 additionally injects a short read after warm-up, then checks
+next-epoch recovery bitwise. Subsets overlap; this is not the full GPU suite.
+The shared fixture's router layout was corrected to [batch, seq, experts] after
+its old four-dimensional layout produced only one token of Top-k. No production
+range guard or numerical tolerance was weakened.
+
+`MOE_LES_TRACE=1` enables opt-in JSON interval logging in debug-capable builds
+with `OV_VERBOSE=1`. Both queues must have profiling enabled. Positional-read
+intervals sample the OpenCL device timer before/after the read; Pass A/B kernels
+use native profiling timestamps on that same device. Missing timer/profiling
+support is an error, not a fabricated Host-enqueue interval. Trace is off by
+default and perturbs timings; reads may be served from page cache. It demonstrates
+read/compute concurrency, not cold-SSD DMA or dedicated-copy-engine throughput.
+
+The trace GPU probe observed 148 read/Pass-A interval intersections. Actual source
+Qwen ratio-80, 21-input/8-output-token generation passed and observed 437 such
+intersections, with no synthetic delay. Its counters recorded 361 waves, 1,659
+ready pairs, 7,301 missing pairs, 29,457 uploads and zero legacy tensor loads.
+Path/hash provenance, trace and generation reports remain outside this repository
+under workspace `les/results/p3_source_les_trace_ratio80/`.
+
+Matched trace-off source runs used ratio 80, 8 output tokens, one warm-up and
+three measured runs per LES setting. All output text matched. Mean wall generation
+was 3.330858 s off versus 2.534071 s on; mean TTFT was 2.536180 s versus 1.427640 s,
+but mean TPOT regressed from 0.113407 s to 0.157922 s. These short sequential Debug
+runs have uncontrolled page cache and are not a general speedup guarantee. LES
+remains default-off; Decode overhead needs performance tuning. ZE remains
+unsupported, larger-Prefill split and cross-layer prediction/pooling are not P3,
+and the previously documented TSan environment limitation is unchanged.
