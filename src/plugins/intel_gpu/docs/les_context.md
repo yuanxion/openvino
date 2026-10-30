@@ -12,6 +12,24 @@ change the MoE numerical path. Those changes belong to P2 and later steps.
 These are experimental internal properties, not a public performance promise.
 The capacity excludes the running task and is not a staging-byte budget.
 
+## Network Ownership
+
+[network](../src/graph/network.cpp) creates a context only for a non-internal
+network with LES enabled, a nonzero offload ratio and an executable compressed
+MoE primitive with a nonzero OTD cache capacity. Disabled LES, resident-only
+and non-MoE graphs create no context or worker.
+
+An eligible network requires an offload ratio of 1-99, exactly one configured
+stream and record/replay disabled. Unsupported combinations fail construction;
+they do not silently fall back to a different scheduling mode. Each network
+owns its context, including networks instantiated from the same program.
+
+Each `execute()` starts a new epoch, drains Host tasks before returning and
+cancels them if execution or the worker fails. Destruction stops and joins the
+worker before releasing network resources. This does not add GPU stream waits
+or asynchronous upload behavior. P1 does not dispatch weight work or add a new
+public infer-request cancellation interface.
+
 ## Worker Contract
 
 [les_context](../include/intel_gpu/runtime/les_context.hpp) owns one worker and
@@ -55,3 +73,23 @@ use fake Host work, without a GPU, to cover single-worker FIFO, queue backpressu
 cancellation, error fan-out/recovery, epoch rotation, blocked producers,
 reentrant control, repeated destruction, active-task join and captured-resource
 release. The same source can be built with ThreadSanitizer.
+
+The existing MoE numerical fixture also checks LES-on resident and OTD cases,
+independent contexts, repeated execute epochs and rejected stream/ratio/recording
+combinations. The property fixture checks that a non-MoE graph with LES enabled
+and ratio 0 or 50 creates no context and preserves its output.
+
+## Verified Milestones
+
+| Stage / Step | Commit | Verification |
+|---|---|---|
+| Stage 1 / P1.1 | `580cb907ba` | Default-off configuration; 184 focused OCL tests passed |
+| Stage 1 / P1.2 | `736dc82af2` | 12 worker tests, the same 12 under TSan, 17 integrated configuration/lifecycle tests passed |
+| Stage 1 / P1.3 | This commit | 26 P1-focused tests, 205 complete focused tests, 8 LES-on forced-fallback tests passed |
+
+P1.3 validation used the source Debug/OCL build on Intel Arc Lunar Lake with
+assertions and existing numerical tolerances unchanged. All listed runs had
+zero failures and skips; the subsets overlap and are not additive. The fallback
+run disabled both `OV_GPU_MOE_USE_GROUPED_GEMM_PREFILL` and
+`OV_GPU_MOE_USE_MICRO_GEMM_PREFILL`. The complete focused run is not the full GPU
+unit suite, and no new ZE LES or real-model performance claim is made.
