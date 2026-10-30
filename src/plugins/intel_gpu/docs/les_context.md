@@ -1,8 +1,10 @@
-# LES Context: Stage 1 / P1
+# LES Context: Stage 1 / P1-P2
 
-P1 introduces a default-off, network-local Host task service. It does not move
-expert reads or uploads off the execution lane, create a transfer queue, or
-change the MoE numerical path. Those changes belong to P2 and later steps.
+P1 introduced a default-off, network-local Host task service. P2 now moves
+expert reads, unchanged repacking and nonblocking uploads to its worker and
+separate OCL transfer lane. All required weights become ready before the
+original MoE kernels run. P3 split computation and layer-level overlap are not
+implemented.
 
 ## Configuration
 
@@ -10,6 +12,9 @@ change the MoE numerical path. Those changes belong to P2 and later steps.
 - `GPU_LES_QUEUE_CAPACITY`: internal queued-task limit, default 32, range 1-1024.
 
 These are experimental internal properties, not a public performance promise.
+They cannot be passed through the public `compile_model()` property map. Use
+`OV_GPU_ENABLE_LES=1` and optionally `OV_GPU_LES_QUEUE_CAPACITY` for experiments;
+internal GPU tests can set the typed properties directly.
 The capacity excludes the running task and is not a staging-byte budget.
 
 ## Network Ownership
@@ -26,9 +31,9 @@ owns its context, including networks instantiated from the same program.
 
 Each `execute()` starts a new epoch, drains Host tasks before returning and
 cancels them if execution or the worker fails. Destruction stops and joins the
-worker before releasing network resources. This does not add GPU stream waits
-or asynchronous upload behavior. P1 does not dispatch weight work or add a new
-public infer-request cancellation interface.
+worker before releasing network resources. P2 callbacks drain their issued DMA
+before returning, including failure paths. There is no new public infer-request
+cancellation interface.
 
 ## Worker Contract
 
@@ -62,7 +67,7 @@ wait or worker join is performed while holding that mutex.
 
 A ticket means the Host callback has returned and released its captures. It
 does not imply an upload event has completed. Epochs invalidate stale metadata;
-they do not fence DMA or permit slot/staging reuse. P2 must separately retain
+they do not fence DMA or permit slot/staging reuse. P2 separately retains
 staging and native events until uploads and previous consumers complete.
 
 ## Validation
@@ -89,7 +94,8 @@ and ratio 0 or 50 creates no context and preserves its output.
 | Stage 1 / P2.1a | `a75f2d0b7e` | 12 cross-queue event tests and 215 complete focused OCL tests passed |
 | Stage 1 / P2.1b | `be2210dcaa` | 12 CPU worker tests and 27 integrated LES/lane tests passed |
 | Stage 1 / P2.2 | `e5a06299d5` | 31 reservation/LRU/provider tests passed |
-| Stage 1 / P2.3 | This commit | 14 upload/provider tests passed |
+| Stage 1 / P2.3 | `0b7014a295` | 14 upload/provider tests passed |
+| Stage 1 / P2.4 | This commit | 303 complete focused tests, 80 LES-on forced-fallback tests, source Qwen ratio-80 LES-on smoke passed |
 
 P1.3 validation used the source Debug/OCL build on Intel Arc Lunar Lake with
 assertions and existing numerical tolerances unchanged. All listed runs had
@@ -118,9 +124,9 @@ prove completion across independent producer queues. P2 upload aggregation must
 provide the individual weight, scale and zero-point completion events instead.
 The caller remains responsible for source-memory, staging and slot lifetimes.
 
-This is the first P2.1 substep, not asynchronous expert loading. ZE adaptation
-and the P2.2-P2.4 reservation/upload pipeline are pending.
-Production weight-loading and the default execution path do not yet call this API.
+P2.4 production LES demand uses this API with every returned upload event.
+The default LES-off execution path remains unchanged. ZE adaptation is not
+implemented.
 
 Validation on the source Debug/OCL Lunar Lake build passed 12 cross-queue event
 tests, including the two original native controls, and 215 complete focused
@@ -161,8 +167,8 @@ ticket discards its pending entries, while ready entries remain cached.
 
 Waiting for upload/consumer events must happen outside the reservation mutex;
 the caller must drain old DMA before releasing its ticket. Five new tests plus
-26 existing LRU/provider tests passed. Production provider integration follows
-with the upload ticket in P2.3-P2.4; this state machine alone is not a GPU fence.
+26 existing LRU/provider tests passed. P2.4 integrates this state machine with
+upload completion and real consumer events; metadata alone is not a GPU fence.
 
 ## P2.3: Bounded Staging And Upload Completion
 
@@ -185,3 +191,44 @@ validation, missing files, short reads and a later short read after an earlier
 DMA has already been submitted. LES worker/chunk/byte counters are separate from
 legacy synchronous tensor-load and timing counters. No device performance claim
 is inferred from these counters.
+
+## P2.4: Production Demand Integration
+
+The offload provider reserves the complete demand before dispatching work. Its
+worker owns positional file reads and staging; all nine W/S/ZP components and
+every chunk must complete before the compute barrier and GPUReady transition.
+A real compute-queue marker retains the last reservation until its consumer
+finishes, independently of profiling. Consumer waits occur outside reservation
+locks. Failed or cancelled queued demands release incomplete reservations;
+active tasks drain uploads before cleanup and the next epoch can recover.
+
+LES clones each provider's mutable reader/cache state per network and allocates
+network-private, per-layer OTD buffers. The buffers use the existing partial
+physical-slot/full-logical-layout convention. Original compiled constant
+allocations still exist: private buffers add persistent memory beyond the
+64 MiB transient staging bound. This is not a cross-layer pool or an unchanged
+memory-footprint claim. Requests exceeding capacity use the original per-expert
+fallback; no split arithmetic, changed tolerances or removed legacy waits are
+introduced.
+
+Final Debug/OCL validation on Lunar Lake passed 303 tests in 25 suites and
+80 LES-on forced-fallback cases, with zero failures/skips. The overlapping
+subsets include 18 upload/provider cases and 80 LES-on numerical cases spanning
+U4/U8, 1/4/48 tokens, 1/2/4 slots, profiling on/off, both routing modes, changing
+routes, independent networks and missing-file recovery. Gated native upload,
+consumer and queued-cancellation tests exercise lifetime and retry behavior.
+This is not the full GPU unit suite. A fresh standalone CPU worker TSan run
+could not start (`unexpected memory mapping`); the earlier P1 TSan result is
+historical, not a P2 provider/driver race-safety result.
+
+The source Qwen3.6-35B VLM smoke passed with ratio 80, LES enabled, one stream,
+21 input tokens and 8 generated tokens. Core, GPU/CPU plugins, IR frontend,
+GenAI and tokenizers were checked against their source-build paths. Counters
+recorded 2,930 worker tasks, 29,349 upload chunks, 5,329,465,344 upload bytes and
+zero legacy synchronous tensor loads. Experiment evidence remains outside this
+repository in the workspace `les/results/p2_source_les_on_ratio80_env/` directory.
+The first attempt preserved in a separate directory failed because the
+experimental entry point passed an internal option through the public API;
+the successful run uses its supported environment variable. This single short
+smoke is not model-accuracy, throughput, overlap or speedup evidence. Eligible
+LES-on ZE execution remains explicitly unsupported; P3 has not started.

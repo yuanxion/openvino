@@ -14,6 +14,7 @@
 #include <intel_gpu/runtime/engine.hpp>
 #include <intel_gpu/runtime/layout.hpp>
 #include <intel_gpu/runtime/memory.hpp>
+#include <intel_gpu/runtime/les_context.hpp>
 #include <iostream>
 #include <numeric>
 
@@ -603,6 +604,7 @@ struct Moe3GemmTestParams {
     size_t group_size;
     bool is_signed = false;
     bool enable_les = false;
+    bool profiling = false;
 };
 
 class moe_3gemm_compressed_gpu_random : public ::testing::TestWithParam<std::tuple<cldnn::MoERouterFused::RoutingType, Moe3GemmTestParams>> {};
@@ -778,6 +780,7 @@ TEST_P(moe_3gemm_compressed_gpu_random, moe_accuracy_test_random) {
     net_config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
     if (param.enable_les) {
         net_config.set_property({ov::intel_gpu::enable_les(true),
+                                 ov::enable_profiling(param.profiling),
                                  ov::intel_gpu::les_queue_capacity(2),
                                  ov::intel_gpu::offload_ratio(0)});
     }
