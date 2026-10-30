@@ -9,6 +9,7 @@
 #include "openvino/runtime/shared_buffer.hpp"
 #include "lru_cache.hpp"
 #include "expert_weight_providers.hpp"
+#include "intel_gpu/runtime/les_context.hpp"
 // clang-format on
 
 using ov::intel_gpu::ocl::moe::IExpertWeightProvider;
@@ -700,6 +701,7 @@ public:
     int _gate_up_group_size;
     int _down_group_size;
     std::shared_ptr<IExpertWeightProvider> _weight_provider;
+    cldnn::les_context* _les_owner = nullptr;
 
     // --- OTD helper methods (used when _weight_provider->is_offloaded()) ---
 
@@ -727,17 +729,29 @@ public:
             return;
         }
         if (!_weight_provider->is_bound()) {
-            instance._weights.gate_w = instance.input_memory_ptr(static_cast<size_t>(MOE3GemmInputIndex::WEIGHT_0));
-            instance._weights.gate_z = instance.input_memory_ptr(static_cast<size_t>(MOE3GemmInputIndex::ZP_0));
-            instance._weights.gate_s = instance.input_memory_ptr(static_cast<size_t>(MOE3GemmInputIndex::SCALE_0));
-
-            instance._weights.up_w = instance.input_memory_ptr(static_cast<size_t>(MOE3GemmInputIndex::WEIGHT_1));
-            instance._weights.up_z = instance.input_memory_ptr(static_cast<size_t>(MOE3GemmInputIndex::ZP_1));
-            instance._weights.up_s = instance.input_memory_ptr(static_cast<size_t>(MOE3GemmInputIndex::SCALE_1));
-
-            instance._weights.down_w = instance.input_memory_ptr(static_cast<size_t>(MOE3GemmInputIndex::WEIGHT_2));
-            instance._weights.down_z = instance.input_memory_ptr(static_cast<size_t>(MOE3GemmInputIndex::ZP_2));
-            instance._weights.down_s = instance.input_memory_ptr(static_cast<size_t>(MOE3GemmInputIndex::SCALE_2));
+            auto bind = [&](MOE3GemmInputIndex index) {
+                auto input = instance.input_memory_ptr(static_cast<size_t>(index));
+                if (!_les_owner) {
+                    return input;
+                }
+                auto logical = input->get_layout();
+                auto physical = logical;
+                auto shape = physical.get_partial_shape();
+                shape[0] = static_cast<int64_t>(resident_slot_count());
+                physical.set_partial_shape(shape);
+                auto& engine = instance.get_network().get_engine();
+                auto allocation = engine.allocate_memory(physical, engine.get_preferred_memory_allocation_type(), false);
+                return engine.reinterpret_buffer(*allocation, logical);
+            };
+            instance._weights.gate_w = bind(MOE3GemmInputIndex::WEIGHT_0);
+            instance._weights.gate_z = bind(MOE3GemmInputIndex::ZP_0);
+            instance._weights.gate_s = bind(MOE3GemmInputIndex::SCALE_0);
+            instance._weights.up_w = bind(MOE3GemmInputIndex::WEIGHT_1);
+            instance._weights.up_z = bind(MOE3GemmInputIndex::ZP_1);
+            instance._weights.up_s = bind(MOE3GemmInputIndex::SCALE_1);
+            instance._weights.down_w = bind(MOE3GemmInputIndex::WEIGHT_2);
+            instance._weights.down_z = bind(MOE3GemmInputIndex::ZP_2);
+            instance._weights.down_s = bind(MOE3GemmInputIndex::SCALE_2);
             _weight_provider->bind(instance._weights);
         }
     }
@@ -1350,6 +1364,7 @@ public:
         cur_moe->_gate_up_group_size = _gate_up_group_size;
         cur_moe->_down_group_size = _down_group_size;
         cur_moe->_weight_provider = _weight_provider;  // shared across clones within the same network
+        cur_moe->_les_owner = nullptr;
         cur_moe->use_micro_gemm_prefill = use_micro_gemm_prefill;
         cur_moe->use_gpu_mask_gen_prefill = use_gpu_mask_gen_prefill;
         cur_moe->use_grouped_gemm_prefill = use_grouped_gemm_prefill;
@@ -2595,6 +2610,37 @@ public:
     }
 
     cldnn::event::ptr execute(const std::vector<cldnn::event::ptr>& events, cldnn::primitive_inst& ins) override {
+        auto& network = ins.get_network();
+        auto* context = network.get_les_context();
+        if (!context || !_weight_provider->is_offloaded()) {
+            return execute_impl(events, ins);
+        }
+        auto& stream = network.get_stream();
+        if (_les_owner != context) {
+            stream.finish();
+            _weight_provider = _weight_provider->clone();
+            _les_owner = context;
+        }
+        _weight_provider->set_les_context(context, network.get_les_epoch());
+        try {
+            auto result = execute_impl(events, ins);
+            auto consumer = stream.enqueue_marker({});
+            stream.flush();
+            _weight_provider->set_consumer(std::move(consumer));
+            return result;
+        } catch (...) {
+            try {
+                stream.finish();
+            } catch (...) {
+                _weight_provider->release();
+                throw;
+            }
+            _weight_provider->release();
+            throw;
+        }
+    }
+
+    cldnn::event::ptr execute_impl(const std::vector<cldnn::event::ptr>& events, cldnn::primitive_inst& ins) {
         OV_ITT_SCOPED_TASK(ov::intel_gpu::itt::domains::intel_gpu_plugin, openvino::itt::handle("moe_3gemm_swiglu_opt_impl::execute"));
         auto& instance = reinterpret_cast<typed_primitive_inst<moe_3gemm_fused_compressed>&>(ins);
         auto cur_moe = instance.get_typed_desc<moe_3gemm_fused_compressed>();

@@ -13,6 +13,10 @@
 #include "intel_gpu/runtime/memory.hpp"
 #include "intel_gpu/runtime/stream.hpp"
 
+namespace cldnn {
+class les_context;
+}
+
 namespace ov::intel_gpu::ocl::moe {
 
 /// Slot indices produced by a simultaneous acquisition (parallel to the input experts vector).
@@ -42,6 +46,9 @@ struct RoutedWeightViews {
 class IExpertWeightProvider {
 public:
     virtual ~IExpertWeightProvider() = default;
+    virtual std::shared_ptr<IExpertWeightProvider> clone() const = 0;
+    virtual void set_les_context(cldnn::les_context*, uint64_t) {}
+    virtual void set_consumer(cldnn::event::ptr) {}
 
     // Releases any pinning established by the most recent acquisition.
     virtual void release() = 0;
