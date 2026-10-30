@@ -27,7 +27,10 @@ void OtdPerfCounters::dump() const {
                    << ", total_gpu_copy_ms=" << gpu_copy_ns.load(std::memory_order_relaxed) / 1000000
                    << ", batched_fallbacks=" << batched_fallbacks.load(std::memory_order_relaxed)
                    << ", grouped_fallbacks=" << grouped_fallbacks.load(std::memory_order_relaxed)
-                   << ", created_onednn_kernels=" << created_onednn_kernels.load(std::memory_order_relaxed) << std::endl;
+                   << ", created_onednn_kernels=" << created_onednn_kernels.load(std::memory_order_relaxed)
+                   << ", les_worker_tasks=" << les_worker_tasks.load(std::memory_order_relaxed)
+                   << ", les_upload_chunks=" << les_upload_chunks.load(std::memory_order_relaxed)
+                   << ", les_upload_bytes=" << les_upload_bytes.load(std::memory_order_relaxed) << std::endl;
 }
 
 OtdPerfCounters* get_perf_counters() {
@@ -260,6 +263,102 @@ void fill_weights_memory(cldnn::stream& exec_stream,
 
         index++;
     }
+}
+
+std::vector<cldnn::event::ptr> fill_weights_memory_async(cldnn::stream& transfer_stream,
+                                                      const cldnn::MOECompressed::Config& config,
+                                                      const std::vector<size_t>& weight_bin_offsets,
+                                                      ParallelWeightReader& weight_reader,
+                                                      cldnn::moe_weights& weights,
+                                                      const std::vector<uint32_t>& experts,
+                                                      const std::vector<size_t>& slots) {
+    constexpr size_t chunk_bytes = 8 * 1024 * 1024;
+    const std::array<cldnn::memory::ptr, 9> tensors{weights.gate_w, weights.up_w, weights.down_w,
+                                                weights.gate_s, weights.up_s, weights.down_s,
+                                                weights.gate_z, weights.up_z, weights.down_z};
+    struct ReadPlan {
+        cldnn::memory::ptr memory;
+        size_t component;
+        size_t source;
+        size_t destination;
+        size_t bytes;
+    };
+    OPENVINO_ASSERT(weight_bin_offsets.size() == tensors.size() && experts.size() == slots.size(), "Invalid LES upload plan");
+    const auto expert_count = static_cast<size_t>(config.num_expert);
+    OPENVINO_ASSERT(expert_count > 0, "Invalid LES expert count");
+    const auto file_size = weight_reader.file_size();
+    std::vector<ReadPlan> plans;
+    for (size_t index = 0; index < experts.size(); ++index) {
+        OPENVINO_ASSERT(experts[index] < expert_count, "LES expert outside configured range");
+        for (size_t component = 0; component < tensors.size(); ++component) {
+            const auto& memory = tensors[component];
+            if (!memory) {
+                continue;
+            }
+            auto total = memory->get_layout().bytes_count();
+            OPENVINO_ASSERT(total % expert_count == 0, "Invalid LES per-expert tensor size");
+            auto bytes = total / expert_count;
+            if (bytes == 0) {
+                continue;
+            }
+            auto base = weight_bin_offsets[component];
+            OPENVINO_ASSERT(base <= file_size && experts[index] <= (file_size - base) / bytes, "LES source offset overflow");
+            auto source = base + experts[index] * bytes;
+            OPENVINO_ASSERT(bytes <= file_size - source, "LES tensor read outside weight file");
+            OPENVINO_ASSERT(slots[index] < memory->size() / bytes, "LES upload outside physical slot buffer");
+            OPENVINO_ASSERT(component < 3 || bytes <= chunk_bytes, "LES transposed metadata exceeds 8 MiB per expert");
+            plans.push_back({memory, component, source, slots[index] * bytes, bytes});
+        }
+    }
+    struct Staging {
+        std::vector<uint8_t> bytes;
+        cldnn::event::ptr upload;
+    };
+    std::array<Staging, 2> staging;
+    std::vector<cldnn::event::ptr> events;
+    size_t cursor = 0;
+    std::exception_ptr error;
+    auto* perf = get_perf_counters();
+    try {
+        for (const auto& plan : plans) {
+            for (size_t offset = 0; offset < plan.bytes;) {
+                auto& buffer = staging[cursor++ % staging.size()];
+                if (buffer.upload) {
+                    buffer.upload->wait();
+                }
+                auto bytes = std::min(chunk_bytes, plan.bytes - offset);
+                buffer.bytes.resize(bytes);
+                weight_reader.read(reinterpret_cast<char*>(buffer.bytes.data()), bytes, plan.source + offset);
+                maybe_transpose_scale_zp(config, plan.component, plan.memory->get_layout(), buffer.bytes, bytes);
+                buffer.upload = plan.memory->copy_from(transfer_stream, buffer.bytes.data(), 0, plan.destination + offset, bytes, false);
+                OPENVINO_ASSERT(buffer.upload, "LES upload did not return a completion event");
+                events.push_back(buffer.upload);
+                transfer_stream.flush();
+                if (perf) {
+                    perf->les_upload_chunks.fetch_add(1, std::memory_order_relaxed);
+                    perf->les_upload_bytes.fetch_add(bytes, std::memory_order_relaxed);
+                }
+                offset += bytes;
+            }
+        }
+    } catch (...) {
+        error = std::current_exception();
+    }
+    for (auto& buffer : staging) {
+        if (buffer.upload) {
+            try {
+                buffer.upload->wait();
+            } catch (...) {
+                if (!error) {
+                    error = std::current_exception();
+                }
+            }
+        }
+    }
+    if (error) {
+        std::rethrow_exception(error);
+    }
+    return events;
 }
 
 }  // namespace ov::intel_gpu::ocl::moe_otd

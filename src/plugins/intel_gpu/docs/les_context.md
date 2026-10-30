@@ -88,7 +88,8 @@ and ratio 0 or 50 creates no context and preserves its output.
 | Stage 1 / P1.3 | `903156e707` | 26 P1-focused tests, 205 complete focused tests, 8 LES-on forced-fallback tests passed |
 | Stage 1 / P2.1a | `a75f2d0b7e` | 12 cross-queue event tests and 215 complete focused OCL tests passed |
 | Stage 1 / P2.1b | `be2210dcaa` | 12 CPU worker tests and 27 integrated LES/lane tests passed |
-| Stage 1 / P2.2 | This commit | 31 reservation/LRU/provider tests passed |
+| Stage 1 / P2.2 | `e5a06299d5` | 31 reservation/LRU/provider tests passed |
+| Stage 1 / P2.3 | This commit | 14 upload/provider tests passed |
 
 P1.3 validation used the source Debug/OCL build on Intel Arc Lunar Lake with
 assertions and existing numerical tolerances unchanged. All listed runs had
@@ -162,3 +163,25 @@ Waiting for upload/consumer events must happen outside the reservation mutex;
 the caller must drain old DMA before releasing its ticket. Five new tests plus
 26 existing LRU/provider tests passed. Production provider integration follows
 with the upload ticket in P2.3-P2.4; this state machine alone is not a GPU fence.
+
+## P2.3: Bounded Staging And Upload Completion
+
+`fill_weights_memory_async` is a worker-side pipeline, not a nonblocking Host
+return: it uses nonblocking copies while reading/repacking subsequent data, then
+drains every issued upload before returning or propagating an error. Its returned
+events cover every uploaded weight, scale and zero-point component. The worker
+must open/use its positional reader itself; execution threads do not lazy-open it.
+
+The entire read/slot plan is checked before the first copy. Two reusable 8 MiB
+staging buffers chunk large weight tensors; a buffer is reused only after its
+previous event completes. Transposed scale/ZP components must fit 8 MiB each per
+expert. Including the existing packed-u4 transpose temporaries, transient staging
+is bounded conservatively by 64 MiB per active worker. Oversized metadata is
+rejected explicitly; the legacy synchronous path is unchanged.
+
+Six upload tests and eight existing provider tests passed: all nine components
+with profiling on/off, source preservation across staging reuse, preflight
+validation, missing files, short reads and a later short read after an earlier
+DMA has already been submitted. LES worker/chunk/byte counters are separate from
+legacy synchronous tensor-load and timing counters. No device performance claim
+is inferred from these counters.
