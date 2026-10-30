@@ -87,7 +87,8 @@ and ratio 0 or 50 creates no context and preserves its output.
 | Stage 1 / P1.2 | `736dc82af2` | 12 worker tests, the same 12 under TSan, 17 integrated configuration/lifecycle tests passed |
 | Stage 1 / P1.3 | `903156e707` | 26 P1-focused tests, 205 complete focused tests, 8 LES-on forced-fallback tests passed |
 | Stage 1 / P2.1a | `a75f2d0b7e` | 12 cross-queue event tests and 215 complete focused OCL tests passed |
-| Stage 1 / P2.1b | This commit | 12 CPU worker tests and 27 integrated LES/lane tests passed |
+| Stage 1 / P2.1b | `be2210dcaa` | 12 CPU worker tests and 27 integrated LES/lane tests passed |
+| Stage 1 / P2.2 | This commit | 31 reservation/LRU/provider tests passed |
 
 P1.3 validation used the source Debug/OCL build on Intel Arc Lunar Lake with
 assertions and existing numerical tolerances unchanged. All listed runs had
@@ -146,3 +147,18 @@ checks that context destruction waits for active device work, retains the stream
 and source data, and releases the stream only after completion. The 27 integrated
 tests also include the existing LES-on numerical checks. No dedicated copy-engine
 selection or overlap performance is implied by creating a separate queue.
+
+## P2.2: Slot Reservations
+
+`ExpertSlotReservations` is separate from the legacy synchronous LRU. It checks
+the entire deduplicated demand before changing state, pins every hit before
+assigning misses and returns immediately when capacity or active consumers block
+the request. Reservation does no I/O. Tickets carry epoch/id and internal slot
+generations; late completion and duplicate release cannot affect a reused slot.
+Only explicit completion marks reserved contents ready. Releasing an incomplete
+ticket discards its pending entries, while ready entries remain cached.
+
+Waiting for upload/consumer events must happen outside the reservation mutex;
+the caller must drain old DMA before releasing its ticket. Five new tests plus
+26 existing LRU/provider tests passed. Production provider integration follows
+with the upload ticket in P2.3-P2.4; this state machine alone is not a GPU fence.
