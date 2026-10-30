@@ -30,6 +30,7 @@
 #include "intel_gpu/primitives/data.hpp"
 #include "intel_gpu/primitives/input_layout.hpp"
 #include "intel_gpu/primitives/lora.hpp"
+#include "intel_gpu/primitives/moe_3gemm_fused_compressed.hpp"
 #include "intel_gpu/primitives/mutable_data.hpp"
 #include "intel_gpu/primitives/permute.hpp"
 #include "intel_gpu/primitives/read_value.hpp"
@@ -39,6 +40,7 @@
 #include "intel_gpu/runtime/error_handler.hpp"
 #include "intel_gpu/runtime/event.hpp"
 #include "intel_gpu/runtime/itt.hpp"
+#include "intel_gpu/runtime/les_context.hpp"
 #include "intel_gpu/runtime/memory.hpp"
 #include "intel_gpu/runtime/stream.hpp"
 #include "kv_cache_inst.h"
@@ -275,6 +277,7 @@ network::network(program::ptr program, stream::ptr stream, bool is_internal, boo
     validate_primitives();
     preallocate_shape_info_buffers();
     add_default_output_chains();
+    initialize_les();
     prepare_record_replay();
 }
 
@@ -301,6 +304,7 @@ network::network(program::ptr program, uint16_t stream_id)
 network::network(program::ptr program, stream::ptr stream, uint16_t stream_id) : network(program, stream, false, stream_id == 0) {}
 
 network::~network() {
+    _les_context.reset();
     if (_program != nullptr) {
         _program->cancel_compilation_context();
     }
@@ -1045,7 +1049,40 @@ void network::add_to_exec_order(const primitive_id& id) {
     _exec_order.push_back(inst);
 }
 
+void network::initialize_les() {
+    const auto& config = get_config();
+    if (_internal || !config.get_enable_les() || config.get_offload_ratio() == 0) {
+        return;
+    }
+    const bool has_otd = std::any_of(_exec_order.begin(), _exec_order.end(), [](const auto& inst) {
+        auto desc = std::dynamic_pointer_cast<const moe_3gemm_fused_compressed>(inst->get_node().get_primitive());
+        return desc && desc->_otd.lru_expert_num > 0;
+    });
+    if (!has_otd) {
+        return;
+    }
+    OPENVINO_ASSERT(config.get_offload_ratio() < 100, "LES requires OFFLOAD_RATIO in [1, 99]");
+    OPENVINO_ASSERT(config.get_num_streams() == 1, "LES requires NUM_STREAMS=1");
+    OPENVINO_ASSERT(!config.get_record_replay(), "LES does not support record/replay");
+    _les_context = std::make_unique<les_context>(config.get_les_queue_capacity());
+}
+
 std::map<primitive_id, network_output> network::execute(const std::vector<event::ptr>& dependencies) {
+    if (!_les_context) {
+        return execute_graph(dependencies);
+    }
+    _les_epoch = _les_context->begin_epoch();
+    try {
+        auto outputs = execute_graph(dependencies);
+        _les_context->wait();
+        return outputs;
+    } catch (...) {
+        _les_context->cancel();
+        throw;
+    }
+}
+
+std::map<primitive_id, network_output> network::execute_graph(const std::vector<event::ptr>& dependencies) {
     OV_ITT_SCOPED_TASK(ov::intel_gpu::itt::domains::intel_gpu_plugin, "NetworkImpl::Execute");
     NETWORK_DEBUG(*this);
 
