@@ -1,4 +1,4 @@
-# LES Context: Stage 1 / P1-P2
+# LES Context: Stage 1 / P1-P3
 
 P1 introduced a default-off, network-local Host task service. P2 now moves
 expert reads, unchanged repacking and nonblocking uploads to its worker and
@@ -95,7 +95,8 @@ and ratio 0 or 50 creates no context and preserves its output.
 | Stage 1 / P2.1b | `be2210dcaa` | 12 CPU worker tests and 27 integrated LES/lane tests passed |
 | Stage 1 / P2.2 | `e5a06299d5` | 31 reservation/LRU/provider tests passed |
 | Stage 1 / P2.3 | `0b7014a295` | 14 upload/provider tests passed |
-| Stage 1 / P2.4 | This commit | 303 complete focused tests, 80 LES-on forced-fallback tests, source Qwen ratio-80 LES-on smoke passed |
+| Stage 1 / P2.4 | `9a8dcff850` | 303 complete focused tests, 80 LES-on forced-fallback tests, source Qwen ratio-80 LES-on smoke passed |
+| Stage 1 / P3.1a | This commit | Canonical pair snapshots and nonblocking demand foundation; 307 focused tests and 80 forced-fallback cases passed |
 
 P1.3 validation used the source Debug/OCL build on Intel Arc Lunar Lake with
 assertions and existing numerical tolerances unchanged. All listed runs had
@@ -231,4 +232,46 @@ The first attempt preserved in a separate directory failed because the
 experimental entry point passed an internal option through the public API;
 the successful run uses its supported environment variable. This single short
 smoke is not model-accuracy, throughput, overlap or speedup evidence. Eligible
-LES-on ZE execution remains explicitly unsupported; P3 has not started.
+LES-on ZE execution remains explicitly unsupported.
+
+## P3.1a: Canonical Pairs And Nonblocking Demand
+
+Reservation tickets now snapshot `ready_pairs` and `missing_pairs` while holding
+the metadata lock. Indices are original routed `token * top_k + rank` positions,
+not compacted ranks, unique experts or shared-expert positions. Both lists keep
+canonical order and cover the entire request, including repeated experts across
+tokens. A pair belongs to the ready list only if its slot was already ready at
+reservation time; later completion does not rewrite this historical snapshot.
+Hits are pinned before any miss receives a slot, as in P2.
+
+`begin_les_demand` reserves and dispatches missing uploads, then returns slot and
+pair snapshots without waiting for uploads. It may still wait for previous
+consumers or bounded worker queue capacity; it is not a generally wait-free API.
+`finish_les_demand` observes worker errors, drains all uploads through the worker
+contract, enqueues the strict native-event barrier and marks the ticket ready.
+It must be called once for a successful demand. A second finish is rejected.
+Capacity rejection returns no demand and dispatches no work. The P2 synchronous
+acquisition is now a begin/finish compatibility wrapper.
+
+Releasing an unfinished demand waits for its worker before releasing pins;
+its pending cache entries are discarded rather than committed. Error cleanup
+also releases resources after waiting and propagates the worker error. Provider
+destruction waits for an outstanding callback before destroying reader/config
+state captured through the provider. Explicit finish, context wait or release
+remain responsible for reporting worker errors; destruction does not throw.
+Consumers must still be fenced by the caller before a reservation is released.
+
+Validation exhausts all 256 Top-8 cold/hot masks using two differently ordered
+tokens with duplicate experts. Three native-gated provider tests check begin
+returning before upload completion, preserved hit data and canonical mapping,
+finish blocking, repeated-finish rejection, unfinished release/retry and active
+upload destruction. Final Debug/OCL evidence: 24 reservation/LRU tests,
+21 upload/provider tests, 307 complete focused tests and 80 LES-on forced-fallback
+cases passed with zero failures/skips. Subsets overlap. A test-fixture file/layout
+size mismatch was corrected without weakening production range validation.
+
+This is only the P3 foundation. Production kernels still execute through the
+P2 all-ready wrapper. Pair-mask GEMV kernels, actual ready-first Pass A/B,
+small-capacity multi-wave scheduling, bitwise split/unsplit comparisons and
+trace-proven layer-level I/O/compute overlap remain pending. The P2 real-model
+smoke is historical evidence, not a run of this new P3 foundation.

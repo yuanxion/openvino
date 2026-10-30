@@ -23,7 +23,7 @@ std::optional<ExpertSlotReservations::Ticket> ExpertSlotReservations::reserve(co
     auto planned = _slots;
     std::unordered_map<uint32_t, size_t> mapping;
     Record record{epoch, {}};
-    Ticket result{_next_id + 1, epoch, {}, {}, {}};
+    Ticket result{_next_id + 1, epoch, {}, {}, {}, {}, {}};
     auto clock = _clock;
     for (auto expert : unique) {
         for (size_t index = 0; index < planned.size(); ++index) {
@@ -68,8 +68,10 @@ std::optional<ExpertSlotReservations::Ticket> ExpertSlotReservations::reserve(co
         result.missing_experts.push_back(expert);
         result.missing_slots.push_back(candidate);
     }
-    for (auto expert : experts) {
-        result.slots.push_back(mapping.at(expert));
+    for (size_t pair = 0; pair < experts.size(); ++pair) {
+        auto slot = mapping.at(experts[pair]);
+        result.slots.push_back(slot);
+        (planned[slot].ready ? result.ready_pairs : result.missing_pairs).push_back(pair);
     }
     _active.emplace(result.id, std::move(record));
     _slots.swap(planned);
