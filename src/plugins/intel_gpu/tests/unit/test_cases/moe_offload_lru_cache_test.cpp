@@ -71,6 +71,44 @@ TEST(moe_les_reservations, rejects_zero_capacity) {
     EXPECT_THROW(ExpertSlotReservations(0), std::invalid_argument);
 }
 
+TEST(moe_les_reservations, partitions_all_top8_masks_in_canonical_pair_order) {
+    const std::vector<uint32_t> experts{7, 0, 5, 2, 6, 1, 4, 3, 3, 4, 1, 6, 2, 5, 0, 7};
+    for (uint32_t mask = 0; mask < 256; ++mask) {
+        SCOPED_TRACE(mask);
+        ExpertSlotReservations cache(8);
+        std::vector<uint32_t> warm;
+        for (uint32_t expert = 0; expert < 8; ++expert) {
+            if (mask & (1U << expert)) {
+                warm.push_back(expert);
+            }
+        }
+        auto initial = cache.reserve(warm, 1);
+        ASSERT_TRUE(initial);
+        ASSERT_TRUE(cache.complete(*initial));
+        ASSERT_TRUE(cache.release(*initial));
+        auto demand = cache.reserve(experts, 2);
+        ASSERT_TRUE(demand);
+        std::vector<size_t> ready;
+        std::vector<size_t> missing;
+        for (size_t pair = 0; pair < experts.size(); ++pair) {
+            (mask & (1U << experts[pair]) ? ready : missing).push_back(pair);
+            EXPECT_EQ(demand->slots[pair], demand->slots[experts.size() - 1 - pair]);
+        }
+        EXPECT_EQ(demand->ready_pairs, ready);
+        EXPECT_EQ(demand->missing_pairs, missing);
+        ASSERT_TRUE(cache.complete(*demand));
+        EXPECT_EQ(demand->ready_pairs, ready);
+        EXPECT_EQ(demand->missing_pairs, missing);
+        ASSERT_TRUE(cache.release(*demand));
+        auto hits = cache.reserve(experts, 3);
+        ASSERT_TRUE(hits);
+        EXPECT_EQ(hits->ready_pairs.size(), experts.size());
+        EXPECT_TRUE(hits->missing_pairs.empty());
+        EXPECT_TRUE(hits->missing_experts.empty());
+        ASSERT_TRUE(cache.release(*hits));
+    }
+}
+
 // --------------------------------------------------
 // Basic construction and initial state
 // --------------------------------------------------

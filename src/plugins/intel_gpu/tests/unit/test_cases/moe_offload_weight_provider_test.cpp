@@ -169,6 +169,110 @@ TEST_F(moe_les_upload, later_short_read_drains_already_submitted_dma) {
     weights.gate_w->copy_to(*transfer, actual.data(), true);
     EXPECT_EQ(actual, std::vector<uint8_t>(32, 7));
 }
+TEST_F(moe_les_upload, split_demand_returns_ready_pairs_before_upload_finishes) {
+    auto file = std::vector<uint8_t>(32, 7);
+    std::fill(file.begin() + 16, file.end(), 11);
+    write(file);
+    MOECompressed::Config config{};
+    config.num_expert = 2;
+    OffloadExpertWeightProvider provider(2, config, std::vector<size_t>(9), path);
+    moe_weights weights;
+    weights.gate_w = buffer(16, data_types::u8, 2);
+    provider.bind(weights);
+    auto transfer = lane();
+    cldnn::les_context context(2, transfer);
+    provider.set_les_context(&context, context.begin_epoch());
+    auto compute = lane();
+    ASSERT_TRUE(provider.try_acquire_simultaneous({0}, *compute));
+    provider.release();
+    cl::UserEvent gate(dynamic_cast<cldnn::ocl::ocl_engine&>(get_test_engine()).get_cl_context());
+    dynamic_cast<cldnn::ocl::ocl_stream&>(*transfer).enqueue_external_barrier({std::make_shared<cldnn::ocl::ocl_event>(gate)});
+    transfer->flush();
+    auto begin = std::async(std::launch::async, [&] { return provider.begin_les_demand({1, 0, 1, 0}); });
+    auto begin_status = begin.wait_for(std::chrono::seconds(5));
+    if (begin_status != std::future_status::ready) {
+        gate.setStatus(CL_COMPLETE);
+    }
+    ASSERT_EQ(begin_status, std::future_status::ready);
+    auto demand = begin.get();
+    auto finish = std::async(std::launch::async, [&] { provider.finish_les_demand(*compute); });
+    auto blocked = finish.wait_for(std::chrono::milliseconds(20));
+    gate.setStatus(CL_COMPLETE);
+    EXPECT_EQ(blocked, std::future_status::timeout);
+    ASSERT_EQ(finish.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    EXPECT_NO_THROW(finish.get());
+    ASSERT_TRUE(demand);
+    EXPECT_EQ(demand->ready_pairs, (std::vector<size_t>{1, 3}));
+    EXPECT_EQ(demand->missing_pairs, (std::vector<size_t>{0, 2}));
+    EXPECT_EQ(demand->slots[0], demand->slots[2]);
+    EXPECT_EQ(demand->slots[1], demand->slots[3]);
+    std::vector<uint8_t> actual(16);
+    weights.gate_w->copy_to(*compute, actual.data(), demand->slots[0] * actual.size(), 0, actual.size(), true);
+    EXPECT_EQ(actual, std::vector<uint8_t>(16, 11));
+    weights.gate_w->copy_to(*compute, actual.data(), demand->slots[1] * actual.size(), 0, actual.size(), true);
+    EXPECT_EQ(actual, std::vector<uint8_t>(16, 7));
+    EXPECT_THROW(provider.finish_les_demand(*compute), ov::Exception);
+    provider.release();
+}
+
+TEST_F(moe_les_upload, split_demand_release_drains_unfinished_upload) {
+    write(std::vector<uint8_t>(32, 7));
+    MOECompressed::Config config{};
+    config.num_expert = 2;
+    OffloadExpertWeightProvider provider(1, config, std::vector<size_t>(9), path);
+    moe_weights weights;
+    weights.gate_w = buffer(16, data_types::u8, 2);
+    provider.bind(weights);
+    auto transfer = lane();
+    cldnn::les_context context(2, transfer);
+    provider.set_les_context(&context, context.begin_epoch());
+    cl::UserEvent gate(dynamic_cast<cldnn::ocl::ocl_engine&>(get_test_engine()).get_cl_context());
+    dynamic_cast<cldnn::ocl::ocl_stream&>(*transfer).enqueue_external_barrier({std::make_shared<cldnn::ocl::ocl_event>(gate)});
+    transfer->flush();
+    auto demand = provider.begin_les_demand({0});
+    auto released = std::async(std::launch::async, [&] { provider.release(); });
+    auto blocked = released.wait_for(std::chrono::milliseconds(20));
+    gate.setStatus(CL_COMPLETE);
+    EXPECT_EQ(blocked, std::future_status::timeout);
+    ASSERT_EQ(released.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    EXPECT_NO_THROW(released.get());
+    ASSERT_TRUE(demand);
+    auto retry = provider.begin_les_demand({0});
+    ASSERT_TRUE(retry);
+    EXPECT_TRUE(retry->ready_pairs.empty());
+    EXPECT_EQ(retry->missing_pairs, std::vector<size_t>{0});
+    provider.finish_les_demand(get_test_stream());
+    provider.release();
+}
+
+TEST_F(moe_les_upload, split_demand_destruction_joins_active_upload) {
+    write(std::vector<uint8_t>(32, 7));
+    MOECompressed::Config config{};
+    config.num_expert = 2;
+    auto transfer = lane();
+    cldnn::les_context context(2, transfer);
+    moe_weights weights;
+    weights.gate_w = buffer(16, data_types::u8, 2);
+    auto provider = std::make_unique<OffloadExpertWeightProvider>(1, config, std::vector<size_t>(9), path);
+    provider->bind(weights);
+    provider->set_les_context(&context, context.begin_epoch());
+    cl::UserEvent gate(dynamic_cast<cldnn::ocl::ocl_engine&>(get_test_engine()).get_cl_context());
+    dynamic_cast<cldnn::ocl::ocl_stream&>(*transfer).enqueue_external_barrier({std::make_shared<cldnn::ocl::ocl_event>(gate)});
+    transfer->flush();
+    auto demand = provider->begin_les_demand({0});
+    auto destroyed = std::async(std::launch::async, [&] { provider.reset(); });
+    auto blocked = destroyed.wait_for(std::chrono::milliseconds(20));
+    gate.setStatus(CL_COMPLETE);
+    EXPECT_EQ(blocked, std::future_status::timeout);
+    ASSERT_EQ(destroyed.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    EXPECT_NO_THROW(destroyed.get());
+    ASSERT_TRUE(demand);
+    EXPECT_NO_THROW(context.wait());
+    std::vector<uint8_t> actual(16);
+    weights.gate_w->copy_to(get_test_stream(), actual.data(), 0, 0, actual.size(), true);
+    EXPECT_EQ(actual, std::vector<uint8_t>(16, 7));
+}
+
 TEST_F(moe_les_upload, provider_capacity_overflow_does_no_io) {
     MOECompressed::Config config{};
     config.num_expert = 2;
