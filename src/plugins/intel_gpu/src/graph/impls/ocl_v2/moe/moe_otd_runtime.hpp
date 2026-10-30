@@ -31,6 +31,9 @@ struct OtdPerfCounters {
     std::atomic<uint64_t> batched_fallbacks{0};
     std::atomic<uint64_t> grouped_fallbacks{0};
     std::atomic<uint64_t> created_onednn_kernels{0};
+    std::atomic<uint64_t> les_worker_tasks{0};
+    std::atomic<uint64_t> les_upload_chunks{0};
+    std::atomic<uint64_t> les_upload_bytes{0};
 
     void dump() const;
 };
@@ -95,5 +98,13 @@ void fill_weights_memory(cldnn::stream& exec_stream,
                          cldnn::moe_weights& wei_mem,
                          const std::vector<uint32_t>& experts_list,
                          const std::vector<size_t>& lru_experts);
+
+std::vector<cldnn::event::ptr> fill_weights_memory_async(cldnn::stream& transfer_stream,
+                                                      const cldnn::MOECompressed::Config& config,
+                                                      const std::vector<size_t>& weight_bin_offsets,
+                                                      ParallelWeightReader& weight_reader,
+                                                      cldnn::moe_weights& weights,
+                                                      const std::vector<uint32_t>& experts,
+                                                      const std::vector<size_t>& slots);
 
 }  // namespace ov::intel_gpu::ocl::moe_otd
