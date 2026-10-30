@@ -14,6 +14,62 @@
 using namespace cldnn;
 using namespace tests;
 using ov::intel_gpu::ocl::moe::LRUCache;
+using ov::intel_gpu::ocl::moe::ExpertSlotReservations;
+
+TEST(moe_les_reservations, deduplicates_and_rejects_capacity_without_mutation) {
+    ExpertSlotReservations cache(2);
+    EXPECT_FALSE(cache.reserve({1, 2, 3}, 1));
+    auto lease = cache.reserve({1, 1, 2}, 1);
+    ASSERT_TRUE(lease);
+    EXPECT_EQ(lease->slots[0], lease->slots[1]);
+    EXPECT_EQ(lease->missing_experts.size(), 2U);
+    EXPECT_TRUE(cache.complete(*lease));
+    EXPECT_TRUE(cache.release(*lease));
+    auto hits = cache.reserve({1, 2}, 2);
+    ASSERT_TRUE(hits);
+    EXPECT_TRUE(hits->missing_experts.empty());
+}
+
+TEST(moe_les_reservations, protects_hits_before_assigning_misses) {
+    ExpertSlotReservations cache(2);
+    auto initial = cache.reserve({1, 2}, 1).value();
+    cache.complete(initial);
+    cache.release(initial);
+    auto lease = cache.reserve({3, 1}, 1).value();
+    EXPECT_EQ(lease.slots[1], initial.slots[0]);
+    EXPECT_EQ(lease.missing_experts, std::vector<uint32_t>{3});
+    EXPECT_NE(lease.slots[0], lease.slots[1]);
+}
+
+TEST(moe_les_reservations, pinned_consumers_prevent_eviction) {
+    ExpertSlotReservations cache(1);
+    auto first = cache.reserve({1}, 1).value();
+    cache.complete(first);
+    auto second = cache.reserve({1}, 1).value();
+    EXPECT_FALSE(cache.reserve({2}, 1));
+    cache.release(first);
+    EXPECT_FALSE(cache.reserve({2}, 1));
+    cache.release(second);
+    EXPECT_TRUE(cache.reserve({2}, 1));
+}
+
+TEST(moe_les_reservations, pending_is_not_ready_and_abort_permits_retry) {
+    ExpertSlotReservations cache(1);
+    auto first = cache.reserve({1}, 1).value();
+    EXPECT_FALSE(cache.reserve({1}, 1));
+    EXPECT_FALSE(cache.reserve({2}, 2));
+    cache.release(first);
+    auto next = cache.reserve({2}, 2).value();
+    EXPECT_FALSE(cache.complete(first));
+    EXPECT_FALSE(cache.release(first));
+    EXPECT_FALSE(cache.reserve({2}, 1));
+    EXPECT_TRUE(cache.complete(next));
+    EXPECT_TRUE(cache.release(next));
+}
+
+TEST(moe_les_reservations, rejects_zero_capacity) {
+    EXPECT_THROW(ExpertSlotReservations(0), std::invalid_argument);
+}
 
 // --------------------------------------------------
 // Basic construction and initial state
