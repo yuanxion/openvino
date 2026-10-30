@@ -7,6 +7,11 @@
 #include <array>
 #include <chrono>
 #include <fstream>
+#include <future>
+#include "intel_gpu/runtime/les_context.hpp"
+#include "runtime/ocl/ocl_engine.hpp"
+#include "runtime/ocl/ocl_stream.hpp"
+#include "runtime/ocl/ocl_event.hpp"
 
 using namespace cldnn;
 using namespace tests;
@@ -163,6 +168,99 @@ TEST_F(moe_les_upload, later_short_read_drains_already_submitted_dma) {
     std::vector<uint8_t> actual(32);
     weights.gate_w->copy_to(*transfer, actual.data(), true);
     EXPECT_EQ(actual, std::vector<uint8_t>(32, 7));
+}
+TEST_F(moe_les_upload, provider_capacity_overflow_does_no_io) {
+    MOECompressed::Config config{};
+    config.num_expert = 2;
+    OffloadExpertWeightProvider provider(1, config, std::vector<size_t>(9), path);
+    moe_weights weights;
+    provider.bind(weights);
+    cldnn::les_context context(2, lane());
+    provider.set_les_context(&context, context.begin_epoch());
+    EXPECT_FALSE(provider.try_acquire_simultaneous({0, 1}, get_test_stream()));
+    EXPECT_NO_THROW(context.wait());
+}
+
+TEST_F(moe_les_upload, provider_waits_for_real_consumer_before_reusing_slot) {
+    auto file = std::vector<uint8_t>(32, 7);
+    std::fill(file.begin() + 16, file.end(), 11);
+    write(file);
+    MOECompressed::Config config{};
+    config.num_expert = 2;
+    OffloadExpertWeightProvider provider(1, config, std::vector<size_t>(9), path);
+    moe_weights weights;
+    weights.gate_w = buffer(16, data_types::u8, 2);
+    provider.bind(weights);
+    cldnn::les_context context(2, lane());
+    provider.set_les_context(&context, context.begin_epoch());
+    auto compute = lane();
+    ASSERT_TRUE(provider.try_acquire_simultaneous({0}, *compute));
+    cl::UserEvent gate(dynamic_cast<cldnn::ocl::ocl_engine&>(get_test_engine()).get_cl_context());
+    dynamic_cast<cldnn::ocl::ocl_stream&>(*compute).enqueue_external_barrier({std::make_shared<cldnn::ocl::ocl_event>(gate)});
+    provider.set_consumer(compute->enqueue_marker({}));
+    compute->flush();
+    auto next = std::async(std::launch::async, [&] { return provider.try_acquire_simultaneous({1}, *compute); });
+    auto blocked = next.wait_for(std::chrono::milliseconds(20));
+    gate.setStatus(CL_COMPLETE);
+    EXPECT_EQ(blocked, std::future_status::timeout);
+    ASSERT_EQ(next.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    ASSERT_TRUE(next.get());
+    std::vector<uint8_t> actual(16);
+    weights.gate_w->copy_to(*compute, actual.data(), 0, 0, actual.size(), true);
+    EXPECT_EQ(actual, std::vector<uint8_t>(16, 11));
+    provider.release();
+}
+
+TEST_F(moe_les_upload, provider_recovers_after_partial_upload_failure) {
+    write(std::vector<uint8_t>(64, 7));
+    MOECompressed::Config config{};
+    config.num_expert = 2;
+    OffloadExpertWeightProvider provider(1, config, std::vector<size_t>{0, 32, 0, 0, 0, 0, 0, 0, 0}, path);
+    moe_weights weights;
+    weights.gate_w = buffer(16, data_types::u8, 2);
+    weights.up_w = buffer(16, data_types::u8, 2);
+    provider.bind(weights);
+    ASSERT_EQ(provider.weight_reader().file_size(), 64U);
+    std::filesystem::resize_file(path, 32);
+    cldnn::les_context context(2, lane());
+    provider.set_les_context(&context, context.begin_epoch());
+    auto compute = lane();
+    EXPECT_ANY_THROW(provider.try_acquire_simultaneous({0}, *compute));
+    context.cancel();
+    write(std::vector<uint8_t>(64, 7));
+    provider.set_les_context(&context, context.begin_epoch());
+    ASSERT_TRUE(provider.try_acquire_simultaneous({0}, *compute));
+    provider.release();
+}
+
+TEST_F(moe_les_upload, provider_cancelled_epoch_releases_queued_reservation) {
+    write(std::vector<uint8_t>(32, 7));
+    MOECompressed::Config config{};
+    config.num_expert = 2;
+    OffloadExpertWeightProvider provider(1, config, std::vector<size_t>(9), path);
+    moe_weights weights;
+    weights.gate_w = buffer(16, data_types::u8, 2);
+    provider.bind(weights);
+    cldnn::les_context context(2, lane());
+    auto epoch = context.begin_epoch();
+    provider.set_les_context(&context, epoch);
+    std::promise<void> entered;
+    std::promise<void> release;
+    auto release_work = release.get_future().share();
+    auto active = context.submit(epoch, [&] { entered.set_value(); release_work.wait(); });
+    entered.get_future().wait();
+    auto compute = lane();
+    auto demand = std::async(std::launch::async, [&] { return provider.try_acquire_simultaneous({0}, *compute); });
+    auto cancelled = std::async(std::launch::async, [&] { context.cancel(); });
+    auto status = demand.wait_for(std::chrono::seconds(5));
+    release.set_value();
+    cancelled.get();
+    ASSERT_EQ(status, std::future_status::ready);
+    EXPECT_THROW(demand.get(), cldnn::les_task_cancelled);
+    EXPECT_THROW(active.completion.get(), cldnn::les_task_cancelled);
+    provider.set_les_context(&context, context.begin_epoch());
+    ASSERT_TRUE(provider.try_acquire_simultaneous({0}, *compute));
+    provider.release();
 }
 }  // namespace
 
