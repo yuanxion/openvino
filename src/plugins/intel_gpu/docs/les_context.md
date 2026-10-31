@@ -383,11 +383,14 @@ P4 proxy execution is implemented for the documented plain-FP16, single-token
 projection boundary. It is not a general predictor for arbitrary Router graphs:
 compressed/quantized FC, fused FC operations, unsupported layouts and malformed
 chains remain demand-only. Router descriptors are re-derived from the restored
-program graph rather than serialized. OTD partial constants now serialize an
-explicit physical-byte marker with no device readback; import reconstructs a
-one-or-more-expert physical backing and the full logical view. Full P4 proxy-stage
-cache import parity and formal performance benefit remain unverified. Full-suite,
-ZE and TSan limits remain unchanged.
+program graph rather than serialized. A two-layer synthetic supported proxy
+program was saved and loaded, then rerun with the restored proxy stage; descriptors,
+prediction, actual route and bitwise output checks passed in all proxy variants.
+OTD partial constants now serialize an explicit physical-byte marker with no
+device readback; import reconstructs a resident-sized physical backing and full
+logical view. Qwen cold export/warm import parity also passed in demand-only mode.
+Formal performance benefit on a model with a supported proxy chain remains
+unverified. Full-suite, ZE and TSan limits remain unchanged.
 
 P4.1b adds `program::get_les_router_links()` as a stricter, read-only
 qualification query. It accepts only a matching Router output-0/1 pair,
@@ -412,8 +415,10 @@ Top-k kernel. The source MoE copies its input activation to network-owned memory
 with the upstream dependency event; the snapshot survives activation reuse and
 is cleared at each LES epoch. The proxy uses dedicated logits, indices and
 weights buffers. It never writes actual Router outputs or changes actual Top-k,
-routing weights or MoE compute. Router descriptors and kernel stages are rebuilt
-per program; cache serialization format is unchanged.
+routing weights or MoE compute. Router descriptors are derived from the loaded
+program graph; the proxy kernel stage is restored through the ordinary primitive
+implementation cache path. Data cache records use the separate partial-OTD marker
+documented above.
 
 `OV_GPU_LES_PREDICT_COMPARE=1` waits for proxy and real Router IDs and records
 Top-k slot recall. This mode is diagnostic and synchronizes Host readback; it is
@@ -432,14 +437,17 @@ bitwise with LES-off. Repeated execution verifies snapshot/event/ID refresh.
 Provider tests inject a speculative short read, check that the epoch remains
 usable, then confirm demand loads the repaired file. Final Debug/OCL verification
 passed 354 focused tests in 29 suites, 112 overlapping LES-on fallback cases and
-all eight proxy variants, zero failures/skips. The plugin linked.
+all eight proxy variants, zero failures/skips. The plugin linked. In the prefetch
+variant the complete program was serialized and loaded into a new network; restored
+descriptors and proxy stage executed, and the final output remained bitwise equal
+to the LES-off baseline.
 
 Source Qwen ratio 80 generated successfully with prediction and prefetch options
 set. All 39 adjacent chains were rejected because the Router FC uses compressed
 weights; zero proxy comparisons ran. This confirms conservative demand-only
-fallback, not prediction coverage on Qwen. No formal speedup or cold-cache
-benchmark is claimed; speculative prefetch remains opt-in and its latency
-benefit is unestablished.
+fallback, not prediction coverage on Qwen. No formal speedup for a supported
+model is claimed; speculative prefetch remains opt-in and its latency benefit is
+unestablished.
 
 For compiled-model cache validation, `LES_CACHE_DIR` is optional in
 `run_source_baseline.sh` and is forwarded as OpenVINO `CACHE_DIR`. Qwen ratio 80
