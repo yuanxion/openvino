@@ -8,6 +8,9 @@
 #include "intel_gpu/primitives/input_layout.hpp"
 #include "intel_gpu/primitives/eltwise.hpp"
 #include "intel_gpu/primitives/loop.hpp"
+#include "intel_gpu/primitives/data.hpp"
+#include "intel_gpu/primitives/fully_connected.hpp"
+#include "intel_gpu/primitives/moe_router_fused.hpp"
 #include "intel_gpu/primitives/moe_3gemm_fused_compressed.hpp"
 #include "intel_gpu/graph/program.hpp"
 #include "intel_gpu/runtime/les_context.hpp"
@@ -138,14 +141,21 @@ protected:
         if (moe) {
             primitive = std::make_shared<cldnn::moe_3gemm_fused_compressed>(id, inputs, cldnn::MOECompressed::Config{});
         } else if (inputs.empty()) {
-            primitive = std::make_shared<cldnn::input_layout>(id,
-                cldnn::layout{cldnn::data_types::f32, cldnn::format::bfyx, {1, 1, 1, 2}});
+            cldnn::layout output_layout{ov::PartialShape{1, 1, 2}, cldnn::data_types::f32, cldnn::format::bfyx};
+            primitive = std::make_shared<cldnn::input_layout>(id, output_layout);
+            auto& node = program.get_or_create(primitive);
+            node.set_output_layout(output_layout, false);
+            return;
         } else {
             primitive = std::make_shared<cldnn::eltwise>(id, inputs, cldnn::eltwise_mode::sum);
         }
         auto& node = program.get_or_create(primitive);
         for (const auto& dependency : dependencies) {
             program.add_connection(program.get_node(dependency), node);
+        }
+        if (moe) {
+            cldnn::layout output_layout{ov::PartialShape{1, 1, 2}, cldnn::data_types::f32, cldnn::format::bfyx};
+            node.set_output_layout(output_layout, false);
         }
     }
 
@@ -158,7 +168,125 @@ protected:
         ADD_FAILURE() << "Missing LES descriptor for " << target;
         return {};
     }
+
+    std::unique_ptr<cldnn::program> router_program(bool sigmoid,
+                                                   bool variable_weights = false,
+                                                   bool projection_bias = false,
+                                                   bool wrong_router_ports = false,
+                                                   bool multiple_tokens = false) {
+        auto program = make_program();
+        cldnn::layout hidden_layout{ov::PartialShape{1, 1, 2}, cldnn::data_types::f32, cldnn::format::bfyx};
+        if (multiple_tokens) {
+            hidden_layout = cldnn::layout{ov::PartialShape{1, 2, 2}, cldnn::data_types::f32, cldnn::format::bfyx};
+        }
+        auto& hidden = program->get_or_create(std::make_shared<cldnn::input_layout>("hidden", hidden_layout));
+        auto hidden_output_layout = hidden_layout;
+        hidden.set_output_layout(hidden_output_layout, false);
+        add(*program, "source", {"hidden"}, true);
+        auto source_output_layout = hidden_layout;
+        program->get_node("source").set_output_layout(source_output_layout, false);
+        const cldnn::layout weights_layout{ov::PartialShape{4, 2}, cldnn::data_types::f32, cldnn::format::bfyx};
+        if (variable_weights) {
+            program->get_or_create(std::make_shared<cldnn::input_layout>("router_weights", weights_layout));
+        } else {
+            program->get_or_create(std::make_shared<cldnn::data>("router_weights", get_test_engine().allocate_memory(weights_layout)));
+        }
+        std::string projection_bias_id;
+        if (projection_bias) {
+            projection_bias_id = "projection_bias";
+            auto bias_memory = get_test_engine().allocate_memory(cldnn::layout{
+                ov::PartialShape{4}, cldnn::data_types::f32, cldnn::format::bfyx});
+            program->get_or_create(std::make_shared<cldnn::data>(projection_bias_id, bias_memory));
+        }
+        auto projection = std::make_shared<cldnn::fully_connected>("projection", cldnn::input_info("source"),
+                                                                  "router_weights", projection_bias_id, 3);
+        auto& projection_node = program->get_or_create(projection);
+        program->add_connection(program->get_node("source"), projection_node);
+        program->add_connection(program->get_node("router_weights"), projection_node);
+        if (projection_bias) {
+            program->add_connection(program->get_node(projection_bias_id), projection_node);
+        }
+        cldnn::MoERouterFused::Config config{};
+        config.num_expert = 4;
+        config.top_k = 2;
+        config.routing_type = sigmoid ? cldnn::MoERouterFused::RoutingType::SIGMOID_BIAS
+                                      : cldnn::MoERouterFused::RoutingType::SOFTMAX;
+        std::vector<cldnn::input_info> inputs{cldnn::input_info("projection")};
+        if (sigmoid) {
+            for (const auto& parameter : std::vector<std::pair<std::string, size_t>>{{"bias", 4}, {"eps", 1}}) {
+                auto memory = get_test_engine().allocate_memory(cldnn::layout{
+                    ov::PartialShape{static_cast<int64_t>(parameter.second)}, cldnn::data_types::f32, cldnn::format::bfyx});
+                program->get_or_create(std::make_shared<cldnn::data>(parameter.first, memory));
+                inputs.emplace_back(parameter.first);
+            }
+        }
+        auto& router = program->get_or_create(std::make_shared<cldnn::moe_router_fused>("router", inputs, config));
+        for (const auto& input : inputs) {
+            program->add_connection(program->get_node(input.pid), router);
+        }
+        auto& target = program->get_or_create(std::make_shared<cldnn::moe_3gemm_fused_compressed>("target",
+            std::vector<cldnn::input_info>{cldnn::input_info("source"), cldnn::input_info("router", 0),
+                                          cldnn::input_info("router", wrong_router_ports ? 0 : 1)},
+            cldnn::MOECompressed::Config{}));
+        program->add_connection(program->get_node("source"), target);
+        program->add_connection(router, target, 0);
+        program->add_connection(router, target, wrong_router_ports ? 0 : 1);
+        return program;
+    }
 };
+
+TEST_F(moe_les_chain, constant_projection_and_router_parameters_are_qualified) {
+    for (bool sigmoid : {false, true}) {
+        auto program = router_program(sigmoid);
+        auto links = program->get_les_router_links();
+        ASSERT_EQ(links.size(), 2U);
+        const auto& link = links.back();
+        EXPECT_EQ(link.status, cldnn::program::les_router_status::supported);
+        EXPECT_EQ(link.router, "router");
+        EXPECT_EQ(link.projection, "projection");
+        EXPECT_EQ(link.weights, "router_weights");
+        EXPECT_EQ(link.experts, 4U);
+        EXPECT_EQ(link.top_k, 2U);
+        EXPECT_EQ(link.sigmoid_bias, sigmoid);
+        EXPECT_EQ(link.routing_bias, sigmoid ? "bias" : "");
+        EXPECT_EQ(link.routing_eps, sigmoid ? "eps" : "");
+    }
+}
+
+TEST_F(moe_les_chain, constant_projection_bias_is_described) {
+    auto program = router_program(false, false, true);
+    const auto& link = program->get_les_router_links().back();
+    EXPECT_EQ(link.status, cldnn::program::les_router_status::supported);
+    EXPECT_EQ(link.projection_bias, "projection_bias");
+}
+
+TEST_F(moe_les_chain, multi_token_proxy_is_rejected) {
+    auto program = router_program(false, false, false, false, true);
+    EXPECT_EQ(program->get_les_router_links().back().status, cldnn::program::les_router_status::unsupported_layout);
+}
+
+TEST_F(moe_les_chain, incorrect_router_output_port_is_rejected) {
+    auto program = router_program(false, false, false, true);
+    EXPECT_EQ(program->get_les_router_links().back().status, cldnn::program::les_router_status::unsupported_router);
+}
+
+TEST_F(moe_les_chain, variable_router_weights_are_rejected) {
+    auto program = router_program(false, true);
+    EXPECT_EQ(program->get_les_router_links().back().status, cldnn::program::les_router_status::non_constant_parameter);
+}
+
+TEST_F(moe_les_chain, different_topk_producers_are_not_a_router_descriptor) {
+    auto program = make_program();
+    add(*program, "hidden");
+    add(*program, "source", {"hidden"}, true);
+    add(*program, "weights");
+    add(*program, "indices");
+    add(*program, "target", {"source", "weights", "indices"}, true);
+    auto links = program->get_les_router_links();
+    ASSERT_EQ(links.size(), 2U);
+    EXPECT_EQ(links.back().status, cldnn::program::les_router_status::unsupported_router);
+    EXPECT_TRUE(links.back().router.empty());
+}
 
 TEST_F(moe_les_chain, dense_gap_uses_nearest_moe_and_stable_ids) {
     auto program = make_program();
