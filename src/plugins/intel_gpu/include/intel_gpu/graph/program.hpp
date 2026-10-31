@@ -178,6 +178,28 @@ public:
         les_link_status status = les_link_status::no_predecessor;
     };
     std::vector<les_moe_link> get_les_moe_links() const;
+    enum class les_router_status {
+        supported,
+        no_chain,
+        unsupported_router,
+        unsupported_projection,
+        non_constant_parameter,
+        unsupported_layout
+    };
+    struct les_router_link {
+        les_moe_link chain;
+        les_router_status status = les_router_status::no_chain;
+        primitive_id router;
+        primitive_id projection;
+        primitive_id weights;
+        primitive_id projection_bias;
+        primitive_id routing_bias;
+        primitive_id routing_eps;
+        size_t experts = 0;
+        size_t top_k = 0;
+        bool sigmoid_bias = false;
+    };
+    std::vector<les_router_link> get_les_router_links() const;
     const nodes_ordering& get_processing_order() const;
     nodes_ordering& get_processing_order();
     const std::vector<primitive_id>& get_allocating_order(bool forced_update = false);

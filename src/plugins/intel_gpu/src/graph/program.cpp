@@ -88,6 +88,8 @@
 
 #include "intel_gpu/primitives/rnn.hpp"
 #include "intel_gpu/primitives/moe_3gemm_fused_compressed.hpp"
+#include "intel_gpu/primitives/moe_router_fused.hpp"
+#include "intel_gpu/primitives/fully_connected.hpp"
 
 // TODO: Remove once we have interface for kernels cache
 #include "impls/ocl/kernels_cache.hpp"
@@ -597,6 +599,107 @@ std::vector<program::les_moe_link> program::get_les_moe_links() const {
         if (link.status == les_link_status::candidate && successor_counts.at(link.source_moe) != 1) {
             link.status = les_link_status::branched_predecessor;
         }
+    }
+    return links;
+}
+
+std::vector<program::les_router_link> program::get_les_router_links() const {
+    std::vector<les_router_link> links;
+    for (const auto& chain : get_les_moe_links()) {
+        les_router_link link;
+        link.chain = chain;
+        auto qualify = [&] {
+            if (chain.status != les_link_status::candidate) {
+                return les_router_status::no_chain;
+            }
+            const auto& target = get_node(chain.target_moe);
+            const auto& dependencies = target.get_dependencies();
+            if (dependencies.size() < 3 || dependencies[1].first != dependencies[2].first ||
+                dependencies[1].second != 0 || dependencies[2].second != 1 ||
+                !dependencies[1].first->is_type<moe_router_fused>()) {
+                return les_router_status::unsupported_router;
+            }
+            const auto& router = *dependencies[1].first;
+            const auto config = std::static_pointer_cast<const moe_router_fused>(router.get_primitive())->_config;
+            if (config.top_k <= 0 || config.top_k > config.num_expert || config.num_expert > 1024 ||
+                (config.routing_type != MoERouterFused::RoutingType::SOFTMAX &&
+                 config.routing_type != MoERouterFused::RoutingType::SIGMOID_BIAS)) {
+                return les_router_status::unsupported_router;
+            }
+            link.router = router.id();
+            link.experts = config.num_expert;
+            link.top_k = config.top_k;
+            link.sigmoid_bias = config.routing_type == MoERouterFused::RoutingType::SIGMOID_BIAS;
+            const auto& router_dependencies = router.get_dependencies();
+            if (router_dependencies.size() != (link.sigmoid_bias ? 3U : 1U) || router_dependencies[0].second != 0 ||
+                !router_dependencies.front().first->is_type<fully_connected>()) {
+                return les_router_status::unsupported_projection;
+            }
+            const auto& projection = *router_dependencies.front().first;
+            const auto desc = std::static_pointer_cast<const fully_connected>(projection.get_primitive());
+            const auto& inputs = projection.get_dependencies();
+            if (desc->compressed_weights || desc->hadamard_block || projection.has_fused_primitives() ||
+                inputs.size() != (desc->bias.is_valid() ? 3U : 2U) || inputs[0].second != 0 ||
+                inputs.front().first->id() != chain.target_hidden || inputs[1].first->id() != desc->weights.pid ||
+                inputs[1].second != desc->weights.idx ||
+                (desc->bias.is_valid() &&
+                 (inputs[2].first->id() != desc->bias.pid || inputs[2].second != desc->bias.idx))) {
+                return les_router_status::unsupported_projection;
+            }
+            link.projection = projection.id();
+            link.weights = inputs[1].first->id();
+            if (desc->bias.is_valid()) {
+                link.projection_bias = inputs[2].first->id();
+            }
+            if (link.sigmoid_bias) {
+                link.routing_bias = router_dependencies[1].first->id();
+                link.routing_eps = router_dependencies[2].first->id();
+            }
+            for (const auto& id : {link.weights, link.projection_bias, link.routing_bias, link.routing_eps}) {
+                if (!id.empty() && !get_node(id).is_type<data>()) {
+                    return les_router_status::non_constant_parameter;
+                }
+            }
+            const auto& weights_node = get_node(link.weights);
+            const auto& hidden_node = get_node(chain.proxy_hidden);
+            const auto& target_hidden_node = get_node(chain.target_hidden);
+            const auto& weights = weights_node.get_output_layout();
+            const auto& hidden = hidden_node.get_output_layout();
+            const auto& target_hidden = target_hidden_node.get_output_layout();
+            const auto is_single_token = [](const layout& value) {
+                const auto& shape = value.get_shape();
+                return shape.size() >= 2 &&
+                       std::all_of(shape.begin(), std::prev(shape.end()), [](size_t dimension) { return dimension == 1; });
+            };
+            if (weights.is_dynamic() || hidden.is_dynamic() ||
+                (weights.data_type != data_types::f16 && weights.data_type != data_types::f32) ||
+                hidden.data_type != weights.data_type || target_hidden.data_type != weights.data_type ||
+                weights.format != format::bfyx || hidden.format != format::bfyx || target_hidden.format != format::bfyx ||
+                weights.get_partial_shape().size() != 2 || hidden.get_partial_shape().size() < 2 ||
+                target_hidden.get_partial_shape().size() < 2 || target_hidden.is_dynamic() ||
+                hidden.get_partial_shape().is_dynamic() ||
+                !desc->weights_transposed || weights.get_shape()[0] != link.experts ||
+                hidden.get_shape().back() != weights.get_shape()[1] || target_hidden.get_shape().back() != weights.get_shape()[1] ||
+                !is_single_token(hidden) || !is_single_token(target_hidden)) {
+                return les_router_status::unsupported_layout;
+            }
+            const auto validate_parameter = [&](const primitive_id& id, size_t count) {
+                if (id.empty()) {
+                    return true;
+                }
+                const auto& parameter = get_node(id).get_output_layout();
+                return !parameter.is_dynamic() && parameter.get_shape().size() == 1 && parameter.get_shape()[0] == count &&
+                       parameter.data_type == weights.data_type;
+            };
+            if (!validate_parameter(link.projection_bias, link.experts) ||
+                !validate_parameter(link.routing_bias, link.experts) ||
+                !validate_parameter(link.routing_eps, 1)) {
+                return les_router_status::unsupported_layout;
+            }
+            return les_router_status::supported;
+        };
+        link.status = qualify();
+        links.push_back(std::move(link));
     }
     return links;
 }
