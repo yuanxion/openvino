@@ -20,11 +20,13 @@
 #include <iostream>
 #include <cstring>
 #include <numeric>
+#include <sstream>
 
 #include "../../common/random_generator.hpp"
 #include "../test_utils/test_utils.h"
 #include "moe_3gemm_test_data.h"
 #include "primitive_inst.h"
+#include "intel_gpu/graph/serialization/binary_buffer.hpp"
 
 using namespace cldnn;
 using namespace ::tests;
@@ -833,6 +835,34 @@ TEST_P(moe_3gemm_compressed_gpu_random, moe_accuracy_test_random) {
         mem_lock<ov::float16, mem_lock_type::read> predicted_values(predicted_result, network.get_stream());
         for (size_t index = 0; index < config.hidden_size; ++index) {
             EXPECT_EQ(std::memcmp(&baseline_values[index], &predicted_values[index], sizeof(ov::float16)), 0) << index;
+        }
+
+        if (param.proxy_prefetch) {
+            std::stringstream serialized;
+            BinaryOutputBuffer output_buffer(serialized);
+            output_buffer.set_stream(network.get_stream_ptr().get());
+            network.get_program()->save(output_buffer);
+            serialized.seekg(0);
+            BinaryInputBuffer input_buffer(serialized, engine);
+            auto imported_program = std::make_shared<program>(engine, net_config);
+            imported_program->load(input_buffer);
+            cldnn::network imported(imported_program);
+            ASSERT_TRUE(imported.is_les_prediction_enabled());
+            auto imported_links = imported.get_les_router_links();
+            ASSERT_EQ(imported_links.size(), 2U);
+            EXPECT_EQ(imported_links.back().status, program::les_router_status::supported);
+            imported.set_input_data("hidden_states", hidden_states_mem);
+            imported.set_input_data("routing_weights", routing_weights_mem);
+            auto imported_outputs = imported.execute();
+            const auto imported_state = imported.get_les_proxy_state("proxy_target");
+            ASSERT_NE(imported_state.prediction_ready, nullptr);
+            imported_state.prediction_ready->wait();
+            auto imported_result = imported_outputs.begin()->second.get_memory();
+            mem_lock<ov::float16, mem_lock_type::read> imported_values(imported_result, imported.get_stream());
+            for (size_t index = 0; index < config.hidden_size; ++index) {
+                EXPECT_EQ(std::memcmp(&baseline_values[index], &imported_values[index], sizeof(ov::float16)), 0)
+                    << "Imported proxy output mismatch " << index;
+            }
         }
 
         auto prior_snapshot = state.hidden;
