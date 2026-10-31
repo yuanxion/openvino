@@ -638,17 +638,39 @@ std::vector<program::les_router_link> program::get_les_router_links() const {
             const auto& router_dependencies = router.get_dependencies();
             if (router_dependencies.size() != (link.sigmoid_bias ? 3U : 1U) || router_dependencies[0].second != 0 ||
                 !router_dependencies.front().first->is_type<fully_connected>()) {
+                link.rejection_reason = "router_logits_not_plain_fully_connected";
                 return les_router_status::unsupported_projection;
             }
             const auto& projection = *router_dependencies.front().first;
             const auto desc = std::static_pointer_cast<const fully_connected>(projection.get_primitive());
             const auto& inputs = projection.get_dependencies();
-            if (desc->compressed_weights || desc->hadamard_block || projection.has_fused_primitives() ||
-                inputs.size() != (desc->bias.is_valid() ? 3U : 2U) || inputs[0].second != 0 ||
-                inputs.front().first->id() != chain.target_hidden || inputs[1].first->id() != desc->weights.pid ||
-                inputs[1].second != desc->weights.idx ||
+            if (desc->compressed_weights) {
+                link.rejection_reason = "projection_compressed_weights";
+                return les_router_status::unsupported_projection;
+            }
+            if (desc->hadamard_block) {
+                link.rejection_reason = "projection_hadamard";
+                return les_router_status::unsupported_projection;
+            }
+            if (projection.has_fused_primitives()) {
+                link.rejection_reason = "fused:";
+                for (const auto& fused : projection.get_fused_primitives()) {
+                    link.rejection_reason += fused.desc->type_string() + ",";
+                }
+                return les_router_status::unsupported_projection;
+            }
+            if (inputs.size() != (desc->bias.is_valid() ? 3U : 2U)) {
+                link.rejection_reason = "projection_unexpected_input_count";
+                return les_router_status::unsupported_projection;
+            }
+            if (inputs[0].second != 0 || inputs.front().first->id() != chain.target_hidden) {
+                link.rejection_reason = "projection_hidden_source_mismatch";
+                return les_router_status::unsupported_projection;
+            }
+            if (inputs[1].first->id() != desc->weights.pid || inputs[1].second != desc->weights.idx ||
                 (desc->bias.is_valid() &&
                  (inputs[2].first->id() != desc->bias.pid || inputs[2].second != desc->bias.idx))) {
+                link.rejection_reason = "projection_parameter_port_mismatch";
                 return les_router_status::unsupported_projection;
             }
             link.projection = projection.id();
@@ -677,7 +699,7 @@ std::vector<program::les_router_link> program::get_les_router_links() const {
                        std::all_of(shape.begin(), std::prev(shape.end()), [](size_t dimension) { return dimension == 1; });
             };
             if (weights.is_dynamic() || hidden.is_dynamic() ||
-                (weights.data_type != data_types::f16 && weights.data_type != data_types::f32) ||
+                weights.data_type != data_types::f16 ||
                 hidden.data_type != weights.data_type || target_hidden.data_type != weights.data_type ||
                 weights.format != format::bfyx || hidden.format != format::bfyx || target_hidden.format != format::bfyx ||
                 weights.get_partial_shape().size() != 2 || hidden.get_partial_shape().size() < 2 ||
@@ -686,6 +708,7 @@ std::vector<program::les_router_link> program::get_les_router_links() const {
                 !desc->weights_transposed || weights.get_shape()[0] != link.experts ||
                 hidden.get_shape().back() != weights.get_shape()[1] || target_hidden.get_shape().back() != weights.get_shape()[1] ||
                 !is_single_token(hidden) || !is_single_token(target_hidden)) {
+                link.rejection_reason = "unsupported_static_single_token_layout";
                 return les_router_status::unsupported_layout;
             }
             const auto validate_parameter = [&](const primitive_id& id, size_t count) {
@@ -699,6 +722,7 @@ std::vector<program::les_router_link> program::get_les_router_links() const {
             if (!validate_parameter(link.projection_bias, link.experts) ||
                 !validate_parameter(link.routing_bias, link.experts) ||
                 !validate_parameter(link.routing_eps, 1)) {
+                link.rejection_reason = "unsupported_router_parameter_layout";
                 return les_router_status::unsupported_layout;
             }
             return les_router_status::supported;

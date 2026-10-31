@@ -175,9 +175,9 @@ protected:
                                                    bool wrong_router_ports = false,
                                                    bool multiple_tokens = false) {
         auto program = make_program();
-        cldnn::layout hidden_layout{ov::PartialShape{1, 1, 2}, cldnn::data_types::f32, cldnn::format::bfyx};
+        cldnn::layout hidden_layout{ov::PartialShape{1, 1, 2}, cldnn::data_types::f16, cldnn::format::bfyx};
         if (multiple_tokens) {
-            hidden_layout = cldnn::layout{ov::PartialShape{1, 2, 2}, cldnn::data_types::f32, cldnn::format::bfyx};
+            hidden_layout = cldnn::layout{ov::PartialShape{1, 2, 2}, cldnn::data_types::f16, cldnn::format::bfyx};
         }
         auto& hidden = program->get_or_create(std::make_shared<cldnn::input_layout>("hidden", hidden_layout));
         auto hidden_output_layout = hidden_layout;
@@ -185,7 +185,7 @@ protected:
         add(*program, "source", {"hidden"}, true);
         auto source_output_layout = hidden_layout;
         program->get_node("source").set_output_layout(source_output_layout, false);
-        const cldnn::layout weights_layout{ov::PartialShape{4, 2}, cldnn::data_types::f32, cldnn::format::bfyx};
+        const cldnn::layout weights_layout{ov::PartialShape{4, 2}, cldnn::data_types::f16, cldnn::format::bfyx};
         if (variable_weights) {
             program->get_or_create(std::make_shared<cldnn::input_layout>("router_weights", weights_layout));
         } else {
@@ -195,7 +195,7 @@ protected:
         if (projection_bias) {
             projection_bias_id = "projection_bias";
             auto bias_memory = get_test_engine().allocate_memory(cldnn::layout{
-                ov::PartialShape{4}, cldnn::data_types::f32, cldnn::format::bfyx});
+                ov::PartialShape{4}, cldnn::data_types::f16, cldnn::format::bfyx});
             program->get_or_create(std::make_shared<cldnn::data>(projection_bias_id, bias_memory));
         }
         auto projection = std::make_shared<cldnn::fully_connected>("projection", cldnn::input_info("source"),
@@ -215,7 +215,7 @@ protected:
         if (sigmoid) {
             for (const auto& parameter : std::vector<std::pair<std::string, size_t>>{{"bias", 4}, {"eps", 1}}) {
                 auto memory = get_test_engine().allocate_memory(cldnn::layout{
-                    ov::PartialShape{static_cast<int64_t>(parameter.second)}, cldnn::data_types::f32, cldnn::format::bfyx});
+                    ov::PartialShape{static_cast<int64_t>(parameter.second)}, cldnn::data_types::f16, cldnn::format::bfyx});
                 program->get_or_create(std::make_shared<cldnn::data>(parameter.first, memory));
                 inputs.emplace_back(parameter.first);
             }
