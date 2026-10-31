@@ -382,9 +382,12 @@ residual probe first failed as intended and passed after ancestor filtering.
 P4 proxy execution is implemented for the documented plain-FP16, single-token
 projection boundary. It is not a general predictor for arbitrary Router graphs:
 compressed/quantized FC, fused FC operations, unsupported layouts and malformed
-chains remain demand-only. Cache serialization was not changed; warm/cold
-imported-chain equivalence and formal performance benefit remain unverified.
-Full-suite, ZE and TSan limits remain unchanged.
+chains remain demand-only. Router descriptors are re-derived from the restored
+program graph rather than serialized. OTD partial constants now serialize an
+explicit physical-byte marker with no device readback; import reconstructs a
+one-or-more-expert physical backing and the full logical view. Full P4 proxy-stage
+cache import parity and formal performance benefit remain unverified. Full-suite,
+ZE and TSan limits remain unchanged.
 
 P4.1b adds `program::get_les_router_links()` as a stricter, read-only
 qualification query. It accepts only a matching Router output-0/1 pair,
@@ -437,3 +440,13 @@ weights; zero proxy comparisons ran. This confirms conservative demand-only
 fallback, not prediction coverage on Qwen. No formal speedup or cold-cache
 benchmark is claimed; speculative prefetch remains opt-in and its latency
 benefit is unestablished.
+
+For compiled-model cache validation, `LES_CACHE_DIR` is optional in
+`run_source_baseline.sh` and is forwarded as OpenVINO `CACHE_DIR`. Qwen ratio 80
+with LES enabled, prediction/prefetch requested and a fresh cache completed a
+cold export and a second warm import; both generated the same text and 21/2 input/
+output token counts. The cache occupied 2.2 GiB. Since this Qwen graph has no
+supported proxy chain, this validates OTD partial-constant serialization and
+demand-only imported execution, not imported proxy-stage execution. The dedicated
+`cache_serialization` suite passed 10/10, including the new zero-payload OTD
+partial allocation roundtrip. Cache timing is not a performance result.
