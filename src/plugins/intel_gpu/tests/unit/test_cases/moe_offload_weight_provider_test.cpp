@@ -337,6 +337,30 @@ TEST_F(moe_les_upload, provider_recovers_after_partial_upload_failure) {
     provider.release();
 }
 
+TEST_F(moe_les_upload, speculative_prefetch_failure_does_not_poison_real_demand) {
+    write(std::vector<uint8_t>(64, 7));
+    MOECompressed::Config config{};
+    config.num_expert = 2;
+    OffloadExpertWeightProvider provider(1, config, std::vector<size_t>{0, 32, 0, 0, 0, 0, 0, 0, 0}, path);
+    moe_weights weights;
+    weights.gate_w = buffer(16, data_types::u8, 2);
+    weights.up_w = buffer(16, data_types::u8, 2);
+    provider.bind(weights);
+    ASSERT_EQ(provider.weight_reader().file_size(), 64U);
+    std::filesystem::resize_file(path, 32);
+    cldnn::les_context context(2, lane());
+    provider.set_les_context(&context, context.begin_epoch());
+    auto compute = lane();
+    EXPECT_NO_THROW(provider.prefetch_les_demand({1}, *compute));
+    EXPECT_NO_THROW(context.wait());
+    write(std::vector<uint8_t>(64, 11));
+    EXPECT_NO_THROW(provider.try_acquire_simultaneous({1}, *compute));
+    std::vector<uint8_t> actual(16);
+    weights.up_w->copy_to(*compute, actual.data(), 0, 0, actual.size(), true);
+    EXPECT_EQ(actual, std::vector<uint8_t>(16, 11));
+    provider.release();
+}
+
 TEST_F(moe_les_upload, provider_cancelled_epoch_releases_queued_reservation) {
     write(std::vector<uint8_t>(32, 7));
     MOECompressed::Config config{};
