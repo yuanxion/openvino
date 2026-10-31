@@ -98,7 +98,8 @@ and ratio 0 or 50 creates no context and preserves its output.
 | Stage 1 / P2.4 | `9a8dcff850` | 303 complete focused tests, 80 LES-on forced-fallback tests, source Qwen ratio-80 LES-on smoke passed |
 | Stage 1 / P3.1a | `94d1eaae6d` | Canonical pair snapshots and nonblocking demand foundation; 307 focused tests and 80 forced-fallback cases passed |
 | Stage 1 / P3.1b-P3.3 | `000d056bf2` | Masked GEMV, ready-first demand overlap, bounded multi-wave execution; 331 focused tests, 104 forced-fallback cases, source model and actual overlap trace passed |
-| Stage 2 / P4.1a | This commit | Read-only static MoE chain candidates; 16 targeted integration, 339 focused and 104 forced-fallback tests passed |
+| Stage 2 / P4.1a | `02ec1d5e1c` | Read-only static MoE chain candidates; 16 targeted integration, 339 focused and 104 forced-fallback tests passed |
+| Stage 2 / P4.1b | This commit | Qualify constant single-token Router/FC descriptors; 345 focused and 104 forced-fallback tests passed |
 
 P1.3 validation used the source Debug/OCL build on Intel Arc Lunar Lake with
 assertions and existing numerical tolerances unchanged. All listed runs had
@@ -384,3 +385,20 @@ Cache serialization was not changed; warm/cold imported-chain equivalence and a
 new real-model P4 discovery run have not been verified. P3 model evidence above
 is historical, not validation of a predictor. Full-suite, ZE and TSan limits
 remain unchanged.
+
+P4.1b adds `program::get_les_router_links()` as a stricter, read-only
+qualification query. It accepts only a matching Router output-0/1 pair,
+Softmax or SigmoidBias routing, a plain noncompressed/nonfused transposed FC
+projection, constant data parameters, and static single-token proxy/target
+hidden layouts. It returns IDs for the Router, FC, weights and optional
+projection/routing bias and epsilon. It verifies descriptor input ports,
+dimensions and element types. Unsupported shapes, variable parameters, and
+malformed Router/projection graphs receive explicit statuses; no parameters are
+copied, no kernel launched, and no existing route modified. Qualification is not
+cached or serialized and must be queried from the final compiled program.
+
+Fourteen targeted graph cases cover chain topology plus both routing modes,
+optional FC bias, nonconstant weights, incorrect Router ports, unrelated Top-k
+producers and multi-token rejection. Debug/OCL verification passed 345 focused
+tests and 104 forced-fallback tests, zero failures/skips; the plugin linked. No
+predictor executes yet, and P4 remains incomplete.
