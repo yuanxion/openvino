@@ -100,7 +100,7 @@ and ratio 0 or 50 creates no context and preserves its output.
 | Stage 1 / P3.1b-P3.3 | `000d056bf2` | Masked GEMV, ready-first demand overlap, bounded multi-wave execution; 331 focused tests, 104 forced-fallback cases, source model and actual overlap trace passed |
 | Stage 2 / P4.1a | `02ec1d5e1c` | Read-only static MoE chain candidates; 16 targeted integration, 339 focused and 104 forced-fallback tests passed |
 | Stage 2 / P4.1b | `0555339301` | Qualify constant single-token Router/FC descriptors; 345 focused and 104 forced-fallback tests passed |
-| Stage 2 / P4.2-P4.3 | This commit | Opt-in independent proxy Top-k, recall diagnostics and worker prefetch; 354 focused and 112 forced-fallback cases passed |
+| Stage 2 / P4.2-P4.3 | `64ed628a5a` | Opt-in independent proxy Top-k, recall diagnostics and worker prefetch; 354 focused and 112 forced-fallback cases passed |
 
 P1.3 validation used the source Debug/OCL build on Intel Arc Lunar Lake with
 assertions and existing numerical tolerances unchanged. All listed runs had
