@@ -99,7 +99,8 @@ and ratio 0 or 50 creates no context and preserves its output.
 | Stage 1 / P3.1a | `94d1eaae6d` | Canonical pair snapshots and nonblocking demand foundation; 307 focused tests and 80 forced-fallback cases passed |
 | Stage 1 / P3.1b-P3.3 | `000d056bf2` | Masked GEMV, ready-first demand overlap, bounded multi-wave execution; 331 focused tests, 104 forced-fallback cases, source model and actual overlap trace passed |
 | Stage 2 / P4.1a | `02ec1d5e1c` | Read-only static MoE chain candidates; 16 targeted integration, 339 focused and 104 forced-fallback tests passed |
-| Stage 2 / P4.1b | This commit | Qualify constant single-token Router/FC descriptors; 345 focused and 104 forced-fallback tests passed |
+| Stage 2 / P4.1b | `0555339301` | Qualify constant single-token Router/FC descriptors; 345 focused and 104 forced-fallback tests passed |
+| Stage 2 / P4.2-P4.3 | This commit | Opt-in independent proxy Top-k, recall diagnostics and worker prefetch; 354 focused and 112 forced-fallback cases passed |
 
 P1.3 validation used the source Debug/OCL build on Intel Arc Lunar Lake with
 assertions and existing numerical tolerances unchanged. All listed runs had
@@ -378,13 +379,12 @@ and the overlapping 104-case forced-fallback subset, zero failures/skips; the
 16-case targeted run is included, not additive. The plugin was relinked. The
 residual probe first failed as intended and passed after ancestor filtering.
 
-P4 remains incomplete. Next is Router descriptor qualification and compile/import
-parity, followed by isolated single-token proxy prediction, epoch/shape checks,
-activation lifetime protection and offline recall comparisons before prefetch.
-Cache serialization was not changed; warm/cold imported-chain equivalence and a
-new real-model P4 discovery run have not been verified. P3 model evidence above
-is historical, not validation of a predictor. Full-suite, ZE and TSan limits
-remain unchanged.
+P4 proxy execution is implemented for the documented plain-FP16, single-token
+projection boundary. It is not a general predictor for arbitrary Router graphs:
+compressed/quantized FC, fused FC operations, unsupported layouts and malformed
+chains remain demand-only. Cache serialization was not changed; warm/cold
+imported-chain equivalence and formal performance benefit remain unverified.
+Full-suite, ZE and TSan limits remain unchanged.
 
 P4.1b adds `program::get_les_router_links()` as a stricter, read-only
 qualification query. It accepts only a matching Router output-0/1 pair,
@@ -400,5 +400,40 @@ cached or serialized and must be queried from the final compiled program.
 Fourteen targeted graph cases cover chain topology plus both routing modes,
 optional FC bias, nonconstant weights, incorrect Router ports, unrelated Top-k
 producers and multi-token rejection. Debug/OCL verification passed 345 focused
-tests and 104 forced-fallback tests, zero failures/skips; the plugin linked. No
-predictor executes yet, and P4 remains incomplete.
+tests and 104 forced-fallback tests, zero failures/skips; the plugin linked.
+
+## P4.2-P4.3: Independent Prediction And Optional Prefetch
+
+`OV_GPU_LES_PREDICT=1` opts in to a plain-FP16 proxy FC and the existing Router
+Top-k kernel. The source MoE copies its input activation to network-owned memory
+with the upstream dependency event; the snapshot survives activation reuse and
+is cleared at each LES epoch. The proxy uses dedicated logits, indices and
+weights buffers. It never writes actual Router outputs or changes actual Top-k,
+routing weights or MoE compute. Router descriptors and kernel stages are rebuilt
+per program; cache serialization format is unchanged.
+
+`OV_GPU_LES_PREDICT_COMPARE=1` waits for proxy and real Router IDs and records
+Top-k slot recall. This mode is diagnostic and synchronizes Host readback; it is
+off by default. `OV_GPU_LES_PREFETCH=1` separately opts into worker-side loading
+for predicted experts. It uses the bounded LES worker, reservation and transfer
+lane, skips demands that cannot fit, releases speculative pins after upload, and
+lets real demand reserve and validate the actual experts. A speculative read or
+upload failure drains issued DMA, discards the incomplete reservation and does
+not poison the request epoch; real demand retries via the normal path.
+Unsupported graphs never build a prediction stage and remain demand-only.
+
+Eight GPU variants cover Softmax/SigmoidBias, FC bias on/off, prediction-only and
+prefetch. The prediction tests observe 0/8, 1/8, 3/8 and 8/8 Top-k matches. They
+check valid IDs, preserve actual Router output and compare final target outputs
+bitwise with LES-off. Repeated execution verifies snapshot/event/ID refresh.
+Provider tests inject a speculative short read, check that the epoch remains
+usable, then confirm demand loads the repaired file. Final Debug/OCL verification
+passed 354 focused tests in 29 suites, 112 overlapping LES-on fallback cases and
+all eight proxy variants, zero failures/skips. The plugin linked.
+
+Source Qwen ratio 80 generated successfully with prediction and prefetch options
+set. All 39 adjacent chains were rejected because the Router FC uses compressed
+weights; zero proxy comparisons ran. This confirms conservative demand-only
+fallback, not prediction coverage on Qwen. No formal speedup or cold-cache
+benchmark is claimed; speculative prefetch remains opt-in and its latency
+benefit is unestablished.

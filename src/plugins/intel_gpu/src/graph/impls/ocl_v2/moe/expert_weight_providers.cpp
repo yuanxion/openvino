@@ -96,6 +96,7 @@ void OffloadExpertWeightProvider::release() {
         _reservation.reset();
     }
     _demand_finished = false;
+    _prefetch_error = nullptr;
     if (error) {
         std::rethrow_exception(error);
     }
@@ -146,6 +147,11 @@ void OffloadExpertWeightProvider::finish_les_demand(cldnn::stream& stream) {
         if (_upload_completion.valid()) {
             _upload_completion.get();
         }
+        if (_prefetch_error) {
+            auto error = _prefetch_error;
+            release();
+            std::rethrow_exception(error);
+        }
         dynamic_cast<cldnn::ocl::ocl_stream&>(stream).enqueue_external_barrier(*_upload_events);
         OPENVINO_ASSERT(_reservations->complete(*_reservation), "LES reservation became stale before GPUReady");
         if (auto* perf = moe_otd::get_perf_counters()) {
@@ -161,6 +167,59 @@ void OffloadExpertWeightProvider::finish_les_demand(cldnn::stream& stream) {
     } catch (...) {
         release();
         throw;
+    }
+}
+
+void OffloadExpertWeightProvider::prefetch_les_demand(const std::vector<uint32_t>& experts, cldnn::stream& stream) {
+    if (!_les_context || !_reservations) {
+        return;
+    }
+    try {
+        release();
+        _prefetch_error = nullptr;
+        _reservation = _reservations->reserve(experts, _les_epoch);
+        if (!_reservation) {
+            return;
+        }
+        const auto prefetched_slots = _reservation->slots.size();
+        OPENVINO_ASSERT(_resident && _les_context->get_transfer_stream(), "LES provider is not bound to a transfer lane");
+        _upload_events = std::make_shared<std::vector<cldnn::event::ptr>>();
+        if (!_reservation->missing_experts.empty()) {
+            auto task = _les_context->submit(_les_epoch,
+                [this, events = _upload_events, transfer = _les_context->get_transfer_stream(), weights = *_resident,
+                 missing = _reservation->missing_experts, slots = _reservation->missing_slots]() mutable {
+                    try {
+                        *events = moe_otd::fill_weights_memory_async(*transfer, _config, _weight_bin_offsets, _weight_reader,
+                                                                     weights, missing, slots);
+                    } catch (...) {
+                        _prefetch_error = std::current_exception();
+                    }
+                });
+            _upload_completion = std::move(task.completion);
+        }
+        finish_les_demand(stream);
+        if (auto* perf = moe_otd::get_perf_counters()) {
+            perf->les_prefetch_experts.fetch_add(prefetched_slots, std::memory_order_relaxed);
+        }
+        release();
+    } catch (const std::exception& error) {
+        try {
+            release();
+        } catch (...) {
+        }
+        if (auto* perf = moe_otd::get_perf_counters()) {
+            perf->les_prefetch_failures.fetch_add(1, std::memory_order_relaxed);
+        }
+        GPU_DEBUG_INFO << "[LES_PREDICT_PREFETCH] speculative demand skipped: " << error.what() << std::endl;
+    } catch (...) {
+        try {
+            release();
+        } catch (...) {
+        }
+        if (auto* perf = moe_otd::get_perf_counters()) {
+            perf->les_prefetch_failures.fetch_add(1, std::memory_order_relaxed);
+        }
+        GPU_DEBUG_INFO << "[LES_PREDICT_PREFETCH] speculative demand skipped: unknown failure" << std::endl;
     }
 }
 

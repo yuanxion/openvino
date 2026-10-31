@@ -58,6 +58,7 @@ public:
     virtual void set_consumer(cldnn::event::ptr) {}
     virtual std::optional<ExpertDemand> begin_les_demand(const std::vector<uint32_t>&) { return std::nullopt; }
     virtual void finish_les_demand(cldnn::stream&) { throw std::logic_error("No LES demand is supported"); }
+    virtual void prefetch_les_demand(const std::vector<uint32_t>&, cldnn::stream&) {}
 
     // Releases any pinning established by the most recent acquisition.
     virtual void release() = 0;

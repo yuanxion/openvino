@@ -81,6 +81,7 @@ public:
     void set_consumer(cldnn::event::ptr consumer) override;
     std::optional<ExpertDemand> begin_les_demand(const std::vector<uint32_t>& experts) override;
     void finish_les_demand(cldnn::stream& stream) override;
+    void prefetch_les_demand(const std::vector<uint32_t>& experts, cldnn::stream& stream) override;
     void bind(cldnn::moe_weights& resident) override;
     bool is_bound() const override {
         return _bound;
@@ -114,6 +115,7 @@ private:
     std::shared_future<void> _upload_completion;
     std::shared_ptr<std::vector<cldnn::event::ptr>> _upload_events;
     bool _demand_finished = false;
+    std::exception_ptr _prefetch_error;
     std::optional<ExpertSlotLease> acquire_les(const std::vector<uint32_t>& experts, cldnn::stream& stream);
 };
 

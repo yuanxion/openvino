@@ -5,6 +5,7 @@
 #include "intel_gpu/graph/network.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <fstream>
 #include <functional>
 #include <map>
@@ -1068,6 +1069,46 @@ void network::initialize_les() {
     auto transfer_config = config.clone();
     transfer_config.set_property(ov::intel_gpu::queue_type(QueueTypes::in_order));
     _les_context = std::make_unique<les_context>(config.get_les_queue_capacity(), _engine.create_stream(transfer_config));
+    const auto* prediction = std::getenv("OV_GPU_LES_PREDICT");
+    _les_prediction_enabled = prediction && std::string(prediction) == "1";
+    const auto* prefetch = std::getenv("OV_GPU_LES_PREFETCH");
+    _les_prefetch_enabled = _les_prediction_enabled && prefetch && std::string(prefetch) == "1";
+    if (_les_prediction_enabled) {
+        _les_router_links = _program->get_les_router_links();
+        for (const auto& link : _les_router_links) {
+            GPU_DEBUG_INFO << "[LES_PREDICT_QUALIFY] source=" << link.chain.source_moe << " target="
+                           << link.chain.target_moe << " status=" << static_cast<int>(link.status)
+                           << " reason=" << link.rejection_reason << std::endl;
+        }
+    }
+}
+
+void network::set_les_proxy_hidden(const primitive_id& target_moe, memory::ptr hidden, event::ptr ready) {
+    auto& state = _les_proxy_states[target_moe];
+    state.hidden = std::move(hidden);
+    state.hidden_ready = std::move(ready);
+    state.predicted_indices.reset();
+    state.predicted_weights.reset();
+    state.prediction_ready.reset();
+}
+
+network::les_proxy_state network::get_les_proxy_state(const primitive_id& target_moe) const {
+    const auto it = _les_proxy_states.find(target_moe);
+    return it == _les_proxy_states.end() ? les_proxy_state{} : it->second;
+}
+
+void network::set_les_proxy_prediction(const primitive_id& target_moe,
+                                       memory::ptr indices,
+                                       memory::ptr weights,
+                                       event::ptr ready) {
+    auto& state = _les_proxy_states[target_moe];
+    state.predicted_indices = std::move(indices);
+    state.predicted_weights = std::move(weights);
+    state.prediction_ready = std::move(ready);
+}
+
+void network::clear_les_proxy_state(const primitive_id& target_moe) {
+    _les_proxy_states.erase(target_moe);
 }
 
 std::map<primitive_id, network_output> network::execute(const std::vector<event::ptr>& dependencies) {
@@ -1075,6 +1116,7 @@ std::map<primitive_id, network_output> network::execute(const std::vector<event:
         return execute_graph(dependencies);
     }
     _les_epoch = _les_context->begin_epoch();
+    _les_proxy_states.clear();
     try {
         auto outputs = execute_graph(dependencies);
         _les_context->wait();

@@ -38,12 +38,17 @@ struct OtdPerfCounters {
     std::atomic<uint64_t> les_ready_pairs{0};
     std::atomic<uint64_t> les_missing_pairs{0};
     std::atomic<uint64_t> les_shared_pairs{0};
+    std::atomic<uint64_t> les_prediction_matches{0};
+    std::atomic<uint64_t> les_prediction_pairs{0};
+    std::atomic<uint64_t> les_prefetch_experts{0};
+    std::atomic<uint64_t> les_prefetch_failures{0};
 
     void dump() const;
 };
 
 OtdPerfCounters* get_perf_counters();
 bool les_trace_enabled();
+bool les_prediction_compare_enabled();
 uint64_t les_device_time(cldnn::stream& stream);
 void les_trace_interval(const char* kind, uint64_t start, uint64_t end);
 
