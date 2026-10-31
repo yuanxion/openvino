@@ -197,6 +197,7 @@ public:
         primitive_id projection_bias;
         primitive_id routing_bias;
         primitive_id routing_eps;
+        std::string rejection_reason;
         size_t experts = 0;
         size_t top_k = 0;
         bool sigmoid_bias = false;

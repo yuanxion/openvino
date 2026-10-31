@@ -4,11 +4,15 @@
 
 #include "moe_router_fused_opt.hpp"
 
+#include <algorithm>
 #include "../common_utils/dispatch_utils.hpp"
 #include "../common_utils/jitter.hpp"
 #include "../primitive_ocl_base.hpp"
 #include "../utils/kernel_generator.hpp"
+#include <cstdlib>
+#include "intel_gpu/primitives/data.hpp"
 #include "intel_gpu/primitives/moe_router_fused.hpp"
+#include "moe_otd_runtime.hpp"
 
 namespace ov::intel_gpu::ocl {
 namespace {
@@ -65,22 +69,70 @@ protected:
     }
 };
 
+class MoeLesProxyFC : public KernelGenerator {
+public:
+    MoeLesProxyFC() : KernelGenerator("moe_les_proxy_fc") {}
+
+protected:
+    [[nodiscard]] JitConstants get_jit_constants(const RuntimeParams& params) const override {
+        auto jit = KernelGenerator::get_jit_constants(params);
+        jit.make("LES_PROXY_FC_ENABLE", 1);
+        jit.make("MOE_DTYPE", params.get_input_layout(0).data_type == ov::element::f16 ? "half" : "float");
+        return jit;
+    }
+
+    [[nodiscard]] Arguments get_arguments_desc(const RuntimeParams&) const override {
+        return {};
+    }
+
+    [[nodiscard]] DispatchDataFunc get_dispatch_data_func() const override {
+        return DispatchDataFunc{[](const RuntimeParams&, KernelData&, ImplRuntimeParams*) {}};
+    }
+
+};
+
 class MoeRouterFusedImpl : public PrimitiveImplOCL {
 public:
     DECLARE_OBJECT_TYPE_SERIALIZATION(ov::intel_gpu::ocl::MoeRouterFusedImpl)
 
     Stage::Ptr softmax_topk = make_stage<MoeRouterSoftMaxTopK>();
     Stage::Ptr sigmoid_bias_topk = make_stage<MoeRouterSigmoidBiasTopK>();
+    Stage::Ptr les_proxy_fc;
+    program::les_router_link les_proxy_link;
 
-    MoeRouterFusedImpl() : PrimitiveImplOCL(MoeRouterFusedOpt::get_type_info_static()) {}
+    MoeRouterFusedImpl() : PrimitiveImplOCL(MoeRouterFusedOpt::get_type_info_static()) {
+        les_proxy_fc = make_stage<MoeLesProxyFC>();
+    }
     MoeRouterFusedImpl(const program_node& node, const RuntimeParams& params) : MoeRouterFusedImpl() {
         auto desc = params.typed_desc<moe_router_fused>();
+        const auto* prediction = std::getenv("OV_GPU_LES_PREDICT");
+        if (params.prog->get_config().get_enable_les() && prediction && std::strcmp(prediction, "1") == 0) {
+            const auto router_links = params.prog->get_les_router_links();
+            const bool has_supported_proxy = std::any_of(router_links.begin(), router_links.end(), [](const auto& link) {
+                return link.status == program::les_router_status::supported;
+            });
+            if (has_supported_proxy) {
+                les_proxy_fc->codegen = std::make_shared<MoeLesProxyFC>();
+                add_stage(les_proxy_fc, params);
+                for (const auto& link : router_links) {
+                    if (link.router == node.id() && link.status == program::les_router_status::supported) {
+                        les_proxy_link = link;
+                        break;
+                    }
+                }
+            }
+        }
+        GPU_DEBUG_INFO << "[LES_PROXY_IMPL] router=" << node.id() << " enabled="
+                   << params.prog->get_config().get_enable_les() << " stage=" << static_cast<bool>(les_proxy_fc)
+                       << " status=" << static_cast<int>(les_proxy_link.status) << std::endl;
         if (desc->_config.routing_type == MoERouterFused::RoutingType::SOFTMAX) {
             add_stage(softmax_topk, params);
         } else {
             OPENVINO_ASSERT(desc->_config.routing_type == MoERouterFused::RoutingType::SIGMOID_BIAS, "Unsupported routing type");
             add_stage(sigmoid_bias_topk, params);
         }
+        GPU_DEBUG_INFO << "[LES_PROXY_IMPL] router=" << node.id() << " activated_stages=" << _order.size()
+                       << " total_stages=" << _stages.size() << std::endl;
     }
 
     [[nodiscard]] std::unique_ptr<primitive_impl> clone() const override {
@@ -90,7 +142,8 @@ public:
     cldnn::event::ptr execute(const std::vector<cldnn::event::ptr>& events, cldnn::primitive_inst& instance) override {
         kernel_dump_info.clear_entries();
 
-        cldnn::stream& stream = instance.get_network().get_stream();
+        auto& network = instance.get_network();
+        cldnn::stream& stream = network.get_stream();
         auto desc = instance.get_typed_desc<moe_router_fused>();
         const auto& config = desc->_config;
 
@@ -119,6 +172,90 @@ public:
         // MoERouterFused outputs: 0 = topk_weights, 1 = topk_indices
         auto topk_weights_mem = instance.output_memory_ptr(0);
         auto topk_indices_mem = instance.output_memory_ptr(1);
+        cldnn::event::ptr proxy_prediction_ready;
+        const program::les_router_link* active_proxy_link = nullptr;
+
+        const auto runtime_link = std::find_if(network.get_les_router_links().begin(),
+                                               network.get_les_router_links().end(),
+                                               [&](const auto& link) {
+                                                   return link.router == instance.id() &&
+                                                          link.status == program::les_router_status::supported;
+                                               });
+        if (network.is_les_prediction_enabled() && network.get_les_context() &&
+            runtime_link != network.get_les_router_links().end()) {
+            OPENVINO_ASSERT(les_proxy_fc, "Qualified LES proxy Router stage was not compiled for ", instance.id());
+            const auto& proxy_link = *runtime_link;
+            active_proxy_link = &proxy_link;
+            auto state = network.get_les_proxy_state(proxy_link.chain.target_moe);
+            if (state.hidden && state.hidden_ready) {
+                auto weights = network.get_primitive(proxy_link.weights)->output_memory_ptr();
+                auto bias = proxy_link.projection_bias.empty()
+                                ? memory::ptr{}
+                                : network.get_primitive(proxy_link.projection_bias)->output_memory_ptr();
+                const auto logits_layout = cldnn::layout({1, 1, 1, static_cast<int64_t>(proxy_link.experts)},
+                                                          inputs.front()->get_layout().data_type,
+                                                          cldnn::format::bfyx);
+                auto logits = network.get_engine().allocate_memory(logits_layout);
+                auto proxy_indices = network.get_engine().allocate_memory(instance.get_impl_params()->get_output_layout(1));
+                auto proxy_weights = network.get_engine().allocate_memory(instance.get_impl_params()->get_output_layout(0));
+
+                cldnn::kernel_arguments_data fc_args;
+                cldnn::kernel_arguments_desc fc_desc;
+                fc_desc.arguments.push_back({ArgumentDescriptor::Types::INPUT, 0});
+                fc_args.inputs.push_back(state.hidden);
+                fc_desc.arguments.push_back({ArgumentDescriptor::Types::INPUT, 1});
+                fc_args.inputs.push_back(weights);
+                fc_desc.arguments.push_back({ArgumentDescriptor::Types::INPUT, 2});
+                fc_args.inputs.push_back(bias ? bias : weights);
+                cldnn::scalars_desc fc_scalars(2);
+                fc_scalars[0].t = ScalarDescriptor::Types::UINT32;
+                fc_scalars[0].v.u32 = static_cast<uint32_t>(state.hidden->get_layout().get_shape().back());
+                fc_scalars[1].t = ScalarDescriptor::Types::UINT32;
+                fc_scalars[1].v.u32 = bias ? 1U : 0U;
+                fc_args.scalars = &fc_scalars;
+                fc_desc.arguments.push_back({ArgumentDescriptor::Types::SCALAR, 0});
+                fc_desc.arguments.push_back({ArgumentDescriptor::Types::SCALAR, 1});
+                fc_desc.arguments.push_back({ArgumentDescriptor::Types::OUTPUT, 0});
+                fc_args.outputs.push_back(logits);
+                stream.set_arguments(*les_proxy_fc->kernel, fc_desc, fc_args);
+                fc_desc.workGroups.global = {proxy_link.experts, 1, 1};
+                fc_desc.workGroups.local = {1, 1, 1};
+                auto proxy_projection = stream.enqueue_kernel(*les_proxy_fc->kernel,
+                                                              fc_desc,
+                                                              fc_args,
+                                                              {state.hidden_ready},
+                                                              true);
+
+                std::vector<memory::ptr> proxy_inputs{logits};
+                if (config.routing_type == MoERouterFused::RoutingType::SIGMOID_BIAS) {
+                    proxy_inputs.push_back(instance.input_memory_ptr(1));
+                    proxy_inputs.push_back(instance.input_memory_ptr(2));
+                }
+                cldnn::kernel_arguments_data proxy_args;
+                cldnn::kernel_arguments_desc proxy_desc;
+                for (uint32_t i = 0; i < proxy_inputs.size(); ++i) {
+                    proxy_desc.arguments.push_back({ArgumentDescriptor::Types::INPUT, i});
+                    proxy_args.inputs.push_back(proxy_inputs[i]);
+                }
+                proxy_desc.arguments.push_back({ArgumentDescriptor::Types::OUTPUT, 0});
+                proxy_args.outputs.push_back(proxy_indices);
+                proxy_desc.arguments.push_back({ArgumentDescriptor::Types::OUTPUT, 1});
+                proxy_args.outputs.push_back(proxy_weights);
+                stream.set_arguments(*routing_stage->kernel, proxy_desc, proxy_args);
+                proxy_desc.workGroups.global = {1, lws_size};
+                proxy_desc.workGroups.local = {1, lws_size};
+                auto prediction_ready = stream.enqueue_kernel(*routing_stage->kernel,
+                                                             proxy_desc,
+                                                             proxy_args,
+                                                             {proxy_projection},
+                                                             true);
+                network.set_les_proxy_prediction(proxy_link.chain.target_moe,
+                                                 std::move(proxy_indices),
+                                                 std::move(proxy_weights),
+                                                 std::move(prediction_ready));
+                proxy_prediction_ready = network.get_les_proxy_state(proxy_link.chain.target_moe).prediction_ready;
+            }
+        }
 
         // Build kernel arguments manually (same as execute_stage in moe_3gemm)
         cldnn::kernel_arguments_data args;
@@ -140,7 +277,30 @@ public:
 
         kernel_dump_info.add_entry_point(routing_stage->kernel->get_id());
 
-        return stream.enqueue_kernel(*routing_stage->kernel, kargs_desc, {}, events, instance.needs_completion_event());
+        auto actual_routing_ready = stream.enqueue_kernel(*routing_stage->kernel,
+                                                          kargs_desc,
+                                                          {},
+                                                          events,
+                                                          instance.needs_completion_event());
+        if (network.is_les_prefetch_enabled() && proxy_prediction_ready && active_proxy_link) {
+            try {
+                proxy_prediction_ready->wait();
+                const auto proxy = network.get_les_proxy_state(active_proxy_link->chain.target_moe);
+                std::vector<uint32_t> predicted_ids(active_proxy_link->top_k);
+                proxy.predicted_indices->copy_to(stream,
+                                                 predicted_ids.data(),
+                                                 0,
+                                                 0,
+                                                 predicted_ids.size() * sizeof(uint32_t),
+                                                 true);
+                auto target = network.get_primitive(active_proxy_link->chain.target_moe);
+                target->get_impl()->enqueue_les_prefetch(*target, predicted_ids, proxy_prediction_ready);
+            } catch (const std::exception& error) {
+                GPU_DEBUG_INFO << "[LES_PREDICT_PREFETCH] target=" << active_proxy_link->chain.target_moe
+                               << " skipped=" << error.what() << std::endl;
+            }
+        }
+        return actual_routing_ready;
     }
 };
 

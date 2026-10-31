@@ -652,6 +652,24 @@ class moe_3gemm_swiglu_opt_impl : public PrimitiveImplOCL {
 public:
     DECLARE_OBJECT_TYPE_SERIALIZATION(ov::intel_gpu::ocl::MoE3GemmSwigluImpl)
 
+    void enqueue_les_prefetch(cldnn::primitive_inst& ins,
+                              const std::vector<uint32_t>& experts,
+                              cldnn::event::ptr) override {
+        auto& network = ins.get_network();
+        auto* context = network.get_les_context();
+        if (!context || !network.is_les_prediction_enabled() || !_weight_provider->is_offloaded()) {
+            return;
+        }
+        if (_les_owner != context) {
+            _weight_provider = _weight_provider->clone();
+            _les_owner = context;
+        }
+        _weight_provider->set_les_context(context, network.get_les_epoch());
+        auto& instance = reinterpret_cast<typed_primitive_inst<moe_3gemm_fused_compressed>&>(ins);
+        bind_weights_on_first_exec(instance);
+        _weight_provider->prefetch_les_demand(experts, network.get_stream());
+    }
+
     // Routing/expert selection is read back to the host (topk_ids, expert masks)
     bool supports_replay() const override {
         return false;
@@ -1858,6 +1876,29 @@ public:
                 const size_t pair_count = token_num * static_cast<size_t>(max_topk);
                 std::vector<uint32_t> experts(pair_count);
                 scratch.topk_id->copy_to(stream, experts.data(), 0, 0, pair_count * sizeof(uint32_t), true);
+                if (cur_net.is_les_prediction_enabled() && moe_otd::les_prediction_compare_enabled()) {
+                    auto prediction = cur_net.get_les_proxy_state(instance.id());
+                    if (prediction.predicted_indices && prediction.prediction_ready) {
+                        prediction.prediction_ready->wait();
+                        std::vector<uint32_t> predicted(pair_count);
+                        prediction.predicted_indices->copy_to(stream,
+                                                              predicted.data(),
+                                                              0,
+                                                              0,
+                                                              pair_count * sizeof(uint32_t),
+                                                              true);
+                        uint64_t matches = 0;
+                        for (size_t pair = 0; pair < pair_count; ++pair) {
+                            matches += predicted[pair] == experts[pair];
+                        }
+                        if (auto* perf = moe_otd::get_perf_counters()) {
+                            perf->les_prediction_matches.fetch_add(matches, std::memory_order_relaxed);
+                            perf->les_prediction_pairs.fetch_add(pair_count, std::memory_order_relaxed);
+                        }
+                        GPU_DEBUG_INFO << "[LES_PREDICT] target=" << instance.id() << " matches=" << matches << "/"
+                                       << pair_count << std::endl;
+                    }
+                }
                 std::vector<bool> done(pair_count, false);
                 size_t remaining = pair_count;
                 bool shared_pending = _has_shared_expert;
@@ -3128,6 +3169,19 @@ public:
         auto& stream = cur_net.get_stream();
 
         OPENVINO_ASSERT(_weight_provider, "expert weight provider not initialized");
+
+        if (cur_net.is_les_prediction_enabled()) {
+            for (const auto& link : cur_net.get_les_router_links()) {
+                if (link.status != program::les_router_status::supported || link.chain.source_moe != instance.id()) {
+                    continue;
+                }
+                auto source_hidden = instance.input_memory_ptr(0);
+                auto snapshot = cur_net.get_engine().allocate_memory(source_hidden->get_layout());
+                stream.enqueue_barrier(events);
+                auto snapshot_ready = snapshot->copy_from(stream, *source_hidden, false);
+                cur_net.set_les_proxy_hidden(link.chain.target_moe, std::move(snapshot), std::move(snapshot_ready));
+            }
+        }
 
         cldnn::event::ptr ret_env = nullptr;
         _has_shared_expert = (config.num_shared_expert > 0);

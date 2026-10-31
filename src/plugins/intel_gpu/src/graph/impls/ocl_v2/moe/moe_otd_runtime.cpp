@@ -24,6 +24,14 @@ bool les_trace_enabled() {
     return enabled;
 }
 
+bool les_prediction_compare_enabled() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("OV_GPU_LES_PREDICT_COMPARE");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
 uint64_t les_device_time(cldnn::stream& stream) {
     auto queue = dynamic_cast<cldnn::ocl::ocl_stream&>(stream).get_cl_queue().get();
     cl_device_id device = nullptr;
@@ -63,7 +71,11 @@ void OtdPerfCounters::dump() const {
                    << ", les_waves=" << les_waves.load(std::memory_order_relaxed)
                    << ", les_ready_pairs=" << les_ready_pairs.load(std::memory_order_relaxed)
                    << ", les_missing_pairs=" << les_missing_pairs.load(std::memory_order_relaxed)
-                   << ", les_shared_pairs=" << les_shared_pairs.load(std::memory_order_relaxed) << std::endl;
+                   << ", les_shared_pairs=" << les_shared_pairs.load(std::memory_order_relaxed)
+                   << ", les_prediction_matches=" << les_prediction_matches.load(std::memory_order_relaxed)
+                   << ", les_prediction_pairs=" << les_prediction_pairs.load(std::memory_order_relaxed)
+                   << ", les_prefetch_experts=" << les_prefetch_experts.load(std::memory_order_relaxed)
+                   << ", les_prefetch_failures=" << les_prefetch_failures.load(std::memory_order_relaxed) << std::endl;
 }
 
 OtdPerfCounters* get_perf_counters() {
