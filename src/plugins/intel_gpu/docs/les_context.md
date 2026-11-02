@@ -499,3 +499,39 @@ and 2.404974 s prefetch: speculation regressed, rather than demonstrating speedu
 Page cache was uncontrolled and diagnostic comparison readback was enabled.
 Prefetch remains blocking at the target Router; no P5 early scheduling, P6/P7
 support, general GPU suite, ZE LES or new TSan result is claimed.
+
+## P5.1: Demand-Priority Worker Foundation
+
+`les_context::submit` remains the required-demand API. Demand tasks retain FIFO
+order within their class and run before queued speculative tasks. If the bounded
+pending queue is full, demand may displace a not-yet-started speculative task;
+its ticket completes with `les_task_cancelled`. Already active work is not
+preempted, and its uploads still drain before buffers can be reused.
+
+`try_submit_speculative` never waits for queue space. It returns an empty optional
+when the queue is full or invalidating, while stale/stopped epochs remain errors.
+Speculative failures complete their own ticket without poisoning required work.
+Required-demand failures preserve the previous context-wide error propagation.
+Epoch rotation, cancellation, shutdown, queue capacity and the single worker
+contract are unchanged. Prefetch now uses the speculative API, releases its
+reservation on admission refusal and treats policy cancellation as a skip rather
+than an upload failure.
+
+Focused OCL Debug tests passed 396/396 with zero failures/skips. New deterministic
+tests cover demand-before-speculation, per-class FIFO, full-queue displacement,
+nonblocking prefetch refusal, speculative error isolation and stale-epoch drops.
+The provider refusal test checks unchanged GPU bytes and a successful subsequent
+real demand. Evidence: workspace `les/p5_foundation_results.xml`.
+
+OLMoE six-mode regression also passed with all 18 texts/counts equal, 15 qualified
+chains, 2,520 compared slots per prediction mode, 2,520 prefetched slots per
+prefetch mode, zero prefetch failures and unchanged warm cache blobs. Evidence:
+workspace `les/results/p5_1_olmoe_acceptance_20261102/acceptance.json`.
+
+This is the P5 scheduling foundation, not the complete P5 milestone. Prefetch
+still blocks at the target Router. Pending expert-task deduplication/promotion,
+earlier submission, separate lookahead/predict-k policy, anti-pollution budgets
+and useful/useless/late/extra-miss accounting remain pending. Queue admission is
+not physical cache admission: a rejected speculative submission currently
+releases its reservation but does not restore any cached mapping changed while
+reserving. No P5 performance, full GPU suite, ZE LES or new TSan result is claimed.
