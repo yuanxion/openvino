@@ -621,6 +621,12 @@ TEST(moe_les_reservations, fixed_speculative_policy_separates_horizon_rank_and_b
     EXPECT_EQ(Policy::expert_budget(16, Policy::max_bytes + 1), 0U);
 }
 
+TEST(moe_les_prefill, performance_logging_requires_explicit_one) {
+    const auto* setting = std::getenv("MOE_OTD_PERF_LOG");
+    const bool expected = setting && std::string(setting) == "1";
+    EXPECT_EQ(ov::intel_gpu::ocl::moe_otd::get_perf_counters() != nullptr, expected);
+}
+
 TEST(moe_les_prefill, odd_capacity_retains_canonical_pairs_and_expert_order) {
     auto plan = otd::plan_prefill_waves({3, 1, 3, 2, 0, 1, 2, 2}, 4, 3);
     EXPECT_EQ(plan.bank_capacity, (std::array<size_t, 2>{2, 1}));

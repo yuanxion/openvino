@@ -1053,6 +1053,7 @@ TEST_P(moe_3gemm_compressed_gpu_random, moe_accuracy_test_random) {
         auto prefill_waves = perf ? perf->les_prefill_waves.load() : 0;
         auto prefill_pairs = perf ? perf->les_prefill_pairs.load() : 0;
         auto prefill_chunks = perf ? perf->les_prefill_chunks.load() : 0;
+        auto metadata_allocations = perf ? perf->les_decode_metadata_allocations.load() : 0;
         auto path_waves = [&]() -> uint64_t {
             if (!perf) return 0;
             if (param.prefill_path == 3) return perf->les_prefill_micro_waves.load();
@@ -1061,6 +1062,9 @@ TEST_P(moe_3gemm_compressed_gpu_random, moe_accuracy_test_random) {
         };
         auto previous_path_waves = path_waves();
         auto outputs = network.execute();
+        if (network.get_les_context() && config.seq_len <= 32 && perf) {
+            EXPECT_LE(perf->les_decode_metadata_allocations.load() - metadata_allocations, iteration == 0 ? 3U : 0U);
+        }
         if (param.prefill_waves && perf) {
             EXPECT_GT(perf->les_prefill_waves.load(), prefill_waves);
             EXPECT_EQ(perf->les_prefill_pairs.load() - prefill_pairs, config.seq_len * config.top_k);

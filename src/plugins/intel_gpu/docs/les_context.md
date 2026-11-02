@@ -697,7 +697,11 @@ the complete compatibility matrix remain outside this milestone.
 
 A separate counterbalanced Qwen run on DUT4420LNL used Debug/OCL, ratio 80,
 272 input tokens and 32 generated tokens. Each mode has six measured samples
-after process-local warmup; trace, comparison and counter logging were disabled.
+after process-local warmup; trace and comparison were disabled. A later audit
+found that setting `MOE_OTD_PERF_LOG=0` still enabled counters because the old
+implementation tested variable presence. These historical timings are not
+instrumentation-off measurements. The switch now requires exactly `1`, and the
+benchmark runner removes the variable entirely for old/new binary comparisons.
 All repeated and cross-mode texts/token counts matched. Mean wall generation,
 TTFT and TPOT were respectively:
 
@@ -711,9 +715,59 @@ Demand and prefetch were 13.7% and 18.8% slower in wall time. This establishes
 no speedup for this workload; uncontrolled clocks, temperature and page cache
 make it exploratory rather than a Release performance gate. Load time is
 separate. Raw samples and standard deviations are in workspace
-`les/results/p6_perf_qwen_20261102/performance.json`. The validated OLMoE IR is
-currently missing from its external mount, so no new OLMoE performance result
-is claimed; earlier functional acceptance is not a replacement measurement.
+`les/results/p6_perf_qwen_20261102/performance.json`. The validated OLMoE IR was
+missing from its external mount at that checkpoint, so no OLMoE performance
+result was available then. It has since been rebuilt under workspace
+`les/models/olmoe-p4-int4`: 48 FP16 expert tensors / 3,072 nonzero expert slices,
+16 uncompressed Router projections, and long-input six-mode P5/P6 acceptance.
+Workspace evidence is
+`les/results/olmoe_rebuilt_20261102T143535Z_31992/acceptance.json`.
+
+### Performance Investigation And Metadata Reuse
+
+The instrumented Qwen and rebuilt OLMoE three-generation acceptance runs
+recorded 25,014/38,940 and 4,804/8,637 off/demand expert misses respectively.
+Token-chunk-outer Prefill traversal revisits experts with undersized banks;
+these totals include Decode and do not assign an exact wall-time fraction to
+Prefill. Per-component staging copies/events/flushes, Router readback and
+ready/missing consumer waits also remain. Prediction adds snapshots and proxy
+readback, and prefetch can add useless bytes and cache pollution. P7's memory
+pool does not by itself remove these costs.
+
+Decode now reuses three shape-matched USM Host metadata buffers per
+implementation, cleared on clone. Existing blocking copies and consumer waits
+still protect reuse. `les_decode_metadata_allocations` is available with
+`MOE_OTD_PERF_LOG=1`. Changing-route, independent-network, multi-wave and recovery
+tests require at most three initial allocations and zero later ones for fixed
+shapes. Directed validation passed 337/337 and full focused regression passed
+547/547, no failures/skips; the source GPU plugin rebuilt. Workspace evidence
+is `les/perf_metadata_results.xml` and `les/perf_fix_full_results.xml`.
+The diagnostic report is workspace `les/PERFORMANCE_RCA.md`; local allocation
+reuse is not claimed to eliminate the Prefill reload/synchronization regression.
+
+The corrected, genuinely counters-off Qwen four-mode comparison passed six
+measured samples per mode: off/demand/predict/prefetch wall means were
+11.363/13.387/13.715/14.029 s. Demand/Prefetch remained 17.8%/23.5% slower than
+off. Against the old counters-off Demand baseline, metadata reuse changed wall
+time only 0.19%, within sample variation. TPOT mean decreased 7.13%, but this
+independent-process exploratory result does not establish a causal speedup.
+
+Rebuilt OLMoE's default-path 32-token benchmark failed cross-mode text parity
+at Demand, despite internally stable outputs and correct token counts. Legacy
+OTD grouped execution falls back to per-expert when actual unique experts exceed
+capacity; LES instead executes grouped waves. Forcing Demand to per-expert
+restored text parity, localizing the observed divergence to path choice, not
+proving rounding rather than a kernel/layout defect. The earlier eight-token
+six-mode acceptance does not establish this longer-generation default gate.
+It remains an open numerical investigation; output checks were not relaxed.
+
+A separate explicit per-expert four-mode OLMoE control passed 32-token text/count
+parity with wall means 4.938/6.786/7.133/6.842 s, Demand/Prefetch 37.4%/38.5%
+slower than off. This is not a default-path PASS. Workspace reports are
+`les/results/perf_rca_qwen_20261102/performance.json`,
+`les/results/perf_rca_olmoe_per_expert_20261102/performance.json` and the failed
+default driver `les/perf_rca_olmoe_driver.log`. All 16 successful processes used
+one verified GPU binary, ratio 80, 32 output tokens and no counter variable.
 
 ## P7.1: Physical Pool Foundation (Not Enabled)
 
