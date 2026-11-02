@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <utility>
 #include <chrono>
+#include <limits>
 
 // moe_otd_runtime.hpp is not self-contained: it relies on cldnn graph/runtime
 // types (typed_primitive_inst, data_type_traits) being visible at include time.
@@ -15,8 +16,131 @@
 #include "moe_otd_runtime.hpp"
 #include "intel_gpu/runtime/les_context.hpp"
 #include "runtime/ocl/ocl_stream.hpp"
+#include "runtime/ocl/ocl_engine.hpp"
+#include "runtime/ocl/ocl_event.hpp"
 
 namespace ov::intel_gpu::ocl::moe {
+
+ExpertWeightMemoryPool::ExpertWeightMemoryPool(cldnn::engine& engine, size_t budget_bytes)
+    : _engine(engine), _budget_bytes(budget_bytes) {
+    OPENVINO_ASSERT(dynamic_cast<cldnn::ocl::ocl_engine*>(&engine), "LES weight pools require an OCL engine");
+}
+
+ExpertWeightMemoryPool::~ExpertWeightMemoryPool() {
+    for (const auto& block : _blocks) {
+        if (block.consumer) {
+            try {
+                block.consumer->wait();
+            } catch (...) {
+            }
+        }
+    }
+}
+
+std::optional<ExpertWeightMemoryPool::Lease> ExpertWeightMemoryPool::try_acquire(const Descriptor& descriptor) {
+    OPENVINO_ASSERT(descriptor.num_experts > 0 && descriptor.slots > 0 && descriptor.slots <= descriptor.num_experts,
+                    "Invalid LES pool expert/slot counts");
+    std::array<std::optional<cldnn::layout>, 9> physical;
+    size_t bytes = 0;
+    for (size_t component = 0; component < physical.size(); ++component) {
+        if (!descriptor.logical_layouts[component]) {
+            continue;
+        }
+        auto logical = *descriptor.logical_layouts[component];
+        OPENVINO_ASSERT(logical.get_partial_shape().is_static() && logical.format == cldnn::format::bfyx &&
+                        !logical.data_padding, "LES pool layouts must be static dense bfyx");
+        auto shape = logical.get_partial_shape();
+        OPENVINO_ASSERT(shape.size() > 0 && shape[0].get_length() == static_cast<int64_t>(descriptor.num_experts),
+                        "LES pool layout expert dimension mismatch");
+        shape[0] = static_cast<int64_t>(descriptor.slots);
+        physical[component] = logical;
+        physical[component]->set_partial_shape(shape);
+        auto component_bytes = physical[component]->bytes_count();
+        OPENVINO_ASSERT(component_bytes > 0 && logical.bytes_count() % descriptor.num_experts == 0 &&
+                        component_bytes == logical.bytes_count() / descriptor.num_experts * descriptor.slots,
+                        "LES pool requires byte-addressable expert components");
+        OPENVINO_ASSERT(component_bytes <= std::numeric_limits<size_t>::max() - bytes, "LES pool byte count overflow");
+        bytes += component_bytes;
+    }
+    OPENVINO_ASSERT(bytes > 0, "LES pool descriptor has no weight components");
+    std::lock_guard<std::mutex> lock(_mutex);
+    auto block = std::find_if(_blocks.begin(), _blocks.end(), [&](const Block& candidate) {
+        return !candidate.leased && candidate.descriptor.slots == descriptor.slots &&
+               candidate.descriptor.num_experts == descriptor.num_experts &&
+               candidate.descriptor.logical_layouts == descriptor.logical_layouts &&
+               (!candidate.consumer || candidate.consumer->is_set());
+    });
+    if (block != _blocks.end()) {
+        if (block->consumer) {
+            block->consumer->wait();
+            block->consumer.reset();
+        }
+        ++_reuses;
+    } else {
+        if (bytes > _budget_bytes - _allocated_bytes) {
+            return std::nullopt;
+        }
+        cldnn::moe_weights weights;
+        std::array<cldnn::memory::ptr, 9> allocations;
+        std::array<cldnn::memory::ptr*, 9> tensors{&weights.gate_w, &weights.up_w, &weights.down_w,
+            &weights.gate_s, &weights.up_s, &weights.down_s, &weights.gate_z, &weights.up_z, &weights.down_z};
+        for (size_t component = 0; component < physical.size(); ++component) {
+            if (physical[component]) {
+                allocations[component] = _engine.allocate_memory(*physical[component], _engine.get_preferred_memory_allocation_type(), false);
+                OPENVINO_ASSERT(allocations[component]->size() == physical[component]->bytes_count(),
+                                "LES pool physical allocation size mismatch");
+                *tensors[component] = _engine.reinterpret_buffer(*allocations[component], *descriptor.logical_layouts[component]);
+            }
+        }
+        _blocks.push_back({descriptor, std::move(weights), std::move(allocations), bytes, 0, false, {}});
+        block = std::prev(_blocks.end());
+        _allocated_bytes += bytes;
+        ++_allocations;
+    }
+    block->leased = true;
+    block->id = ++_next_id;
+    Lease lease;
+    lease.id = block->id;
+    lease.weights = block->weights;
+    lease.physical_bytes = block->bytes;
+    lease.owner = this;
+    return lease;
+}
+
+bool ExpertWeightMemoryPool::release(Lease& lease, cldnn::event::ptr consumer) {
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (lease.owner != this) {
+        return false;
+    }
+    auto block = std::find_if(_blocks.begin(), _blocks.end(), [&](const Block& candidate) {
+        return candidate.leased && candidate.id == lease.id;
+    });
+    if (block == _blocks.end()) {
+        return false;
+    }
+    auto* native = dynamic_cast<cldnn::ocl::ocl_event*>(consumer.get());
+    cl_context context = nullptr;
+    OPENVINO_ASSERT(native && clGetEventInfo(native->get().get(), CL_EVENT_CONTEXT, sizeof(context), &context, nullptr) == CL_SUCCESS &&
+                    context == dynamic_cast<cldnn::ocl::ocl_engine&>(_engine).get_cl_context().get(),
+                    "LES pool release requires a native consumer event from its OCL context");
+    block->consumer = std::move(consumer);
+    block->leased = false;
+    lease = {};
+    return true;
+}
+
+ExpertWeightMemoryPool::Statistics ExpertWeightMemoryPool::statistics() const {
+    std::lock_guard<std::mutex> lock(_mutex);
+    Statistics result{_budget_bytes, _allocated_bytes, 0, 0, _allocations, _reuses};
+    for (const auto& block : _blocks) {
+        if (block.leased) {
+            result.leased_bytes += block.bytes;
+        } else if (block.consumer) {
+            result.fence_held_bytes += block.bytes;
+        }
+    }
+    return result;
+}
 
 std::optional<ExpertSlotLease> ResidentExpertWeightProvider::try_acquire_simultaneous(const std::vector<uint32_t>& experts, cldnn::stream& /*stream*/) {
     // Resident: identity mapping, always succeeds.

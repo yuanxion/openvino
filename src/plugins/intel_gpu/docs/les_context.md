@@ -692,3 +692,63 @@ default-off. Performance requires a separate matched comparison; short Debug
 acceptance timings do not establish a general benefit. ZE LES, other GPUs,
 cross-layer physical sharing, the independent GroupedMatMul graph adapter and
 the complete compatibility matrix remain outside this milestone.
+
+### P6 Performance Follow-Up
+
+A separate counterbalanced Qwen run on DUT4420LNL used Debug/OCL, ratio 80,
+272 input tokens and 32 generated tokens. Each mode has six measured samples
+after process-local warmup; trace, comparison and counter logging were disabled.
+All repeated and cross-mode texts/token counts matched. Mean wall generation,
+TTFT and TPOT were respectively:
+
+| Mode | Wall (s) | TTFT (s) | TPOT (s/token) |
+|---|---:|---:|---:|
+| LES off | 10.781 | 7.107 | 0.11847 |
+| Demand | 12.260 | 7.991 | 0.13767 |
+| Prefetch | 12.804 | 8.118 | 0.15113 |
+
+Demand and prefetch were 13.7% and 18.8% slower in wall time. This establishes
+no speedup for this workload; uncontrolled clocks, temperature and page cache
+make it exploratory rather than a Release performance gate. Load time is
+separate. Raw samples and standard deviations are in workspace
+`les/results/p6_perf_qwen_20261102/performance.json`. The validated OLMoE IR is
+currently missing from its external mount, so no new OLMoE performance result
+is claimed; earlier functional acceptance is not a replacement measurement.
+
+## P7.1: Physical Pool Foundation (Not Enabled)
+
+`ExpertWeightMemoryPool` adds an OCL-engine-bound, mutex-serialized allocator
+with an explicit physical-payload byte ceiling. Exact layout classes include
+all nine optional W/S/ZP layouts, expert count and slot count. Layouts must be
+static, dense, byte-addressable bfyx. Same-sized different types/shapes and
+different optional components cannot reuse each other's allocations.
+
+Physical allocations retain slot-sized layouts; provider-facing views retain
+the full logical expert dimension. Logical view `size()` is not physical
+allocation accounting. Budget admission counts the retained physical payload,
+not driver overhead, staging, activations or existing per-layer constants.
+Idle incompatible allocations are retained, not evicted, and can prevent a new
+layout class from fitting. Budget rejection returns no lease without waiting.
+
+Leases have pool ownership and unique IDs. Callers must explicitly release
+every lease with a native consumer event covering all upload/compute uses from
+the same OCL context. Dropping a lease does not release it. Stale or foreign
+leases cannot release a newer owner. Released blocks cannot be reused until
+their consumer completes; destruction drains released consumers. The engine
+must outlive the pool, and all active leases/uses must be released before pool
+destruction. Returned views must not be used after release. `fence_held_bytes`
+conservatively counts retained retired fences until reuse, even if completed.
+
+Five new native-OCL tests cover all-component accounting, exact-class isolation,
+budget/owner/stale-ID rejection, foreign-context fences, destructor draining
+and concurrent admission. Final directed validation passed 43/43; the complete
+focused run passed 546/546 in 37 suites, zero failures/skips. The actual GPU
+plugin also rebuilt successfully. Workspace evidence is
+`les/p7_pool_final_results.xml` and `les/p7_foundation_full_results.xml`.
+
+This foundation is not connected to production network allocations and adds
+no runtime switch. P7 remains incomplete: network-scoped ownership/budget,
+provider binding and cache-generation invalidation, removal of private
+per-layer allocations, cross-network/stream boundaries and the independent
+GroupedMatMul adapter still require implementation and validation. No deployed
+cross-layer sharing or model-level memory reduction is claimed.
