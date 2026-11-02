@@ -663,8 +663,15 @@ std::vector<program::les_router_link> program::get_les_router_links() const {
                 link.rejection_reason = "projection_unexpected_input_count";
                 return les_router_status::unsupported_projection;
             }
-            if (inputs[0].second != 0 || inputs.front().first->id() != chain.target_hidden) {
-                link.rejection_reason = "projection_hidden_source_mismatch";
+            const auto* projection_hidden = inputs.front().first;
+            while (projection_hidden->id() != chain.target_hidden && projection_hidden->is_type<reshape>() &&
+                   !projection_hidden->has_fused_primitives() && !projection_hidden->get_dependencies().empty() &&
+                   projection_hidden->get_dependencies().front().second == 0) {
+                projection_hidden = projection_hidden->get_dependencies().front().first;
+            }
+            if (inputs[0].second != 0 || projection_hidden->id() != chain.target_hidden) {
+                link.rejection_reason = "projection_hidden_source_mismatch:fc=" + inputs.front().first->id() +
+                                        ";target=" + chain.target_hidden;
                 return les_router_status::unsupported_projection;
             }
             if (inputs[1].first->id() != desc->weights.pid || inputs[1].second != desc->weights.idx ||
@@ -693,22 +700,26 @@ std::vector<program::les_router_link> program::get_les_router_links() const {
             const auto& weights = weights_node.get_output_layout();
             const auto& hidden = hidden_node.get_output_layout();
             const auto& target_hidden = target_hidden_node.get_output_layout();
-            const auto is_single_token = [](const layout& value) {
-                const auto& shape = value.get_shape();
-                return shape.size() >= 2 &&
-                       std::all_of(shape.begin(), std::prev(shape.end()), [](size_t dimension) { return dimension == 1; });
+            const auto supports_single_token = [](const layout& value, size_t width) {
+                const auto& shape = value.get_partial_shape();
+                if (shape.rank().is_dynamic() || shape.size() < 2 || shape[shape.size() - 1].is_dynamic() ||
+                    shape[shape.size() - 1].get_length() != static_cast<int64_t>(width)) {
+                    return false;
+                }
+                return std::all_of(shape.begin(), std::prev(shape.end()), [](const ov::Dimension& dimension) {
+                    return dimension.compatible(1);
+                });
             };
-            if (weights.is_dynamic() || hidden.is_dynamic() ||
+            if (weights.is_dynamic() ||
                 weights.data_type != data_types::f16 ||
                 hidden.data_type != weights.data_type || target_hidden.data_type != weights.data_type ||
                 weights.format != format::bfyx || hidden.format != format::bfyx || target_hidden.format != format::bfyx ||
-                weights.get_partial_shape().size() != 2 || hidden.get_partial_shape().size() < 2 ||
-                target_hidden.get_partial_shape().size() < 2 || target_hidden.is_dynamic() ||
-                hidden.get_partial_shape().is_dynamic() ||
+                weights.get_partial_shape().size() != 2 ||
                 !desc->weights_transposed || weights.get_shape()[0] != link.experts ||
-                hidden.get_shape().back() != weights.get_shape()[1] || target_hidden.get_shape().back() != weights.get_shape()[1] ||
-                !is_single_token(hidden) || !is_single_token(target_hidden)) {
-                link.rejection_reason = "unsupported_static_single_token_layout";
+                !supports_single_token(hidden, weights.get_shape()[1]) ||
+                !supports_single_token(target_hidden, weights.get_shape()[1]) ||
+                !supports_single_token(inputs.front().first->get_output_layout(), weights.get_shape()[1])) {
+                link.rejection_reason = "unsupported_single_token_layout";
                 return les_router_status::unsupported_layout;
             }
             const auto validate_parameter = [&](const primitive_id& id, size_t count) {

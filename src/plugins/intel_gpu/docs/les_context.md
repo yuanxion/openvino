@@ -458,3 +458,44 @@ supported proxy chain, this validates OTD partial-constant serialization and
 demand-only imported execution, not imported proxy-stage execution. The dedicated
 `cache_serialization` suite passed 10/10, including the new zero-payload OTD
 partial allocation roundtrip. Cache timing is not a performance result.
+
+## P4.4: Eligible Real-Model Functional Acceptance
+
+Qualification accepts an unfused reshape data-edge chain only when it resolves
+to the exact target hidden node/output. Reshape cannot authorize a different
+hidden source or an intervening computation. Proxy, target and FC hidden layouts
+must retain a static feature width matching the FP16 constant matrix. Leading
+dimensions may be dynamic only if they admit one token. Static multi-token and
+dynamic-width inputs remain unsupported. At execution, snapshots are taken only
+from contiguous FP16/bfyx single-token buffers; a multi-token Router does not
+launch proxy kernels. Prefill continues through the original demand path.
+
+The workspace experiment `les/prepare_p4_router_ir.py` materialized 40 Router
+matrices of the existing Qwen IR as FP16, leaving compressed expert payloads
+unchanged. It requires exact equality to the original represented weights; it
+does not restore their pre-quantization values or implement compressed-FC proxy
+execution. Product compressed/fused FC guards remain unchanged.
+
+On the OCL Debug host, `les/run_p4_acceptance.py` passed six sequential modes:
+LES-off, demand-only, prediction, prefetch, cold compiled cache and warm reuse.
+Each used one warm-up plus two measured generations of eight tokens. All 18
+generated texts and token counts agreed. Each enabled prediction mode qualified
+39 chains, compared 6,552 expert slots and matched 2,133 slots. Prefetch modes
+recorded 6,552 prefetched slots and zero failures. Counts correspond to decode
+only; the 21-token prefill did not run predictions. Warm reuse retained the five
+cache blobs unchanged and still executed predictions. Experiment evidence is in
+workspace `les/results/p4_acceptance_20261102/acceptance.json`.
+
+Focused GPU tests passed 357/357, and the overlapping forced-fallback subset
+passed 112/112 with grouped/micro prefill explicitly disabled. New boundaries
+cover same-source reshape acceptance, different-source rejection, dynamic tokens
+with fixed width and unknown-width rejection. Eight proxy variants retain strict
+bitwise LES-off final-output checks, including repeated execution and synthetic
+program import. Real-model text/count parity is not logits-bitwise accuracy.
+
+This closes the eligible-real-model P4 functional gate, not a performance gate.
+Measured Debug generation means were 2.014619 s demand-only, 2.111490 s prediction
+and 2.404974 s prefetch: speculation regressed, rather than demonstrating speedup.
+Page cache was uncontrolled and diagnostic comparison readback was enabled.
+Prefetch remains blocking at the target Router; no P5 early scheduling, P6/P7
+support, general GPU suite, ZE LES or new TSan result is claimed.
