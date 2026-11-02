@@ -148,6 +148,31 @@ INSTANTIATE_TEST_SUITE_P(smoke,
                                             ::testing::Values(8, 10)),
                          FuseMoERouterTest::get_test_case_name);
 
+TEST_F(TransformationTestsF, FuseMoERouter_preserves_selected_weight_sum) {
+    const auto build_model = [](bool fused) {
+        auto hidden = std::make_shared<ov::op::v0::Parameter>(element::f32, Shape{1, 8});
+        auto weights = op::v0::Constant::create(element::f32, Shape{8, 64}, {0.2f});
+        auto logits = std::make_shared<ov::op::v0::MatMul>(hidden, weights);
+        auto [routing, indices] = build_softmax_routing_for_fuse_test(logits, 8, false);
+        auto selected_sum = routing.get_node_shared_ptr()->input_value(1);
+        if (fused) {
+            const ov::intel_gpu::op::MoERouterFused::Config config{
+                64, 8, ov::intel_gpu::op::MoERouterFused::RoutingType::SOFTMAX};
+            auto router = std::make_shared<ov::intel_gpu::op::MoERouterFused>(ov::OutputVector{logits}, config);
+            routing = router->output(0);
+            indices = router->output(1);
+        }
+        auto axis = op::v0::Constant::create(element::i32, Shape{1}, {0});
+        auto routing_out = std::make_shared<ov::op::v0::Unsqueeze>(routing, axis);
+        auto indices_out = std::make_shared<ov::op::v0::Unsqueeze>(indices, axis);
+        return std::make_shared<ov::Model>(ov::OutputVector{routing_out, indices_out, selected_sum},
+                                           ov::ParameterVector{hidden});
+    };
+    model = build_model(false);
+    model_ref = build_model(true);
+    manager.register_pass<FuseMoERouter>(std::vector<ov::element::Type>{element::f32});
+}
+
 TEST_F(TransformationTestsF, FuseMoERouter_unsupported_activation_type) {
     auto hidden_states = std::make_shared<ov::op::v0::Parameter>(element::f32, Shape{4, 8, 2048});
     auto flatten_shape = op::v0::Constant::create(element::i32, Shape{2}, {32, 2048});
