@@ -639,3 +639,56 @@ boundary. LES remains default-off. These short sequential Debug samples do not
 establish formal performance, model/logit accuracy, complete GPU-suite coverage,
 ZE LES support or a new TSan result. P0 gaps remain deferred; larger-Prefill
 overlap, cross-layer pools and the full compatibility matrix remain P6-P8.
+
+## P6: Bounded Multi-Wave Prefill
+
+LES-on OCL offloaded MoE execution now uses the original per-expert, grouped
+oneDNN or micro-GEMM arithmetic path for inputs above the batched-GEMV threshold.
+It partitions actual unique experts into waves, retaining original token/rank
+pair indices. Grouped/micro wave outputs scatter into canonical pair scratch;
+one final weighted reduction runs in original rank order. The per-expert path
+keeps ascending-expert index-add order rather than accumulating wave partial
+sums. Shared expert execution occurs once per token chunk, after routed output.
+
+The two banks partition the existing resident slot count, including odd counts;
+they do not each receive a full-capacity allocation. Capacity one advances
+serially. Bank providers return absolute slots in the same weight allocation.
+Current-wave completion permits next-bank worker upload while compute proceeds;
+consumer events protect reuse. Exceptions drain issued compute and uploads
+before cleanup. Switching to bank execution invalidates the main provider's
+cache metadata, preventing later Decode from treating overwritten data as ready.
+
+Tokens are processed in chunks of at most 128. Gather, gate/up/down, routing
+metadata and canonical scratch are reused across chunks. Full input/output
+tensors remain full-sized, and small layout-dependent metadata still scales
+with the configured expert count. This is a token-bound scratch contract, not
+a global fixed-byte memory ceiling or cross-layer pool. Empty token inputs keep
+the existing non-Prefill path; the wave planner accepts empty routes without
+fabricating work. Large-prefill constants still have the existing P2/P5 private
+allocation overhead, which P7 must address.
+
+Final focused tests passed 541/541 in 37 suites and the overlapping forced
+grouped/micro fallback subset passed 258/258 in 14 suites, zero failures/skips.
+Coverage includes U4/U8, both routing modes, profiling off/on, odd and one-slot
+capacities, 33/65/257-token execution, a partial final chunk, changing routes,
+shared experts, missing/truncated files after earlier uploads and next-epoch
+recovery. Tests require actual per-path wave/chunk counters and bounded scratch.
+Per-expert/grouped and shape-matched micro outputs are compared bitwise with
+same-path full-capacity controls. Micro versus the old unchunked shape is also
+checked with the original numerical tolerance: chunking can change micro-kernel
+floating-point rounding by one ULP, so unchunked bitwise parity is not claimed.
+
+OLMoE LLM and Qwen VLM six-mode acceptance passed with respectively 267/272
+input tokens, eight output tokens, 18 equal repeated outputs per model, active
+Prefill counters and unchanged warm cache blobs. Evidence is in workspace
+`les/p6_complete_results.xml`, `les/p6_complete_fallback_results.xml` and
+`les/results/p6_complete_{olmoe,qwen}_20261102/acceptance.json`.
+The native micro trace probe observed 51 read/kernel interval intersections
+across 918 reads and 225 kernel events on one device timer. This is real
+read/compute overlap, not cold-storage DMA throughput or end-to-end speedup.
+
+P6 is functionally complete within the existing OCL fused-MoE boundary. LES stays
+default-off. Performance requires a separate matched comparison; short Debug
+acceptance timings do not establish a general benefit. ZE LES, other GPUs,
+cross-layer physical sharing, the independent GroupedMatMul graph adapter and
+the complete compatibility matrix remain outside this milestone.

@@ -56,7 +56,32 @@ void OffloadExpertWeightProvider::bind(cldnn::moe_weights& resident) {
 }
 
 std::shared_ptr<IExpertWeightProvider> OffloadExpertWeightProvider::clone() const {
-    return std::make_shared<OffloadExpertWeightProvider>(_capacity, _config, _weight_bin_offsets, _weights_path);
+    auto provider = std::make_shared<OffloadExpertWeightProvider>(_capacity, _config, _weight_bin_offsets, _weights_path);
+    provider->_slot_offset = _slot_offset;
+    return provider;
+}
+
+std::shared_ptr<OffloadExpertWeightProvider> OffloadExpertWeightProvider::make_les_bank(size_t capacity,
+                                                                                    size_t slot_offset) const {
+    OPENVINO_ASSERT(capacity > 0 && slot_offset <= _capacity && capacity <= _capacity - slot_offset,
+                    "LES Prefill bank exceeds resident capacity");
+    auto provider = std::make_shared<OffloadExpertWeightProvider>(capacity, _config, _weight_bin_offsets, _weights_path);
+    provider->_slot_offset = _slot_offset + slot_offset;
+    return provider;
+}
+
+void OffloadExpertWeightProvider::reset_les_cache() {
+    OPENVINO_ASSERT(_les_context, "LES cache reset requires a context");
+    release();
+    _reservations = std::make_unique<ExpertSlotReservations>(_capacity);
+    _demand_shadow = std::make_unique<ExpertSlotReservations>(_capacity);
+}
+
+ExpertSlotLease OffloadExpertWeightProvider::physical_slots(ExpertSlotLease slots) const {
+    for (auto& slot : slots) {
+        slot += _slot_offset;
+    }
+    return slots;
 }
 
 void OffloadExpertWeightProvider::set_les_context(cldnn::les_context* context, uint64_t epoch) {
@@ -143,12 +168,12 @@ std::optional<ExpertDemand> OffloadExpertWeightProvider::begin_les_demand(const 
         _shadow_reservation = _demand_shadow->reserve(experts, _les_epoch);
         OPENVINO_ASSERT(_shadow_reservation, "LES demand shadow reservation failed");
         OPENVINO_ASSERT(_resident && _les_context->get_transfer_stream(), "LES provider is not bound to a transfer lane");
-        ExpertDemand demand{_reservation->slots, _reservation->ready_pairs, _reservation->missing_pairs};
+        ExpertDemand demand{physical_slots(_reservation->slots), _reservation->ready_pairs, _reservation->missing_pairs};
         _upload_events = std::make_shared<std::vector<cldnn::event::ptr>>();
         if (!_reservation->missing_experts.empty()) {
             auto task = _les_context->submit(_les_epoch,
             [this, events = _upload_events, transfer = _les_context->get_transfer_stream(), weights = *_resident,
-                 missing = _reservation->missing_experts, slots = _reservation->missing_slots]() mutable {
+                 missing = _reservation->missing_experts, slots = physical_slots(_reservation->missing_slots)]() mutable {
                     if (auto* perf = moe_otd::get_perf_counters()) {
                         perf->les_worker_tasks.fetch_add(1, std::memory_order_relaxed);
                     }
@@ -310,7 +335,7 @@ void OffloadExpertWeightProvider::prefetch_les_demand(const std::vector<uint32_t
         if (!_reservation->missing_experts.empty()) {
             auto task = _les_context->try_submit_speculative(_les_epoch,
                 [this, events = _upload_events, transfer = _les_context->get_transfer_stream(), weights = *_resident,
-                 missing = _reservation->missing_experts, slots = _reservation->missing_slots]() mutable {
+                 missing = _reservation->missing_experts, slots = physical_slots(_reservation->missing_slots)]() mutable {
                     try {
                         *events = moe_otd::fill_weights_memory_async(*transfer, _config, _weight_bin_offsets, _weight_reader,
                                                                      weights, missing, slots, &_prefetch_uploaded_bytes);

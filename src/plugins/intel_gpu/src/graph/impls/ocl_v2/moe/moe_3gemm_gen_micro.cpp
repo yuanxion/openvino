@@ -325,7 +325,7 @@ DispatchDataFunc MoE3GemmMicroGenerator::get_dispatch_data_func() const {
     return DispatchDataFunc{[wei_idx](const RuntimeParams& params, KernelData& kd, ImplRuntimeParams* rt_params) {
         assert(!params.is_dynamic());
 
-        auto* rtp = static_cast<MoEGemmRuntimeParams*>(rt_params);
+        auto* rtp = static_cast<MoE3GemmRuntimeParams*>(rt_params);
         const auto& device_info = params.get_device_info();
         const auto& gemm_p = kd.micro_kernels[0]->p;
         auto sg_per_wg_n = static_cast<size_t>(gemm_p.getSetting("sg_per_wg_n"));
@@ -360,6 +360,9 @@ DispatchDataFunc MoE3GemmMicroGenerator::get_dispatch_data_func() const {
             OPENVINO_THROW("Unsupported input tensor shape size: ", input_layout.get_shape().size());
         }
 
+        if (rtp->prefill_tokens) {
+            n = rtp->prefill_tokens;
+        }
         const auto& experts_weight_shape = experts_weight_layout.get_shape();
         size_t m = experts_weight_shape[1];
         size_t k = experts_weight_shape.size() == 4 ? experts_weight_shape[2] * experts_weight_shape[3] : experts_weight_shape[2];

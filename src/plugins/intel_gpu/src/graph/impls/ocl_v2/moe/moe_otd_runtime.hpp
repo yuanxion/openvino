@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -18,6 +19,21 @@
 #include "openvino/util/parallel_io.hpp"
 
 namespace ov::intel_gpu::ocl::moe_otd {
+
+struct PrefillWave {
+    size_t bank;
+    std::vector<uint32_t> experts;
+    std::vector<size_t> pairs;
+};
+
+struct PrefillWavePlan {
+    std::array<size_t, 2> bank_capacity;
+    std::vector<PrefillWave> waves;
+};
+
+PrefillWavePlan plan_prefill_waves(const std::vector<uint32_t>& routed_experts,
+                                 size_t num_experts,
+                                 size_t capacity);
 
 struct LesSpeculationPolicy {
     static constexpr size_t lookahead_layers = 1;
@@ -50,6 +66,12 @@ struct OtdPerfCounters {
     std::atomic<uint64_t> les_upload_chunks{0};
     std::atomic<uint64_t> les_upload_bytes{0};
     std::atomic<uint64_t> les_waves{0};
+    std::atomic<uint64_t> les_prefill_waves{0};
+    std::atomic<uint64_t> les_prefill_pairs{0};
+    std::atomic<uint64_t> les_prefill_grouped_waves{0};
+    std::atomic<uint64_t> les_prefill_micro_waves{0};
+    std::atomic<uint64_t> les_prefill_per_expert_waves{0};
+    std::atomic<uint64_t> les_prefill_chunks{0};
     std::atomic<uint64_t> les_ready_pairs{0};
     std::atomic<uint64_t> les_missing_pairs{0};
     std::atomic<uint64_t> les_shared_pairs{0};

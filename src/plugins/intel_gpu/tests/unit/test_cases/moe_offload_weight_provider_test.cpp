@@ -465,6 +465,110 @@ TEST(moe_les_reservations, fixed_speculative_policy_separates_horizon_rank_and_b
     EXPECT_EQ(Policy::expert_budget(16, Policy::max_bytes + 1), 0U);
 }
 
+TEST(moe_les_prefill, odd_capacity_retains_canonical_pairs_and_expert_order) {
+    auto plan = otd::plan_prefill_waves({3, 1, 3, 2, 0, 1, 2, 2}, 4, 3);
+    EXPECT_EQ(plan.bank_capacity, (std::array<size_t, 2>{2, 1}));
+    ASSERT_EQ(plan.waves.size(), 3U);
+    EXPECT_EQ(plan.waves[0].experts, (std::vector<uint32_t>{0, 1}));
+    EXPECT_EQ(plan.waves[1].experts, (std::vector<uint32_t>{2}));
+    EXPECT_EQ(plan.waves[2].experts, (std::vector<uint32_t>{3}));
+    EXPECT_EQ(plan.waves[0].pairs, (std::vector<size_t>{1, 4, 5}));
+    EXPECT_EQ(plan.waves[1].pairs, (std::vector<size_t>{3, 6, 7}));
+    EXPECT_EQ(plan.waves[2].pairs, (std::vector<size_t>{0, 2}));
+    EXPECT_EQ(plan.waves[0].bank, 0U);
+    EXPECT_EQ(plan.waves[1].bank, 1U);
+    EXPECT_EQ(plan.waves[2].bank, 0U);
+}
+
+TEST(moe_les_prefill, all_top8_subsets_cover_pairs_once_within_total_capacity) {
+    for (size_t capacity = 1; capacity <= 9; ++capacity) {
+        for (uint32_t mask = 0; mask < 256; ++mask) {
+            std::vector<uint32_t> routed;
+            for (size_t token = 0; token < 3; ++token) {
+                for (uint32_t expert = 0; expert < 8; ++expert) {
+                    if (mask & (1U << expert)) {
+                        routed.push_back((expert + token) % 8);
+                    }
+                }
+            }
+            auto plan = otd::plan_prefill_waves(routed, 8, capacity);
+            EXPECT_EQ(plan.bank_capacity[0] + plan.bank_capacity[1], capacity);
+            std::vector<size_t> visited(routed.size(), 0);
+            std::vector<uint32_t> experts;
+            for (const auto& wave : plan.waves) {
+                EXPECT_LE(wave.experts.size(), plan.bank_capacity[wave.bank]);
+                EXPECT_TRUE(std::is_sorted(wave.pairs.begin(), wave.pairs.end()));
+                experts.insert(experts.end(), wave.experts.begin(), wave.experts.end());
+                for (auto pair : wave.pairs) {
+                    ASSERT_LT(pair, routed.size());
+                    ++visited[pair];
+                    EXPECT_NE(std::find(wave.experts.begin(), wave.experts.end(), routed[pair]), wave.experts.end());
+                }
+            }
+            EXPECT_TRUE(std::all_of(visited.begin(), visited.end(), [](size_t count) { return count == 1; }));
+            EXPECT_TRUE(std::is_sorted(experts.begin(), experts.end()));
+            EXPECT_EQ(std::adjacent_find(experts.begin(), experts.end()), experts.end());
+        }
+    }
+}
+
+TEST(moe_les_prefill, rejects_invalid_routes_and_budget) {
+    EXPECT_ANY_THROW(otd::plan_prefill_waves({0}, 1, 0));
+    EXPECT_ANY_THROW(otd::plan_prefill_waves({0}, 0, 1));
+    EXPECT_ANY_THROW(otd::plan_prefill_waves({2}, 2, 1));
+    EXPECT_TRUE(otd::plan_prefill_waves({}, 2, 1).waves.empty());
+}
+
+TEST_F(moe_les_upload, prefill_banks_share_allocation_without_overwriting_other_bank) {
+    std::vector<uint8_t> source(64);
+    for (size_t expert = 0; expert < 4; ++expert) {
+        std::fill_n(source.begin() + expert * 16, 16, static_cast<uint8_t>(expert + 11));
+    }
+    write(source);
+    MOECompressed::Config config{};
+    config.num_expert = 4;
+    OffloadExpertWeightProvider provider(3, config, std::vector<size_t>(9), path);
+    moe_weights weights;
+    weights.gate_w = buffer(16, data_types::u8, 4);
+    provider.bind(weights);
+    cldnn::les_context context(2, lane());
+    auto epoch = context.begin_epoch();
+    provider.set_les_context(&context, epoch);
+    auto compute = lane();
+    ASSERT_TRUE(provider.try_acquire_simultaneous({3}, *compute));
+    provider.reset_les_cache();
+    auto first = provider.make_les_bank(2, 0);
+    auto second = provider.make_les_bank(1, 2);
+    for (const auto& bank : {first, second}) {
+        bank->bind(weights);
+        bank->set_les_context(&context, epoch);
+    }
+    auto first_demand = first->begin_les_demand({0, 1});
+    auto second_demand = second->begin_les_demand({2});
+    ASSERT_TRUE(first_demand);
+    ASSERT_TRUE(second_demand);
+    first->finish_les_demand(*compute);
+    second->finish_les_demand(*compute);
+    EXPECT_EQ(second_demand->slots, (std::vector<size_t>{2}));
+    EXPECT_EQ(first->try_acquire_simultaneous({3, 0, 1}, *compute), std::nullopt);
+    std::vector<uint8_t> actual(16);
+    for (size_t expert = 0; expert < 2; ++expert) {
+        weights.gate_w->copy_to(*compute, actual.data(), first_demand->slots[expert] * 16, 0, 16, true);
+        EXPECT_EQ(actual, std::vector<uint8_t>(16, static_cast<uint8_t>(expert + 11)));
+    }
+    weights.gate_w->copy_to(*compute, actual.data(), 2 * 16, 0, 16, true);
+    EXPECT_EQ(actual, std::vector<uint8_t>(16, 13));
+    first->release();
+    second->release();
+    auto demand = provider.begin_les_demand({3});
+    ASSERT_TRUE(demand);
+    EXPECT_EQ(demand->missing_pairs, (std::vector<size_t>{0}));
+    provider.finish_les_demand(*compute);
+    provider.release();
+    EXPECT_ANY_THROW(provider.make_les_bank(2, 2));
+    EXPECT_ANY_THROW(provider.make_les_bank(0, 0));
+}
+
 TEST(moe_les_reservations, rollback_unstarted_speculation_restores_full_cache) {
     ov::intel_gpu::ocl::moe::ExpertSlotReservations reservations(2);
     auto demand = reservations.reserve({0, 1}, 1);
