@@ -8,6 +8,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 
@@ -34,6 +35,7 @@ public:
 
     uint64_t begin_epoch();
     ticket submit(uint64_t epoch, std::function<void()> work);
+    std::optional<ticket> try_submit_speculative(uint64_t epoch, std::function<void()> work);
     void wait();
     void cancel();
     void stop();
@@ -42,11 +44,13 @@ public:
 private:
     struct task {
         uint64_t epoch;
+        bool speculative;
         std::function<void()> work;
         std::promise<void> completion;
     };
 
     void run();
+    std::optional<ticket> submit_task(uint64_t epoch, std::function<void()> work, bool speculative);
     void invalidate(bool stopping);
     void check_control_thread() const;
     static void fail_tasks(std::deque<task>& tasks, std::exception_ptr error);
