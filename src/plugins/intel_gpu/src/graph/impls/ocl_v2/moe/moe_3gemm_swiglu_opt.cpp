@@ -360,9 +360,12 @@ protected:
 
 class MoE3GemmSwigluPrefillScatterReduceRowLut : public KernelGenerator {
 public:
-    MoE3GemmSwigluPrefillScatterReduceRowLut() : KernelGenerator("moe_scatter_reduction_row_lut", "prefill_scatter_reduce") {}
+    explicit MoE3GemmSwigluPrefillScatterReduceRowLut(bool canonical = false)
+        : KernelGenerator("moe_scatter_reduction_row_lut", canonical ? "prefill_canonical_scatter" : "prefill_scatter_reduce"),
+          _canonical(canonical) {}
 
 protected:
+    bool _canonical;
     [[nodiscard]] JitConstants get_jit_constants(const RuntimeParams& params) const override {
         auto jit = KernelGenerator::get_jit_constants(params);
         auto desc = params.typed_desc<moe_3gemm_fused_compressed>();
@@ -379,6 +382,9 @@ protected:
         jit.make("VEC_BLK_SIZE", 4);
         jit.make("BATCHES_PER_THREAD", batches_per_thread);
 
+        if (_canonical) {
+            jit.make("LES_CANONICAL_SCATTER", 1);
+        }
         jit.make("INPUT0_TYPE", "half");  // mlp_down output
         jit.make("INPUT1_TYPE", "half");  // experts router weights
         jit.make("INPUT2_TYPE", "int");   // gathered row index per (token, top_k)
@@ -660,6 +666,7 @@ public:
     // Grouped GEMM path: same OCL kernels but compiled with ONEDNN_GROUPED_GEMM_USED=1
     Stage::Ptr grouped_gemm_prefill_gather = make_stage<MoE3GemmSwigluPrefillGather>(/*use_grouped_gemm=*/true);
     Stage::Ptr grouped_gemm_prefill_swiglu = make_stage<MoE3GemmSwigluPrefillSwiglu>(/*use_grouped_gemm=*/true);
+    Stage::Ptr prefill_canonical_scatter = make_stage<MoE3GemmSwigluPrefillScatterReduceRowLut>(true);
     Stage::Ptr prefill_scatter_reduce_row_lut = make_stage<MoE3GemmSwigluPrefillScatterReduceRowLut>();
 
     struct dnnl_weights {
@@ -696,7 +703,26 @@ public:
         memory::ptr shared_zp[4];
     } moe_fusion_weights;
 
+    struct prefill_execution {
+        size_t tokens = 0;
+        memory::ptr hidden;
+        memory::ptr output;
+        memory::ptr canonical;
+        std::vector<int32_t> gather_tokens;
+        std::vector<int32_t> offsets;
+        std::vector<int32_t> row_lut;
+        std::vector<int32_t> expert_ids;
+        std::vector<int32_t> starts;
+        std::vector<int32_t> lengths;
+        std::vector<uint32_t> routed_experts;
+        std::vector<size_t> resident_slots;
+        std::vector<event::ptr> trace_events;
+    };
+
+    static constexpr size_t prefill_chunk_tokens = 128;
+
     struct scratch_buffers {
+        std::shared_ptr<prefill_execution> prefill;
         // softmax+topk
         memory::ptr topk_id;
         memory::ptr topk_weights;
@@ -892,16 +918,20 @@ public:
         needs_fallback = false;
     }
 
-    bool on_load_expert_weights(size_t expert_no, typed_primitive_inst<moe_3gemm_fused_compressed>& instance, dnnl::stream& dnn_stream) {
+    bool on_load_expert_weights(size_t expert_no, typed_primitive_inst<moe_3gemm_fused_compressed>& instance,
+                               dnnl::stream& dnn_stream, std::optional<size_t> resident_slot = std::nullopt) {
         if (!_weight_provider->is_offloaded()) {
             return false;
         }
 
-        dnn_stream.wait();
+        if (!resident_slot) {
+            dnn_stream.wait();
+        }
 
         auto& stream = instance.get_network().get_stream();
         auto& dnnl_weights = _dnnl_weights[expert_no];
-        auto lru_expert_no = static_cast<int64_t>(_weight_provider->acquire_one(static_cast<uint32_t>(expert_no), stream));
+        auto lru_expert_no = static_cast<int64_t>(resident_slot ? *resident_slot :
+                            _weight_provider->acquire_one(static_cast<uint32_t>(expert_no), stream));
         auto& params = instance._weights;
 
 #    define CONVERT_DNNL_OTD(name, i)                                                                                                                  \
@@ -1125,6 +1155,12 @@ public:
         if (params.prog->get_config().get_enable_les() && cur_moe->_otd.lru_expert_num > 0) {
             add_stage(mlp_gate_up_masked, params);
             add_stage(mlp_down_masked, params);
+            if (use_grouped_gemm_prefill || use_micro_gemm_prefill) {
+                add_stage(prefill_canonical_scatter, params);
+                if (!use_grouped_gemm_prefill) {
+                    add_stage(prefill_scatter_reduce_row_lut, params);
+                }
+            }
         }
     }
 
@@ -1412,6 +1448,10 @@ public:
         size_t expert_num = static_cast<size_t>(config.num_expert);
         auto hidden_states_layout = params.input_layouts[0];
         auto token_num = get_seq_len(hidden_states_layout);
+        if (params.prog->get_config().get_enable_les() && cur_moe->_otd.lru_expert_num > 0 &&
+            token_num > batched_gemv_threshold) {
+            token_num = std::min(token_num, prefill_chunk_tokens);
+        }
         auto data_type = hidden_states_layout.data_type;
         bool has_shared_expert = params.input_layouts.size() > static_cast<size_t>(MOE3GemmInputIndex::SHARED_GATE_WEIGHT);
 
@@ -1448,6 +1488,10 @@ public:
             internal_buffers.emplace_back(layout_token_idx, false);  // 10: token idx per expert
             layout layout_actual_used_expert_num(ov::Shape{1}, ov::element::i32, cldnn::format::bfyx);
             internal_buffers.emplace_back(layout_actual_used_expert_num, false);  // 11: actual_used_expert_num
+            if (params.prog->get_config().get_enable_les() && cur_moe->_otd.lru_expert_num > 0) {
+                internal_buffers.emplace_back(layout(ov::Shape{1}, data_types::i32, format::bfyx), false);
+                internal_buffers.emplace_back(layout_token_idx, false);
+            }
         }
         // for grouped_gemm: scatter_reduce via moe_scatter_reduction_row_lut (13); gather uses 10, OneDNN desc uses 12
         if (use_grouped_gemm_prefill && token_num > 1) {
@@ -1481,6 +1525,9 @@ public:
         // Routing weights scratch buffer (used in prefill paths and reused as shared_gate_vals in batched GEMV)
         scratch.routing_weights = intermediates_memories[MOE_INTERNAL_BUFFER_ROUTING_WEIGHTS];
         const auto desc = instance.get_typed_desc<moe_3gemm_fused_compressed>();
+        if (_les_owner && token_num > batched_gemv_threshold) {
+            token_num = std::min(token_num, prefill_chunk_tokens);
+        }
         const bool single_token_fallback = desc->_otd.lru_expert_num > 0 &&
                                            desc->_otd.lru_expert_num < static_cast<size_t>(desc->_config.top_k);
         if (token_num > 1 || single_token_fallback) {
@@ -1918,6 +1965,30 @@ public:
         return ret;
     }
 
+    cldnn::event::ptr enqueue_prefill_micro(const std::vector<event::ptr>& events,
+                                           typed_primitive_inst<moe_3gemm_fused_compressed>& instance,
+                                           Stage& stage, scratch_buffers& scratch) {
+        OPENVINO_ASSERT(stage.kernel, "LES Prefill micro stage is unavailable on this device");
+        auto* rtp = static_cast<MoE3GemmRuntimeParams*>(m_rt_params.get());
+        rtp->prefill_tokens = scratch.prefill->tokens;
+        stage.kd.update_dispatch_data_func(*instance.get_impl_params(), stage.kd, rtp);
+        auto args = PrimitiveImplOCL::get_arguments(instance);
+        for (size_t component = 0; component < 3; ++component) {
+            args.inputs[3 + component * 3] = scratch.moe_fusion_wei_addr.weight[component];
+            args.inputs[4 + component * 3] = scratch.moe_fusion_wei_addr.scale[component];
+            args.inputs[5 + component * 3] = scratch.moe_fusion_wei_addr.zp[component];
+        }
+        args.scalars = &stage.kd.params.scalars;
+        args.local_memory_args = &stage.kd.params.local_memory_args;
+        auto& stream = instance.get_network().get_stream();
+        stream.set_arguments(*stage.kernel, stage.kd.params, args);
+        auto result = stream.enqueue_kernel(*stage.kernel, stage.kd.params, {}, events, true);
+        if (moe_otd::les_trace_enabled()) {
+            scratch.prefill->trace_events.push_back(result);
+        }
+        return result;
+    }
+
     cldnn::event::ptr exec_prefill_micro_gemm(const std::vector<cldnn::event::ptr>& events,
                                               typed_primitive_inst<moe_3gemm_fused_compressed>& instance,
                                               scratch_buffers& scratch,
@@ -1933,6 +2004,11 @@ public:
         auto routing_mem_ptr = scratch.topk_weights;
         auto input_layout = instance.input_memory_ptr(static_cast<size_t>(MOE3GemmInputIndex::HIDDEN_STATES))->get_layout();
         auto token_num = get_seq_len(input_layout);
+        if (scratch.prefill) {
+            token_num = scratch.prefill->tokens;
+            hidden_states_mem_ptr = scratch.prefill->hidden;
+            final_hidden_states_mem_ptr = scratch.prefill->output;
+        }
 
         _hidden_size = static_cast<int>(cur_moe->_config.hidden_size);
         _intermediate_size = static_cast<int>(cur_moe->_config.inter_size);
@@ -1946,7 +2022,7 @@ public:
         auto num_total_experts = static_cast<int>(cur_moe->_config.num_expert);
         int num_actually_used_experts = 0;
 
-        {
+        if (!scratch.prefill) {
             auto topk_count = token_num * static_cast<size_t>(max_topk);
             bool needs_fallback = false;
             on_before_prefill(stream, instance, scratch, batch_mem_ptr, topk_count, needs_fallback);
@@ -1965,7 +2041,19 @@ public:
         //   mask 2: token len for each activated expert, shape = [activated_expert_num]
         //   mask 3: expert id, shape = [activated_expert_num]
         //   mask 4: actual activated expert num, shape = [1]
-        if (use_gpu_mask_gen) {
+        if (scratch.prefill) {
+            const auto& execution = *scratch.prefill;
+            rtp->num_actually_used_experts = static_cast<int>(execution.expert_ids.size());
+            auto upload = [&](size_t index, const std::vector<int32_t>& values) {
+                intermediates_memories[index]->copy_from(stream, values.data(), 0, 0,
+                                                         values.size() * sizeof(int32_t), true);
+            };
+            upload(MOE_INTERNAL_BUFFER_TOKEN_IDX_PER_EXPERT, execution.gather_tokens);
+            upload(MOE_INTERNAL_BUFFER_TOKEN_START_OFFSET_PER_EXPERT, execution.starts);
+            upload(MOE_INTERNAL_BUFFER_ACTIVATED_EXPERT_IDS, execution.expert_ids);
+            upload(MOE_INTERNAL_BUFFER_TOKEN_LEN_PER_ACTIVATED_EXPERT, execution.lengths);
+            upload(MOE_INTERNAL_BUFFER_ROW_LUT, execution.row_lut);
+        } else if (use_gpu_mask_gen) {
             auto token_size = token_num;
             ret_event = execute_stage(events,
                                       instance,
@@ -2070,7 +2158,8 @@ public:
             auto block_size = get_vec_size(*instance.get_impl_params());
             auto [local_threads_count, batches_per_thread, unaligned_elements] =
                 calc_thread_count(const_cast<RuntimeParams&>(*instance.get_impl_params()), block_size, hidden_size);
-            auto token_per_expert = intermediates_memories[MOE_INTERNAL_BUFFER_TOKEN_IDX_PER_EXPERT]->get_layout().get_shape()[0];
+            auto token_per_expert = scratch.prefill ? scratch.prefill->gather_tokens.size() :
+                intermediates_memories[MOE_INTERNAL_BUFFER_TOKEN_IDX_PER_EXPERT]->get_layout().get_shape()[0];
 
 #    if DEBUG_MOE_LOG
             GPU_DEBUG_TRACE_DETAIL << "\nstep 2: prefill_gather local_threads_count=" << local_threads_count << ", batches_per_thread=" << batches_per_thread
@@ -2080,7 +2169,7 @@ public:
             ret_event = execute_stage({ret_event},
                                       instance,
                                       *prefill_gather,
-                                      {instance.input_memory_ptr(static_cast<size_t>(MOE3GemmInputIndex::HIDDEN_STATES)),
+                                      {hidden_states_mem_ptr,
                                        intermediates_memories[MOE_INTERNAL_BUFFER_TOKEN_IDX_PER_EXPERT]},
                                       {scratch.x},
                                       {static_cast<size_t>(token_per_expert * local_threads_count), 1, 1},
@@ -2105,8 +2194,13 @@ public:
 #    if DEBUG_MOE_LOG
             GPU_DEBUG_TRACE_DETAIL << "\nstep 3: moe_gemm for up and gate" << std::endl;
 #    endif
-            ret_event = PrimitiveImplOCL::execute_stage({ret_event}, instance, micro_gemm_up);
-            ret_event = PrimitiveImplOCL::execute_stage({ret_event}, instance, micro_gemm_gate);
+            if (scratch.prefill) {
+                ret_event = enqueue_prefill_micro({ret_event}, instance, *micro_gemm_up, scratch);
+                ret_event = enqueue_prefill_micro({ret_event}, instance, *micro_gemm_gate, scratch);
+            } else {
+                ret_event = PrimitiveImplOCL::execute_stage({ret_event}, instance, micro_gemm_up);
+                ret_event = PrimitiveImplOCL::execute_stage({ret_event}, instance, micro_gemm_gate);
+            }
         }
 
         // step 4: post proc - gate_up = silu(gate)*up, silu(x)=x*sigmod(x)=x*(1+exp(-x))
@@ -2149,7 +2243,15 @@ public:
 #    if DEBUG_MOE_LOG
             GPU_DEBUG_TRACE_DETAIL << "\nstep 5: moe_gemm for down" << std::endl;
 #    endif
-            ret_event = PrimitiveImplOCL::execute_stage({ret_event}, instance, micro_gemm_down);
+            ret_event = scratch.prefill ? enqueue_prefill_micro({ret_event}, instance, *micro_gemm_down, scratch) :
+                                         PrimitiveImplOCL::execute_stage({ret_event}, instance, micro_gemm_down);
+        }
+
+        if (scratch.prefill) {
+            auto [local, batches, unused] = calc_thread_count(const_cast<RuntimeParams&>(*instance.get_impl_params()), 4, _hidden_size);
+            return execute_stage({ret_event}, instance, *prefill_canonical_scatter,
+                                 {scratch.y, routing_mem_ptr, intermediates_memories[MOE_INTERNAL_BUFFER_ROW_LUT]},
+                                 {scratch.prefill->canonical}, {token_num * local, 1, 1}, {local, 1, 1}, true);
         }
 
         // step 6: scatter and reduce
@@ -2476,19 +2578,30 @@ public:
         // [batch, max_topk]
         auto topk_id_mem = scratch.topk_id;
         auto token_num = get_seq_len(hidden_states_layout);
+        if (scratch.prefill) {
+            token_num = scratch.prefill->tokens;
+            hidden_states_mem_ptr = scratch.prefill->hidden;
+            final_hidden_states_mem_ptr = scratch.prefill->output;
+        }
         expert_mask_cpu expert_mask;
         get_expert_mask_from_gpu(config, topk_id_mem, stream, expert_mask, token_num);
 
-        for (size_t expert_no = 0; expert_no < config.num_expert; expert_no++) {
-            if (expert_no >= expert_mask.pred_flag.size()) {
-                OPENVINO_THROW("expert_no=", expert_no, " is out of bounds");
+        std::vector<uint32_t> experts;
+        if (scratch.prefill) {
+            experts = scratch.prefill->routed_experts;
+        } else {
+            for (uint32_t expert = 0; expert < config.num_expert; ++expert) {
+                if (expert_mask.pred_flag[expert]) {
+                    experts.push_back(expert);
+                }
             }
-            auto can_skip_subgraph = expert_mask.pred_flag[expert_no] == 0;
-            if (can_skip_subgraph) {
-                continue;
-            }
+        }
 
-            on_load_expert_weights(expert_no, instance, dnn_stream);
+        for (size_t expert_index = 0; expert_index < experts.size(); ++expert_index) {
+            auto expert_no = experts[expert_index];
+
+            on_load_expert_weights(expert_no, instance, dnn_stream,
+                                   scratch.prefill ? std::optional<size_t>(scratch.prefill->resident_slots[expert_index]) : std::nullopt);
             auto& dnnl_weights = _dnnl_weights[expert_no];
 
             // expert_mask
@@ -2543,7 +2656,6 @@ public:
                                          {1, lws_size},
                                          true /*instance.needs_completion_event()*/);
         }
-
         return result_event;
     }
 
@@ -2573,6 +2685,11 @@ public:
         auto [hidden_states_mem_ptr, hidden_states_layout] = get_input_info(instance, static_cast<size_t>(MOE3GemmInputIndex::HIDDEN_STATES));
         auto token_num = get_seq_len(hidden_states_layout);
         auto final_hidden_states_mem_ptr = instance.output_memory_ptr(0);
+        if (scratch.prefill) {
+            token_num = scratch.prefill->tokens;
+            hidden_states_mem_ptr = scratch.prefill->hidden;
+            final_hidden_states_mem_ptr = scratch.prefill->output;
+        }
         auto batch_mem_ptr = scratch.topk_id;
         auto routing_mem_ptr = scratch.topk_weights;
         const auto& intermediates_memories = instance.get_intermediates_memories();
@@ -2609,7 +2726,14 @@ public:
         // holds that expert output, or -1 when the pair is unused. Filled by the mask loops below.
         std::vector<int32_t> row_lut_cpu(static_cast<size_t>(token_num) * max_topk, -1);
 
-        if (!build_grouped_mask_otd(stream,
+        if (scratch.prefill) {
+            tokens_per_expert_cpu = scratch.prefill->gather_tokens;
+            grouped_offsets_cpu = scratch.prefill->offsets;
+            row_lut_cpu = scratch.prefill->row_lut;
+            tokens_lens_per_expert_cpu = scratch.prefill->lengths;
+            num_actually_used_experts = static_cast<int>(tokens_lens_per_expert_cpu.size());
+            set_otd_weight_pointers(instance, scratch);
+        } else if (!build_grouped_mask_otd(stream,
                                     instance,
                                     scratch,
                                     batch_mem_ptr,
@@ -2649,7 +2773,8 @@ public:
             }
         }
 
-        int total_gathered_tokens = static_cast<int>(token_num) * max_topk;
+        int total_gathered_tokens = scratch.prefill ? static_cast<int>(scratch.prefill->gather_tokens.size()) :
+                                static_cast<int>(token_num) * max_topk;
 
         intermediates_memories[MOE_INTERNAL_BUFFER_ROW_LUT]->copy_from(stream, row_lut_cpu.data(), 0, 0, row_lut_cpu.size() * sizeof(row_lut_cpu[0]), true);
 
@@ -2681,7 +2806,7 @@ public:
             ret_event = execute_stage({ret_event},
                                       instance,
                                       *grouped_gemm_prefill_gather,
-                                      {instance.input_memory_ptr(static_cast<size_t>(MOE3GemmInputIndex::HIDDEN_STATES)),
+                                      {hidden_states_mem_ptr,
                                        intermediates_memories[MOE_INTERNAL_BUFFER_TOKEN_IDX_PER_EXPERT]},
                                       {scratch.x},
                                       {static_cast<size_t>(total_gathered_tokens) * local_threads_count, 1, 1},
@@ -2787,15 +2912,171 @@ public:
             ret_event =
                 execute_stage({ret_event},
                               instance,
-                              *prefill_scatter_reduce_row_lut,
+                              *(scratch.prefill ? prefill_canonical_scatter : prefill_scatter_reduce_row_lut),
                               {intermediates_memories[MOE_INTERNAL_BUFFER_DOWN_OUTPUT], routing_mem_ptr, intermediates_memories[MOE_INTERNAL_BUFFER_ROW_LUT]},
-                              {final_hidden_states_mem_ptr},
+                              {scratch.prefill ? scratch.prefill->canonical : final_hidden_states_mem_ptr},
                               {static_cast<size_t>(token_num) * local_threads_count, 1, 1},
                               {local_threads_count, 1, 1},
                               true /*needs_completion_event*/);
         }
 
         return ret_event;
+    }
+
+    cldnn::event::ptr exec_les_prefill(const std::vector<cldnn::event::ptr>& events,
+                                     typed_primitive_inst<moe_3gemm_fused_compressed>& instance,
+                                     scratch_buffers& scratch, size_t token_count) {
+        auto& stream = instance.get_network().get_stream();
+        auto& engine = instance.get_network().get_engine();
+        const auto& config = instance.get_typed_desc<moe_3gemm_fused_compressed>()->_config;
+        const size_t top_k = config.top_k;
+        auto provider = std::dynamic_pointer_cast<moe::OffloadExpertWeightProvider>(_weight_provider);
+        OPENVINO_ASSERT(provider, "LES Prefill requires the offload provider");
+        provider->reset_les_cache();
+        std::array<std::shared_ptr<moe::OffloadExpertWeightProvider>, 2> banks;
+        const auto bank_capacity = moe_otd::plan_prefill_waves({}, config.num_expert, resident_slot_count()).bank_capacity;
+        for (size_t bank = 0, offset = 0; bank < banks.size(); ++bank) {
+            if (bank_capacity[bank]) {
+                banks[bank] = provider->make_les_bank(bank_capacity[bank], offset);
+                banks[bank]->set_les_context(_les_owner, instance.get_network().get_les_epoch());
+                banks[bank]->bind(instance._weights);
+                offset += bank_capacity[bank];
+            }
+        }
+        scratch.prefill = std::make_shared<prefill_execution>();
+        if (use_grouped_gemm_prefill || use_micro_gemm_prefill) {
+            scratch.prefill->canonical = engine.allocate_memory(layout(
+                ov::Shape{std::min(token_count, prefill_chunk_tokens) * top_k, static_cast<size_t>(_hidden_size)},
+                data_types::f16, format::bfyx));
+        }
+        auto original_ids = scratch.topk_id;
+        auto original_weights = scratch.topk_weights;
+        auto view = [&](const memory::ptr& source, size_t start, size_t rows, size_t columns) {
+            auto shape = ov::Shape{rows, columns};
+            return engine.create_subbuffer(*source, layout(shape, source->get_layout().data_type, format::bfyx),
+                                           start * columns * data_type_traits::size_of(source->get_layout().data_type));
+        };
+        event::ptr result;
+        try {
+            stream.enqueue_barrier(events);
+            for (size_t start = 0; start < token_count; start += prefill_chunk_tokens) {
+                auto& execution = *scratch.prefill;
+                execution.tokens = std::min(prefill_chunk_tokens, token_count - start);
+                execution.hidden = view(instance.input_memory_ptr(0), start, execution.tokens, _hidden_size);
+                execution.output = view(instance.output_memory_ptr(0), start, execution.tokens, _hidden_size);
+                scratch.topk_id = view(original_ids, start, execution.tokens, top_k);
+                scratch.topk_weights = view(original_weights, start, execution.tokens, top_k);
+                if (!use_grouped_gemm_prefill && !use_micro_gemm_prefill) {
+                    execution.output->fill(stream, 0u);
+                }
+                std::vector<uint32_t> routed(execution.tokens * top_k);
+                scratch.topk_id->copy_to(stream, routed.data(), 0, 0, routed.size() * sizeof(uint32_t), true);
+                auto plan = moe_otd::plan_prefill_waves(routed, config.num_expert, resident_slot_count());
+                std::array<std::optional<moe::ExpertDemand>, 2> demands;
+                for (size_t wave_index = 0; wave_index < plan.waves.size(); ++wave_index) {
+                    const auto& wave = plan.waves[wave_index];
+                    auto bank = wave.bank;
+                    if (!demands[bank]) {
+                        demands[bank] = banks[bank]->begin_les_demand(wave.experts);
+                    }
+                    OPENVINO_ASSERT(demands[bank], "LES Prefill wave reservation failed");
+                    banks[bank]->finish_les_demand(stream);
+                    if (wave_index + 1 < plan.waves.size() && plan.waves[wave_index + 1].bank != bank) {
+                        const auto& next = plan.waves[wave_index + 1];
+                        demands[next.bank] = banks[next.bank]->begin_les_demand(next.experts);
+                        OPENVINO_ASSERT(demands[next.bank], "LES Prefill lookahead reservation failed");
+                    }
+                    execution.gather_tokens.clear();
+                    execution.expert_ids.clear();
+                    execution.starts.clear();
+                    execution.lengths.clear();
+                    execution.offsets.assign(resident_slot_count(), 0);
+                    execution.row_lut.assign(routed.size(), -1);
+                    execution.routed_experts = wave.experts;
+                    execution.resident_slots = demands[bank]->slots;
+                    for (size_t slot = 0; slot < resident_slot_count(); ++slot) {
+                        for (size_t index = 0; index < wave.experts.size(); ++index) {
+                            if (demands[bank]->slots[index] != slot) {
+                                continue;
+                            }
+                            auto offset = execution.gather_tokens.size();
+                            for (auto pair : wave.pairs) {
+                                if (routed[pair] == wave.experts[index]) {
+                                    execution.row_lut[pair] = static_cast<int32_t>(execution.gather_tokens.size());
+                                    execution.gather_tokens.push_back(static_cast<int32_t>(pair / top_k));
+                                }
+                            }
+                            execution.expert_ids.push_back(static_cast<int32_t>(slot));
+                            execution.starts.push_back(static_cast<int32_t>(offset));
+                            execution.lengths.push_back(static_cast<int32_t>(execution.gather_tokens.size() - offset));
+                        }
+                        execution.offsets[slot] = static_cast<int32_t>(execution.gather_tokens.size());
+                    }
+                    if (use_micro_gemm_prefill) {
+                        result = exec_prefill_micro_gemm({}, instance, scratch, false);
+                    } else if (use_grouped_gemm_prefill) {
+                        result = exec_prefill_grouped_gemm({}, stream, instance, scratch);
+                    } else {
+                        result = exec_prefill_onednn({}, stream, instance, scratch);
+                    }
+                    banks[bank]->set_consumer(result);
+                    stream.flush();
+                    demands[bank].reset();
+                    if (auto* perf = moe_otd::get_perf_counters()) {
+                        perf->les_prefill_waves.fetch_add(1, std::memory_order_relaxed);
+                        perf->les_prefill_pairs.fetch_add(wave.pairs.size(), std::memory_order_relaxed);
+                        auto& path = use_micro_gemm_prefill ? perf->les_prefill_micro_waves :
+                                     use_grouped_gemm_prefill ? perf->les_prefill_grouped_waves : perf->les_prefill_per_expert_waves;
+                        path.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+                if (use_grouped_gemm_prefill || use_micro_gemm_prefill) {
+                    std::vector<int32_t> identity(routed.size());
+                    std::iota(identity.begin(), identity.end(), 0);
+                    const auto& lut = instance.get_intermediates_memories()[MOE_INTERNAL_BUFFER_ROW_LUT];
+                    lut->copy_from(stream, identity.data(), 0, 0, identity.size() * sizeof(int32_t), true);
+                    auto [local, batches, unused] = calc_thread_count(const_cast<RuntimeParams&>(*instance.get_impl_params()), 4, _hidden_size);
+                    result = execute_stage({result}, instance, *prefill_scatter_reduce_row_lut,
+                                           {execution.canonical, scratch.topk_weights, lut}, {execution.output},
+                                           {execution.tokens * local, 1, 1}, {local, 1, 1}, true);
+                }
+                if (_has_shared_expert) {
+                    result->wait();
+                    init_shared_primitives(engine, scratch.moe_fusion_wei_addr, static_cast<int>(execution.tokens));
+                    execute_shared_expert(stream.get_onednn_stream(), static_cast<int>(execution.tokens),
+                                          execution.hidden, execution.output, scratch);
+                    result = stream.enqueue_marker({});
+                }
+                stream.flush();
+                result->wait();
+                for (const auto& event : execution.trace_events) {
+                    auto* native = dynamic_cast<cldnn::ocl::ocl_event*>(event.get());
+                    OPENVINO_ASSERT(native, "LES Prefill trace requires native kernel events");
+                    moe_otd::les_trace_interval("prefill_micro",
+                        native->get().getProfilingInfo<CL_PROFILING_COMMAND_START>(),
+                        native->get().getProfilingInfo<CL_PROFILING_COMMAND_END>());
+                }
+                execution.trace_events.clear();
+                if (auto* perf = moe_otd::get_perf_counters()) {
+                    perf->les_prefill_chunks.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            for (const auto& bank : banks) {
+                if (bank) {
+                    bank->release();
+                }
+            }
+        } catch (...) {
+            auto error = std::current_exception();
+            try { stream.finish(); } catch (...) {}
+            for (const auto& bank : banks) {
+                if (bank) {
+                    try { bank->release(); } catch (...) {}
+                }
+            }
+            std::rethrow_exception(error);
+        }
+        return result;
     }
 
     cldnn::event::ptr execute(const std::vector<cldnn::event::ptr>& events, cldnn::primitive_inst& ins) override {
@@ -2876,12 +3157,19 @@ public:
 
         auto [hidden_states_mem_ptr, hidden_states_layout] = get_input_info(instance, static_cast<size_t>(MOE3GemmInputIndex::HIDDEN_STATES));
         size_t token_num = get_seq_len(hidden_states_layout);
+        if (token_num == 0) {
+            return stream.enqueue_marker(events);
+        }
 
         bind_weights_on_first_exec(instance);
 
         scratch_buffers scratch;
         prepare_internal_buffers(instance, scratch, token_num);
         kernel_dump_info.clear_entries();
+        if (_les_owner && token_num > batched_gemv_threshold) {
+            update_rt_params(instance);
+            return exec_les_prefill(events, instance, scratch, token_num);
+        }
 
         // Batched GEMV: for small token counts (including single token, MTP/speculative decoding),
         // use optimized GEMV kernels with batch dimension. Avoids gather/scatter overhead.

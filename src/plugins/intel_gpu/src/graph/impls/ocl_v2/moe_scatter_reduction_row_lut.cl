@@ -41,13 +41,20 @@ KERNEL(moe_scatter_reduction_row_lut)(
 
         for (uint j = 0; j < BATCHES_PER_THREAD; j++) {
             INPUT_VEC_TYPE input_data = VLOAD(0, &input[in_base + j * VEC_BLK_SIZE]);
+#ifdef LES_CANONICAL_SCATTER
+            const uint pair_base = (token * ACTIVE_EXPERTS + k) * HIDDEN_SIZE + lane_base;
+            VSTORE(input_data, 0, &output[pair_base + j * VEC_BLK_SIZE]);
+#else
             input_data *= expert_weight;
             acc[j] += input_data;
+#endif
         }
     }
 
+#ifndef LES_CANONICAL_SCATTER
     const uint out_base = token * HIDDEN_SIZE + lane_base;
     for (uint j = 0; j < BATCHES_PER_THREAD; j++) {
         VSTORE(acc[j], 0, &output[out_base + j * VEC_BLK_SIZE]);
     }
+#endif
 }

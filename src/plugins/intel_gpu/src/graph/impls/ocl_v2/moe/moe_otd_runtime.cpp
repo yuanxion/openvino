@@ -16,6 +16,33 @@
 
 namespace ov::intel_gpu::ocl::moe_otd {
 
+PrefillWavePlan plan_prefill_waves(const std::vector<uint32_t>& routed_experts,
+                                 size_t num_experts,
+                                 size_t capacity) {
+    OPENVINO_ASSERT(capacity > 0 && num_experts > 0, "LES Prefill requires positive expert and slot counts");
+    PrefillWavePlan plan{{capacity / 2 + capacity % 2, capacity / 2}, {}};
+    std::vector<bool> active(num_experts, false);
+    for (auto expert : routed_experts) {
+        OPENVINO_ASSERT(expert < num_experts, "LES Prefill expert is out of range: ", expert);
+        active[expert] = true;
+    }
+    std::vector<size_t> expert_wave(num_experts);
+    for (size_t expert = 0; expert < num_experts; ++expert) {
+        if (!active[expert]) {
+            continue;
+        }
+        if (plan.waves.empty() || plan.waves.back().experts.size() == plan.bank_capacity[plan.waves.back().bank]) {
+            plan.waves.push_back({capacity == 1 ? 0 : plan.waves.size() % 2, {}, {}});
+        }
+        expert_wave[expert] = plan.waves.size() - 1;
+        plan.waves.back().experts.push_back(static_cast<uint32_t>(expert));
+    }
+    for (size_t pair = 0; pair < routed_experts.size(); ++pair) {
+        plan.waves[expert_wave[routed_experts[pair]]].pairs.push_back(pair);
+    }
+    return plan;
+}
+
 bool les_trace_enabled() {
     static const bool enabled = [] {
         const auto* value = std::getenv("MOE_LES_TRACE");
@@ -69,6 +96,12 @@ void OtdPerfCounters::dump() const {
                    << ", les_upload_chunks=" << les_upload_chunks.load(std::memory_order_relaxed)
                    << ", les_upload_bytes=" << les_upload_bytes.load(std::memory_order_relaxed)
                    << ", les_waves=" << les_waves.load(std::memory_order_relaxed)
+                   << ", les_prefill_waves=" << les_prefill_waves.load(std::memory_order_relaxed)
+                   << ", les_prefill_pairs=" << les_prefill_pairs.load(std::memory_order_relaxed)
+                   << ", les_prefill_grouped_waves=" << les_prefill_grouped_waves.load(std::memory_order_relaxed)
+                   << ", les_prefill_micro_waves=" << les_prefill_micro_waves.load(std::memory_order_relaxed)
+                   << ", les_prefill_per_expert_waves=" << les_prefill_per_expert_waves.load(std::memory_order_relaxed)
+                   << ", les_prefill_chunks=" << les_prefill_chunks.load(std::memory_order_relaxed)
                    << ", les_ready_pairs=" << les_ready_pairs.load(std::memory_order_relaxed)
                    << ", les_missing_pairs=" << les_missing_pairs.load(std::memory_order_relaxed)
                    << ", les_shared_pairs=" << les_shared_pairs.load(std::memory_order_relaxed)

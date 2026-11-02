@@ -78,6 +78,8 @@ public:
 
     void release() override;
     std::shared_ptr<IExpertWeightProvider> clone() const override;
+    std::shared_ptr<OffloadExpertWeightProvider> make_les_bank(size_t capacity, size_t slot_offset) const;
+    void reset_les_cache();
     void set_les_context(cldnn::les_context* context, uint64_t epoch) override;
     void set_consumer(cldnn::event::ptr consumer) override;
     std::optional<ExpertDemand> begin_les_demand(const std::vector<uint32_t>& experts) override;
@@ -101,6 +103,7 @@ public:
 
 private:
     size_t _capacity = 0;
+    size_t _slot_offset = 0;
     cldnn::MOECompressed::Config _config{};
     std::vector<size_t> _weight_bin_offsets;
     std::filesystem::path _weights_path;
@@ -125,6 +128,7 @@ private:
     uint64_t _prefetch_uploaded_bytes = 0;
     size_t _prefetch_expert_bytes = 0;
     void resolve_prefetch(const std::vector<uint32_t>& experts, bool schedule = true);
+    ExpertSlotLease physical_slots(ExpertSlotLease slots) const;
     std::optional<ExpertSlotLease> acquire_les(const std::vector<uint32_t>& experts, cldnn::stream& stream);
 };
 
