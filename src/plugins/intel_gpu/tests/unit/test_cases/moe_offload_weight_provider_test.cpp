@@ -390,6 +390,46 @@ TEST_F(moe_les_upload, provider_cancelled_epoch_releases_queued_reservation) {
     ASSERT_TRUE(provider.try_acquire_simultaneous({0}, *compute));
     provider.release();
 }
+
+TEST_F(moe_les_upload, rejected_speculation_releases_reservation_without_upload) {
+    std::vector<uint8_t> file(32, 7);
+    std::fill(file.begin() + 16, file.end(), 11);
+    write(file);
+    MOECompressed::Config config{};
+    config.num_expert = 2;
+    OffloadExpertWeightProvider provider(1, config, std::vector<size_t>(9), path);
+    moe_weights weights;
+    weights.gate_w = buffer(16, data_types::u8, 2);
+    provider.bind(weights);
+    auto compute = lane();
+    std::vector<uint8_t> sentinel(16, 77);
+    weights.gate_w->copy_from(*compute, sentinel.data(), 0, 0, sentinel.size(), true);
+    cldnn::les_context context(1, lane());
+    auto epoch = context.begin_epoch();
+    provider.set_les_context(&context, epoch);
+    std::promise<void> release;
+    std::promise<void> started;
+    auto active = context.submit(epoch, [gate = release.get_future().share(), &started] {
+        started.set_value();
+        gate.wait();
+    });
+    EXPECT_EQ(started.get_future().wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    auto queued = context.submit(epoch, [] {});
+    auto speculative = std::async(std::launch::async, [&] { provider.prefetch_les_demand({1}, *compute); });
+    const auto status = speculative.wait_for(std::chrono::seconds(5));
+    release.set_value();
+    EXPECT_EQ(status, std::future_status::ready);
+    EXPECT_NO_THROW(speculative.get());
+    EXPECT_NO_THROW(active.completion.get());
+    EXPECT_NO_THROW(queued.completion.get());
+    std::vector<uint8_t> actual(16);
+    weights.gate_w->copy_to(*compute, actual.data(), 0, 0, actual.size(), true);
+    EXPECT_EQ(actual, sentinel);
+    ASSERT_TRUE(provider.try_acquire_simultaneous({1}, *compute));
+    weights.gate_w->copy_to(*compute, actual.data(), 0, 0, actual.size(), true);
+    EXPECT_EQ(actual, std::vector<uint8_t>(16, 11));
+    provider.release();
+}
 }  // namespace
 
 TEST(moe_expert_weight_provider, resident_is_identity) {

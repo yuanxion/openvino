@@ -1,5 +1,6 @@
 #include "intel_gpu/runtime/les_context.hpp"
 
+#include <algorithm>
 #include <utility>
 
 namespace cldnn {
@@ -60,24 +61,50 @@ uint64_t les_context::begin_epoch() {
 }
 
 les_context::ticket les_context::submit(uint64_t epoch, std::function<void()> work) {
+    return *submit_task(epoch, std::move(work), false);
+}
+
+std::optional<les_context::ticket> les_context::try_submit_speculative(uint64_t epoch, std::function<void()> work) {
+    return submit_task(epoch, std::move(work), true);
+}
+
+std::optional<les_context::ticket> les_context::submit_task(uint64_t epoch, std::function<void()> work, bool speculative) {
     check_control_thread();
     if (!work) {
         throw std::invalid_argument("LES requires a nonempty copy task");
     }
     std::unique_lock<std::mutex> lock(_mutex);
-    _changed.wait(lock, [this, epoch] {
-        return _stopping || epoch != _epoch || _error || (!_invalidating && _pending.size() < _capacity);
-    });
+    if (!speculative) {
+        _changed.wait(lock, [this, epoch] {
+            return _stopping || epoch != _epoch || _error ||
+                   (!_invalidating && (_pending.size() < _capacity ||
+                    std::any_of(_pending.begin(), _pending.end(), [](const task& pending) { return pending.speculative; })));
+        });
+    }
     if (_stopping || epoch != _epoch) {
         throw les_task_cancelled{};
     }
     if (_error) {
         std::rethrow_exception(_error);
     }
-    task pending{epoch, std::move(work), {}};
+    if (speculative && (_invalidating || _pending.size() == _capacity)) {
+        return std::nullopt;
+    }
+    std::optional<task> discarded;
+    if (_pending.size() == _capacity) {
+        auto candidate = std::find_if(_pending.begin(), _pending.end(), [](const task& pending) { return pending.speculative; });
+        discarded.emplace(std::move(*candidate));
+        _pending.erase(candidate);
+    }
+    task pending{epoch, speculative, std::move(work), {}};
     ticket result{epoch, pending.completion.get_future().share()};
-    _pending.push_back(std::move(pending));
+    auto position = speculative ? _pending.end() :
+        std::find_if(_pending.begin(), _pending.end(), [](const task& queued) { return queued.speculative; });
+    _pending.insert(position, std::move(pending));
     lock.unlock();
+    if (discarded) {
+        discarded->completion.set_exception(std::make_exception_ptr(les_task_cancelled{}));
+    }
     _changed.notify_all();
     return result;
 }
@@ -132,7 +159,7 @@ void les_context::run() {
             std::lock_guard<std::mutex> lock(_mutex);
             if (_stopping || current.epoch != _epoch) {
                 error = std::make_exception_ptr(les_task_cancelled{});
-            } else if (error) {
+            } else if (error && !current.speculative) {
                 _error = error;
                 failed.swap(_pending);
             }
