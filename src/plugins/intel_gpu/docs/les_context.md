@@ -650,6 +650,13 @@ one final weighted reduction runs in original rank order. The per-expert path
 keeps ascending-expert index-add order rather than accumulating wave partial
 sums. Shared expert execution occurs once per token chunk, after routed output.
 
+Grouped selection preserves the legacy OTD capacity rule: actual unique experts
+across the entire Prefill, not configured expert count or per-wave count, must
+fit the original resident capacity. Otherwise LES uses per-expert arithmetic
+inside bounded waves, preserving fused routing weights and ascending-expert
+accumulation. Sparse routing that fits still uses grouped waves. Micro-GEMM
+selection is unchanged. No cross-path bitwise equivalence is assumed.
+
 The two banks partition the existing resident slot count, including odd counts;
 they do not each receive a full-capacity allocation. Capacity one advances
 serially. Bank providers return absolute slots in the same weight allocation.
@@ -759,7 +766,8 @@ capacity; LES instead executes grouped waves. Forcing Demand to per-expert
 restored text parity, localizing the observed divergence to path choice, not
 proving rounding rather than a kernel/layout defect. The earlier eight-token
 six-mode acceptance does not establish this longer-generation default gate.
-It remains an open numerical investigation; output checks were not relaxed.
+That historical failure is addressed by the capacity-selection correction below;
+output checks were not relaxed.
 
 A separate explicit per-expert four-mode OLMoE control passed 32-token text/count
 parity with wall means 4.938/6.786/7.133/6.842 s, Demand/Prefetch 37.4%/38.5%
@@ -768,6 +776,32 @@ slower than off. This is not a default-path PASS. Workspace reports are
 `les/results/perf_rca_olmoe_per_expert_20261102/performance.json` and the failed
 default driver `les/perf_rca_olmoe_driver.log`. All 16 successful processes used
 one verified GPU binary, ratio 80, 32 output tokens and no counter variable.
+
+### Default-Path Accuracy Follow-Up
+
+A fixed-input 48-token MoE regression at the original resident capacity reproduced
+16 bitwise failures against LES-off before the fix. LES had selected grouped
+waves where legacy OTD selected per-expert arithmetic. Whole-Prefill capacity
+selection now preserves that legacy rule. This fixes a path-compatibility
+regression, not proof that all grouped differences are harmless rounding.
+Cross-path intermediate/logit equivalence is not certified.
+
+Grouped tests passed 56/56, including sparse-fit and full-capacity grouped
+counters, overflow per-expert counters, U4/U8, both Routers, changing routes and
+repeated bitwise legacy comparisons. Shared-expert tests passed 12/12 with
+same-arithmetic full-capacity controls and unchanged original numerical checks.
+Full focused regression passed 571/571 in 37 suites, zero failures/skips.
+Evidence is workspace `les/accuracy_*_results.xml`.
+
+The source plugin passed the previously failing default OLMoE workload: 267 input
+tokens, 32 output tokens, eight counterbalanced processes and 32 identical
+warmup/measured texts and counts. No grouped/micro override or counter variable
+was set. GPU SHA-256 was
+`9a29560e619e3af15dac3b2cae8a7fe4259411c6f61ffd30533add49cdd2180d`.
+Evidence is `les/results/accuracy_olmoe_default_20261102/performance.json`.
+Off/Demand/Predict/Prefetch wall means were 5.360/7.036/7.172/7.319 s;
+Demand/Prefetch remain 31.3%/36.6% slower. This closes the tested accuracy gate,
+not an acceleration claim or full-model quality certification. P7/P8 remain open.
 
 ## P7.1: Physical Pool Foundation (Not Enabled)
 

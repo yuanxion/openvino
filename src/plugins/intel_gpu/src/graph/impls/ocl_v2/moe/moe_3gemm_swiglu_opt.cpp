@@ -2949,11 +2949,7 @@ public:
             }
         }
         scratch.prefill = std::make_shared<prefill_execution>();
-        if (use_grouped_gemm_prefill || use_micro_gemm_prefill) {
-            scratch.prefill->canonical = engine.allocate_memory(layout(
-                ov::Shape{std::min(token_count, prefill_chunk_tokens) * top_k, static_cast<size_t>(_hidden_size)},
-                data_types::f16, format::bfyx));
-        }
+        bool use_grouped_prefill = use_grouped_gemm_prefill;
         auto original_ids = scratch.topk_id;
         auto original_weights = scratch.topk_weights;
         auto view = [&](const memory::ptr& source, size_t start, size_t rows, size_t columns) {
@@ -2964,6 +2960,18 @@ public:
         event::ptr result;
         try {
             stream.enqueue_barrier(events);
+            if (use_grouped_prefill && !use_micro_gemm_prefill) {
+                std::vector<uint32_t> routed(token_count * top_k);
+                original_ids->copy_to(stream, routed.data(), 0, 0, routed.size() * sizeof(uint32_t), true);
+                std::sort(routed.begin(), routed.end());
+                const auto unique_experts = static_cast<size_t>(std::unique(routed.begin(), routed.end()) - routed.begin());
+                use_grouped_prefill = unique_experts <= resident_slot_count();
+            }
+            if (use_grouped_prefill || use_micro_gemm_prefill) {
+                scratch.prefill->canonical = engine.allocate_memory(layout(
+                    ov::Shape{std::min(token_count, prefill_chunk_tokens) * top_k, static_cast<size_t>(_hidden_size)},
+                    data_types::f16, format::bfyx));
+            }
             for (size_t start = 0; start < token_count; start += prefill_chunk_tokens) {
                 auto& execution = *scratch.prefill;
                 execution.tokens = std::min(prefill_chunk_tokens, token_count - start);
@@ -2971,7 +2979,7 @@ public:
                 execution.output = view(instance.output_memory_ptr(0), start, execution.tokens, _hidden_size);
                 scratch.topk_id = view(original_ids, start, execution.tokens, top_k);
                 scratch.topk_weights = view(original_weights, start, execution.tokens, top_k);
-                if (!use_grouped_gemm_prefill && !use_micro_gemm_prefill) {
+                if (!use_grouped_prefill && !use_micro_gemm_prefill) {
                     execution.output->fill(stream, 0u);
                 }
                 std::vector<uint32_t> routed(execution.tokens * top_k);
@@ -3019,7 +3027,7 @@ public:
                     }
                     if (use_micro_gemm_prefill) {
                         result = exec_prefill_micro_gemm({}, instance, scratch, false);
-                    } else if (use_grouped_gemm_prefill) {
+                    } else if (use_grouped_prefill) {
                         result = exec_prefill_grouped_gemm({}, stream, instance, scratch);
                     } else {
                         result = exec_prefill_onednn({}, stream, instance, scratch);
@@ -3031,11 +3039,11 @@ public:
                         perf->les_prefill_waves.fetch_add(1, std::memory_order_relaxed);
                         perf->les_prefill_pairs.fetch_add(wave.pairs.size(), std::memory_order_relaxed);
                         auto& path = use_micro_gemm_prefill ? perf->les_prefill_micro_waves :
-                                     use_grouped_gemm_prefill ? perf->les_prefill_grouped_waves : perf->les_prefill_per_expert_waves;
+                                     use_grouped_prefill ? perf->les_prefill_grouped_waves : perf->les_prefill_per_expert_waves;
                         path.fetch_add(1, std::memory_order_relaxed);
                     }
                 }
-                if (use_grouped_gemm_prefill || use_micro_gemm_prefill) {
+                if (use_grouped_prefill || use_micro_gemm_prefill) {
                     std::vector<int32_t> identity(routed.size());
                     std::iota(identity.begin(), identity.end(), 0);
                     const auto& lut = instance.get_intermediates_memories()[MOE_INTERNAL_BUFFER_ROW_LUT];

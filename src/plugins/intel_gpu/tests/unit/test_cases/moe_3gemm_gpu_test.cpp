@@ -437,6 +437,7 @@ struct Moe3GemmTestParams {
     bool proxy_prefetch = false;
     bool prefill_waves = false;
     int prefill_path = 0;
+    bool prefill_sparse = false;
 };
 
 class scoped_moe_env {
@@ -510,7 +511,7 @@ TEST_P(moe_3gemm_compressed_gpu_random, moe_accuracy_test_random) {
     auto routing_weights = rg.generate_random_1d<ov::float16>(config.batch_size * config.seq_len * config.num_experts, 0.0f, 1.0f, 1000);
     if (param.prefill_waves) {
         for (size_t index = 0; index < routing_weights.size(); ++index) {
-            auto rank = (index % config.num_experts + index / config.num_experts) % config.num_experts;
+            auto rank = (index % config.num_experts + (param.prefill_sparse ? 0 : index / config.num_experts)) % config.num_experts;
             routing_weights[index] = ov::float16(static_cast<float>(rank) - config.num_experts / 2.0f);
         }
     }
@@ -924,6 +925,8 @@ TEST_P(moe_3gemm_compressed_gpu_random, moe_accuracy_test_random) {
 
     std::unique_ptr<cldnn::network> unsplit;
     std::unique_ptr<cldnn::network> legacy_prefill;
+    const bool grouped_fallback = param.prefill_waves && param.prefill_path == 2 && !param.prefill_sparse &&
+                                  param.lru_expert_num < config.num_experts;
     if (param.enable_les && param.lru_expert_num > 0 && (param.seq_len <= 32 || param.prefill_waves)) {
         cldnn::topology baseline_topology;
         for (const auto& entry : topology.get_primitives()) {
@@ -938,6 +941,15 @@ TEST_P(moe_3gemm_compressed_gpu_random, moe_accuracy_test_random) {
         if (param.prefill_waves && param.seq_len > 128) {
             legacy_prefill = std::make_unique<cldnn::network>(engine, baseline_topology, baseline_config);
             legacy_prefill->set_input_data("hidden_states", hidden_states_mem);
+            baseline_config.set_property(ov::intel_gpu::enable_les(true));
+        } else if (param.prefill_waves && param.prefill_path == 2 && param.seq_len == 48) {
+            legacy_prefill = std::make_unique<cldnn::network>(engine, topology, baseline_config);
+            legacy_prefill->set_input_data("hidden_states", hidden_states_mem);
+        }
+        if (grouped_fallback) {
+            baseline_config.set_property(ov::intel_gpu::moe_use_grouped_gemm_prefill(false), ov::intel_gpu::enable_les(true));
+        }
+        if (param.prefill_waves && param.prefill_path == 2) {
             baseline_config.set_property(ov::intel_gpu::enable_les(true));
         }
         unsplit = std::make_unique<cldnn::network>(engine, baseline_topology, baseline_config);
@@ -1006,7 +1018,7 @@ TEST_P(moe_3gemm_compressed_gpu_random, moe_accuracy_test_random) {
         auto alternate_routing = routing_weights;
         for (size_t index = 0; index < alternate_routing.size(); ++index) {
             if (param.prefill_waves) {
-                auto rank = (index % config.num_experts + index / config.num_experts + 1) % config.num_experts;
+                auto rank = (index % config.num_experts + (param.prefill_sparse ? 0 : index / config.num_experts) + 1) % config.num_experts;
                 alternate_routing[index] = ov::float16(static_cast<float>(rank) - config.num_experts / 2.0f);
             } else {
                 alternate_routing[index] = ov::float16(index % config.num_experts >= 2 ? 8.0f : -8.0f);
@@ -1057,7 +1069,7 @@ TEST_P(moe_3gemm_compressed_gpu_random, moe_accuracy_test_random) {
         auto path_waves = [&]() -> uint64_t {
             if (!perf) return 0;
             if (param.prefill_path == 3) return perf->les_prefill_micro_waves.load();
-            if (param.prefill_path == 2) return perf->les_prefill_grouped_waves.load();
+            if (param.prefill_path == 2 && !grouped_fallback) return perf->les_prefill_grouped_waves.load();
             return perf->les_prefill_per_expert_waves.load();
         };
         auto previous_path_waves = path_waves();
@@ -1096,6 +1108,10 @@ TEST_P(moe_3gemm_compressed_gpu_random, moe_accuracy_test_random) {
             auto legacy_output = legacy_prefill->execute().begin()->second.get_memory();
             cldnn::mem_lock<ov::float16, mem_lock_type::read> legacy_values(legacy_output, legacy_prefill->get_stream());
             for (size_t index = 0; index < expected.size(); ++index) {
+                if (param.prefill_path == 2 && config.seq_len == 48) {
+                    ASSERT_EQ(std::memcmp(&output_ptr[index], &legacy_values[index], sizeof(ov::float16)), 0)
+                        << "Legacy grouped OTD fallback mismatch at " << index << ", iteration " << iteration;
+                }
                 ASSERT_NEAR(static_cast<float>(output_ptr[index]), static_cast<float>(legacy_values[index]), tolerance)
                     << "Legacy Prefill path mismatch " << index;
             }
@@ -1180,13 +1196,17 @@ INSTANTIATE_TEST_SUITE_P(smoke_les_p6_grouped,
             std::vector<Moe3GemmTestParams> parameters;
             for (size_t tokens : {48U, 257U}) {
                 for (bool u4 : {false, true}) {
-                    for (size_t capacity : {1U, 3U}) {
+                    for (size_t capacity : {1U, 3U, 6U}) {
                         Moe3GemmTestParams parameter{tokens, u4, 128, 128, 6, 3, 128, false, capacity, true};
                         parameter.prefill_waves = true;
                         parameter.prefill_path = 2;
                         parameters.push_back(parameter);
                         parameter.profiling = true;
                         parameters.push_back(parameter);
+                        if (capacity == 3) {
+                            parameter.prefill_sparse = true;
+                            parameters.push_back(parameter);
+                        }
                     }
                 }
             }
@@ -1584,7 +1604,7 @@ TEST_P(moe_3gemm_compressed_gpu_shared_random, moe_accuracy_test_shared_expert_r
         split_config.set_property({ov::intel_gpu::enable_les(true), ov::intel_gpu::offload_ratio(50),
                                    ov::enable_profiling(param.profiling), ov::num_streams(1)});
         std::unique_ptr<cldnn::network> full_capacity;
-        if (param.prefill_waves && param.seq_len > 128) {
+        if (param.prefill_waves && (param.seq_len > 128 || param.prefill_path == 2)) {
             auto full = offloaded;
             full._otd.lru_expert_num = config.num_experts;
             cldnn::topology full_topology;
@@ -1592,7 +1612,11 @@ TEST_P(moe_3gemm_compressed_gpu_shared_random, moe_accuracy_test_shared_expert_r
                 if (entry.first != full.id) full_topology.add_primitive(entry.second);
             }
             full_topology.add(full);
-            full_capacity = std::make_unique<cldnn::network>(engine, full_topology, split_config);
+            auto full_config = split_config.clone();
+            if (param.prefill_path == 2 && param.lru_expert_num < config.num_experts) {
+                full_config.set_property(ov::intel_gpu::moe_use_grouped_gemm_prefill(false));
+            }
+            full_capacity = std::make_unique<cldnn::network>(engine, full_topology, full_config);
             full_capacity->set_input_data("hidden_states", hidden_states_mem);
             full_capacity->set_input_data("routing_weights", routing_weights_mem);
         }
