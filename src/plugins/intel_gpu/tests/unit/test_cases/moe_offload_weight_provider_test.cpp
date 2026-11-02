@@ -47,6 +47,162 @@ protected:
     }
 };
 
+TEST_F(moe_les_upload, pool_budget_counts_all_components_and_reuses_only_after_consumer) {
+    using Pool = ov::intel_gpu::ocl::moe::ExpertWeightMemoryPool;
+    Pool::Descriptor descriptor;
+    descriptor.num_experts = 4;
+    descriptor.slots = 2;
+    for (size_t component = 0; component < 9; ++component) {
+        descriptor.logical_layouts[component] = layout{data_types::u8, format::bfyx,
+            {4, 1, 1, component < 3 ? 16 : component < 6 ? 4 : 2}};
+    }
+    Pool pool(get_test_engine(), 132);
+    auto lease = pool.try_acquire(descriptor);
+    ASSERT_TRUE(lease);
+    EXPECT_EQ(lease->physical_bytes, 132U);
+    EXPECT_EQ(lease->weights.gate_w->size(), 64U);
+    ASSERT_NE(lease->weights.gate_w->get_mem_tracker(), nullptr);
+    EXPECT_EQ(lease->weights.gate_w->get_mem_tracker()->size(), 32U);
+    EXPECT_EQ(lease->weights.gate_w->get_layout().bytes_count(), 64U);
+    EXPECT_EQ(pool.statistics().leased_bytes, 132U);
+    EXPECT_FALSE(pool.try_acquire(descriptor));
+    auto stale = *lease;
+    auto original = lease->weights.gate_w;
+    cl::UserEvent gate(dynamic_cast<cldnn::ocl::ocl_engine&>(get_test_engine()).get_cl_context());
+    auto consumer = std::make_shared<cldnn::ocl::ocl_event>(gate);
+    EXPECT_TRUE(pool.release(*lease, consumer));
+    EXPECT_EQ(lease->id, 0U);
+    EXPECT_EQ(pool.statistics().fence_held_bytes, 132U);
+    EXPECT_FALSE(pool.try_acquire(descriptor));
+    gate.setStatus(CL_COMPLETE);
+    auto reused = pool.try_acquire(descriptor);
+    ASSERT_TRUE(reused);
+    EXPECT_NE(reused->id, stale.id);
+    EXPECT_EQ(reused->weights.gate_w, original);
+    EXPECT_FALSE(pool.release(stale, consumer));
+    EXPECT_EQ(pool.statistics().allocations, 1U);
+    EXPECT_EQ(pool.statistics().reuses, 1U);
+    EXPECT_EQ(pool.statistics().allocated_bytes, 132U);
+    EXPECT_TRUE(pool.release(*reused, consumer));
+}
+
+TEST_F(moe_les_upload, pool_layout_classes_budget_and_owner_are_isolated) {
+    using Pool = ov::intel_gpu::ocl::moe::ExpertWeightMemoryPool;
+    Pool::Descriptor descriptor;
+    descriptor.num_experts = 2;
+    descriptor.slots = 1;
+    descriptor.logical_layouts[0] = layout{data_types::u8, format::bfyx, {2, 1, 1, 16}};
+    Pool pool(get_test_engine(), 32);
+    Pool other(get_test_engine(), 16);
+    Pool disabled(get_test_engine(), 0);
+    auto lease = pool.try_acquire(descriptor);
+    auto independent = other.try_acquire(descriptor);
+    ASSERT_TRUE(lease);
+    ASSERT_TRUE(independent);
+    EXPECT_FALSE(disabled.try_acquire(descriptor));
+    auto compute = lane();
+    auto consumer = compute->enqueue_marker({});
+    compute->flush();
+    consumer->wait();
+    EXPECT_FALSE(other.release(*lease, consumer));
+    EXPECT_TRUE(pool.release(*lease, consumer));
+    auto signed_descriptor = descriptor;
+    signed_descriptor.logical_layouts[0] = layout{data_types::i8, format::bfyx, {2, 1, 1, 16}};
+    auto signed_lease = pool.try_acquire(signed_descriptor);
+    ASSERT_TRUE(signed_lease);
+    EXPECT_EQ(pool.statistics().allocations, 2U);
+    auto changed = descriptor;
+    changed.logical_layouts[3] = layout{data_types::f16, format::bfyx, {2, 1, 1, 1}};
+    EXPECT_FALSE(pool.try_acquire(changed));
+    changed = descriptor;
+    changed.logical_layouts[0] = layout{data_types::u8, format::bfyx, {2, 1, 2, 8}};
+    EXPECT_FALSE(pool.try_acquire(changed));
+    EXPECT_TRUE(pool.release(*signed_lease, consumer));
+    EXPECT_TRUE(other.release(*independent, consumer));
+    EXPECT_EQ(pool.statistics().allocated_bytes, 32U);
+}
+
+TEST_F(moe_les_upload, pool_rejects_invalid_descriptors_and_missing_fences) {
+    using Pool = ov::intel_gpu::ocl::moe::ExpertWeightMemoryPool;
+    Pool pool(get_test_engine(), 16);
+    Pool::Descriptor descriptor;
+    EXPECT_ANY_THROW(pool.try_acquire(descriptor));
+    descriptor.num_experts = 2;
+    descriptor.slots = 1;
+    EXPECT_ANY_THROW(pool.try_acquire(descriptor));
+    descriptor.logical_layouts[0] = layout{data_types::u8, format::bfyx, {3, 1, 1, 16}};
+    EXPECT_ANY_THROW(pool.try_acquire(descriptor));
+    descriptor.logical_layouts[0] = layout{data_types::u8, format::bfyx, {2, 1, 1, 16}};
+    auto lease = pool.try_acquire(descriptor);
+    ASSERT_TRUE(lease);
+    EXPECT_ANY_THROW(pool.release(*lease, nullptr));
+    EXPECT_EQ(pool.statistics().leased_bytes, 16U);
+    cl::Context foreign_context(dynamic_cast<cldnn::ocl::ocl_engine&>(get_test_engine())
+                                    .get_cl_context().getInfo<CL_CONTEXT_DEVICES>());
+    cl::UserEvent foreign_gate(foreign_context);
+    EXPECT_ANY_THROW(pool.release(*lease, std::make_shared<cldnn::ocl::ocl_event>(foreign_gate)));
+    foreign_gate.setStatus(CL_COMPLETE);
+    EXPECT_EQ(pool.statistics().leased_bytes, 16U);
+    auto compute = lane();
+    auto consumer = compute->enqueue_marker({});
+    compute->flush();
+    EXPECT_TRUE(pool.release(*lease, consumer));
+    EXPECT_FALSE(pool.release(*lease, consumer));
+    descriptor.slots = 3;
+    EXPECT_ANY_THROW(pool.try_acquire(descriptor));
+    descriptor.slots = 1;
+    descriptor.logical_layouts[0] = layout{data_types::u8, format::yxfb, {2, 1, 1, 16}};
+    EXPECT_ANY_THROW(pool.try_acquire(descriptor));
+}
+
+TEST_F(moe_les_upload, pool_destruction_drains_released_native_consumer) {
+    using Pool = ov::intel_gpu::ocl::moe::ExpertWeightMemoryPool;
+    auto pool = std::make_unique<Pool>(get_test_engine(), 16);
+    Pool::Descriptor descriptor;
+    descriptor.num_experts = 2;
+    descriptor.slots = 1;
+    descriptor.logical_layouts[0] = layout{data_types::u8, format::bfyx, {2, 1, 1, 16}};
+    auto lease = pool->try_acquire(descriptor);
+    ASSERT_TRUE(lease);
+    cl::UserEvent gate(dynamic_cast<cldnn::ocl::ocl_engine&>(get_test_engine()).get_cl_context());
+    EXPECT_TRUE(pool->release(*lease, std::make_shared<cldnn::ocl::ocl_event>(gate)));
+    std::promise<void> entered;
+    auto destroying = std::async(std::launch::async, [owned = std::move(pool), &entered]() mutable {
+        entered.set_value();
+        owned.reset();
+    });
+    entered.get_future().wait();
+    auto status = destroying.wait_for(std::chrono::milliseconds(20));
+    gate.setStatus(CL_COMPLETE);
+    EXPECT_NO_THROW(destroying.get());
+    EXPECT_EQ(status, std::future_status::timeout);
+}
+
+TEST_F(moe_les_upload, pool_concurrent_admission_cannot_exceed_budget) {
+    using Pool = ov::intel_gpu::ocl::moe::ExpertWeightMemoryPool;
+    Pool pool(get_test_engine(), 16);
+    Pool::Descriptor descriptor;
+    descriptor.num_experts = 2;
+    descriptor.slots = 1;
+    descriptor.logical_layouts[0] = layout{data_types::u8, format::bfyx, {2, 1, 1, 16}};
+    auto first = std::async(std::launch::async, [&] { return pool.try_acquire(descriptor); });
+    auto second = std::async(std::launch::async, [&] { return pool.try_acquire(descriptor); });
+    auto first_lease = first.get();
+    auto second_lease = second.get();
+    EXPECT_NE(first_lease.has_value(), second_lease.has_value());
+    EXPECT_EQ(pool.statistics().allocated_bytes, 16U);
+    EXPECT_EQ(pool.statistics().allocations, 1U);
+    auto compute = lane();
+    auto consumer = compute->enqueue_marker({});
+    compute->flush();
+    if (first_lease) {
+        EXPECT_TRUE(pool.release(*first_lease, consumer));
+    }
+    if (second_lease) {
+        EXPECT_TRUE(pool.release(*second_lease, consumer));
+    }
+}
+
 TEST_F(moe_les_upload, all_nine_components_are_ready_and_repacked) {
     MOECompressed::Config config{};
     config.num_expert = 2;

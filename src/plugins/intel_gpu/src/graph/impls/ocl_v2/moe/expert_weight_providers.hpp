@@ -6,9 +6,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <array>
 #include <filesystem>
 #include <future>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -19,6 +22,57 @@
 #include "moe_otd_runtime.hpp"
 
 namespace ov::intel_gpu::ocl::moe {
+
+class ExpertWeightMemoryPool {
+public:
+    struct Descriptor {
+        std::array<std::optional<cldnn::layout>, 9> logical_layouts;
+        size_t num_experts = 0;
+        size_t slots = 0;
+    };
+    struct Lease {
+        uint64_t id = 0;
+        cldnn::moe_weights weights;
+        size_t physical_bytes = 0;
+
+    private:
+        friend class ExpertWeightMemoryPool;
+        const ExpertWeightMemoryPool* owner = nullptr;
+    };
+    struct Statistics {
+        size_t budget_bytes;
+        size_t allocated_bytes;
+        size_t leased_bytes;
+        size_t fence_held_bytes;
+        uint64_t allocations;
+        uint64_t reuses;
+    };
+
+    ExpertWeightMemoryPool(cldnn::engine& engine, size_t budget_bytes);
+    ~ExpertWeightMemoryPool();
+    std::optional<Lease> try_acquire(const Descriptor& descriptor);
+    bool release(Lease& lease, cldnn::event::ptr consumer);
+    Statistics statistics() const;
+
+private:
+    struct Block {
+        Descriptor descriptor;
+        cldnn::moe_weights weights;
+        std::array<cldnn::memory::ptr, 9> allocations;
+        size_t bytes;
+        uint64_t id;
+        bool leased;
+        cldnn::event::ptr consumer;
+    };
+    cldnn::engine& _engine;
+    const size_t _budget_bytes;
+    mutable std::mutex _mutex;
+    std::vector<Block> _blocks;
+    size_t _allocated_bytes = 0;
+    uint64_t _next_id = 0;
+    uint64_t _allocations = 0;
+    uint64_t _reuses = 0;
+};
 
 // Identity provider: every expert's weights are already resident in device memory
 // for the network lifetime. This is the behaviour of the non-offloaded (ratio=0) path.
