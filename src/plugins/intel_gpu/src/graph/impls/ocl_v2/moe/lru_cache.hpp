@@ -27,7 +27,9 @@ public:
     };
 
     explicit ExpertSlotReservations(size_t capacity);
-    std::optional<Ticket> reserve(const std::vector<uint32_t>& experts, uint64_t epoch);
+    std::optional<Ticket> reserve(const std::vector<uint32_t>& experts, uint64_t epoch, bool speculative = false);
+    void discard_unused(const Ticket& ticket, const std::vector<uint32_t>& used);
+    bool rollback(const Ticket& ticket);
     bool complete(const Ticket& ticket);
     bool release(const Ticket& ticket);
 
@@ -42,6 +44,7 @@ private:
     struct Record {
         uint64_t epoch;
         std::vector<std::pair<size_t, uint64_t>> generations;
+        std::vector<std::pair<size_t, Slot>> replaced;
     };
     std::mutex _mutex;
     std::vector<Slot> _slots;

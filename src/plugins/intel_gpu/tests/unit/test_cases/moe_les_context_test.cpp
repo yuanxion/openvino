@@ -248,6 +248,50 @@ TEST(moe_les_scheduler, speculative_failure_does_not_poison_demand) {
     EXPECT_NO_THROW(context.wait());
 }
 
+TEST(moe_les_scheduler, pending_prefetch_promoted_to_demand_without_duplicate_work) {
+    cldnn::les_context context(3);
+    auto epoch = context.begin_epoch();
+    std::promise<void> release;
+    std::promise<void> started;
+    auto active = context.submit(epoch, [gate = release.get_future().share(), &started] {
+        started.set_value();
+        gate.wait();
+    });
+    EXPECT_EQ(started.get_future().wait_for(5s), std::future_status::ready);
+    std::vector<int> order;
+    auto first = context.try_submit_speculative(epoch, [&] { order.push_back(2); });
+    auto matched = context.try_submit_speculative(epoch, [&] { order.push_back(1); });
+    EXPECT_TRUE(context.promote(*matched));
+    EXPECT_FALSE(context.promote(*matched));
+    EXPECT_FALSE(context.cancel_pending(*matched));
+    release.set_value();
+    context.wait();
+    EXPECT_NO_THROW(active.completion.get());
+    EXPECT_NO_THROW(first->completion.get());
+    EXPECT_NO_THROW(matched->completion.get());
+    EXPECT_EQ(order, (std::vector<int>{1, 2}));
+}
+
+TEST(moe_les_scheduler, pending_cancel_does_not_cancel_active_upload) {
+    cldnn::les_context context(2);
+    auto epoch = context.begin_epoch();
+    std::promise<void> release;
+    std::promise<void> started;
+    auto active = context.try_submit_speculative(epoch, [gate = release.get_future().share(), &started] {
+        started.set_value();
+        gate.wait();
+    });
+    EXPECT_EQ(started.get_future().wait_for(5s), std::future_status::ready);
+    auto queued = context.try_submit_speculative(epoch, [] {});
+    EXPECT_FALSE(context.cancel_pending(*active));
+    EXPECT_TRUE(context.cancel_pending(*queued));
+    EXPECT_FALSE(context.cancel_pending(*queued));
+    release.set_value();
+    EXPECT_NO_THROW(active->completion.get());
+    EXPECT_THROW(queued->completion.get(), cldnn::les_task_cancelled);
+    EXPECT_NO_THROW(context.wait());
+}
+
 TEST(moe_les_scheduler, epoch_rotation_discards_pending_speculation) {
     cldnn::les_context context(2);
     auto epoch = context.begin_epoch();
