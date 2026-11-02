@@ -10,6 +10,7 @@
 #include "intel_gpu/primitives/loop.hpp"
 #include "intel_gpu/primitives/data.hpp"
 #include "intel_gpu/primitives/fully_connected.hpp"
+#include "intel_gpu/primitives/reshape.hpp"
 #include "intel_gpu/primitives/moe_router_fused.hpp"
 #include "intel_gpu/primitives/moe_3gemm_fused_compressed.hpp"
 #include "intel_gpu/graph/program.hpp"
@@ -173,11 +174,15 @@ protected:
                                                    bool variable_weights = false,
                                                    bool projection_bias = false,
                                                    bool wrong_router_ports = false,
-                                                   bool multiple_tokens = false) {
+                                                   bool multiple_tokens = false,
+                                                   bool dynamic_tokens = false) {
         auto program = make_program();
         cldnn::layout hidden_layout{ov::PartialShape{1, 1, 2}, cldnn::data_types::f16, cldnn::format::bfyx};
         if (multiple_tokens) {
             hidden_layout = cldnn::layout{ov::PartialShape{1, 2, 2}, cldnn::data_types::f16, cldnn::format::bfyx};
+        }
+        if (dynamic_tokens) {
+            hidden_layout = cldnn::layout{ov::PartialShape{1, -1, 2}, cldnn::data_types::f16, cldnn::format::bfyx};
         }
         auto& hidden = program->get_or_create(std::make_shared<cldnn::input_layout>("hidden", hidden_layout));
         auto hidden_output_layout = hidden_layout;
@@ -260,8 +265,34 @@ TEST_F(moe_les_chain, constant_projection_bias_is_described) {
     EXPECT_EQ(link.projection_bias, "projection_bias");
 }
 
+TEST_F(moe_les_chain, router_hidden_reshape_preserves_source_identity) {
+    auto program = router_program(false);
+    auto& source = program->get_node("source");
+    auto& projection = program->get_node("projection");
+    auto& view = program->get_or_create(std::make_shared<cldnn::reshape>(
+        "router_hidden_view", cldnn::input_info("source"), cldnn::tensor{1, 1, 2, 1}));
+    program->add_connection(source, view);
+    projection.replace_dependency(0, view);
+    EXPECT_EQ(program->get_les_router_links().back().status, cldnn::program::les_router_status::supported);
+    view.replace_dependency(0, program->get_node("hidden"));
+    EXPECT_EQ(program->get_les_router_links().back().status, cldnn::program::les_router_status::unsupported_projection);
+}
+
 TEST_F(moe_les_chain, multi_token_proxy_is_rejected) {
     auto program = router_program(false, false, false, false, true);
+    EXPECT_EQ(program->get_les_router_links().back().status, cldnn::program::les_router_status::unsupported_layout);
+}
+
+TEST_F(moe_les_chain, dynamic_tokens_with_static_hidden_width_are_qualified) {
+    auto program = router_program(false, false, false, false, false, true);
+    EXPECT_EQ(program->get_les_router_links().back().status, cldnn::program::les_router_status::supported);
+}
+
+TEST_F(moe_les_chain, dynamic_hidden_width_is_rejected) {
+    auto program = router_program(false, false, false, false, false, true);
+    cldnn::layout hidden_layout{ov::PartialShape{1, -1, -1}, cldnn::data_types::f16, cldnn::format::bfyx};
+    program->get_node("hidden").set_output_layout(hidden_layout, false);
+    program->get_node("source").set_output_layout(hidden_layout, false);
     EXPECT_EQ(program->get_les_router_links().back().status, cldnn::program::les_router_status::unsupported_layout);
 }
 

@@ -181,13 +181,14 @@ public:
                                                    return link.router == instance.id() &&
                                                           link.status == program::les_router_status::supported;
                                                });
-        if (network.is_les_prediction_enabled() && network.get_les_context() &&
+        if (token_num == 1 && network.is_les_prediction_enabled() && network.get_les_context() &&
             runtime_link != network.get_les_router_links().end()) {
             OPENVINO_ASSERT(les_proxy_fc, "Qualified LES proxy Router stage was not compiled for ", instance.id());
             const auto& proxy_link = *runtime_link;
             active_proxy_link = &proxy_link;
             auto state = network.get_les_proxy_state(proxy_link.chain.target_moe);
-            if (state.hidden && state.hidden_ready) {
+            if (state.hidden && state.hidden_ready &&
+                state.hidden->get_layout().count() == state.hidden->get_layout().get_shape().back()) {
                 auto weights = network.get_primitive(proxy_link.weights)->output_memory_ptr();
                 auto bias = proxy_link.projection_bias.empty()
                                 ? memory::ptr{}
