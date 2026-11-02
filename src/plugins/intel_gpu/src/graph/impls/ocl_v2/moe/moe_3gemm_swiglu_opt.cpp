@@ -2845,6 +2845,12 @@ public:
                     continue;
                 }
                 auto source_hidden = instance.input_memory_ptr(0);
+                const auto& hidden_layout = source_hidden->get_layout();
+                if (hidden_layout.data_type != data_types::f16 || hidden_layout.format != format::bfyx ||
+                    hidden_layout.count() != hidden_layout.get_shape().back() ||
+                    hidden_layout.get_linear_size() != hidden_layout.count()) {
+                    continue;
+                }
                 auto snapshot = cur_net.get_engine().allocate_memory(source_hidden->get_layout());
                 stream.enqueue_barrier(events);
                 auto snapshot_ready = snapshot->copy_from(stream, *source_hidden, false);
