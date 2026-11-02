@@ -184,6 +184,94 @@ TEST(moe_les_lifecycle, rejects_empty_task) {
     EXPECT_THROW(context.submit(context.begin_epoch(), {}), std::invalid_argument);
 }
 
+TEST(moe_les_scheduler, demand_preempts_pending_speculation) {
+    cldnn::les_context context(4);
+    auto epoch = context.begin_epoch();
+    std::promise<void> release;
+    std::promise<void> started;
+    auto active = context.submit(epoch, [gate = release.get_future().share(), &started] {
+        started.set_value();
+        gate.wait();
+    });
+    EXPECT_EQ(started.get_future().wait_for(5s), std::future_status::ready);
+    std::vector<int> order;
+    auto speculative = context.try_submit_speculative(epoch, [&] { order.push_back(3); });
+    auto second_speculative = context.try_submit_speculative(epoch, [&] { order.push_back(4); });
+    auto demand = context.submit(epoch, [&] { order.push_back(1); });
+    auto second_demand = context.submit(epoch, [&] { order.push_back(2); });
+    release.set_value();
+    context.wait();
+    ASSERT_TRUE(speculative);
+    ASSERT_TRUE(second_speculative);
+    EXPECT_NO_THROW(active.completion.get());
+    EXPECT_NO_THROW(demand.completion.get());
+    EXPECT_NO_THROW(second_demand.completion.get());
+    EXPECT_NO_THROW(speculative->completion.get());
+    EXPECT_NO_THROW(second_speculative->completion.get());
+    EXPECT_EQ(order, (std::vector<int>{1, 2, 3, 4}));
+}
+
+TEST(moe_les_scheduler, full_speculative_queue_yields_to_demand) {
+    cldnn::les_context context(1);
+    auto epoch = context.begin_epoch();
+    std::promise<void> release;
+    std::promise<void> started;
+    auto active = context.submit(epoch, [gate = release.get_future().share(), &started] {
+        started.set_value();
+        gate.wait();
+    });
+    EXPECT_EQ(started.get_future().wait_for(5s), std::future_status::ready);
+    std::atomic<bool> ran{false};
+    auto speculative = context.try_submit_speculative(epoch, [&] { ran = true; });
+    auto rejected = context.try_submit_speculative(epoch, [] {});
+    auto producer = std::async(std::launch::async, [&] { return context.submit(epoch, [] {}); });
+    const auto status = producer.wait_for(5s);
+    release.set_value();
+    EXPECT_EQ(status, std::future_status::ready);
+    EXPECT_FALSE(rejected);
+    auto demand = producer.get();
+    context.wait();
+    ASSERT_TRUE(speculative);
+    EXPECT_THROW(speculative->completion.get(), cldnn::les_task_cancelled);
+    EXPECT_NO_THROW(demand.completion.get());
+    EXPECT_NO_THROW(active.completion.get());
+    EXPECT_FALSE(ran);
+}
+
+TEST(moe_les_scheduler, speculative_failure_does_not_poison_demand) {
+    cldnn::les_context context(2);
+    auto epoch = context.begin_epoch();
+    auto speculative = context.try_submit_speculative(epoch, [] { throw std::runtime_error("speculation failed"); });
+    ASSERT_TRUE(speculative);
+    EXPECT_THROW(speculative->completion.get(), std::runtime_error);
+    EXPECT_NO_THROW(context.submit(epoch, [] {}).completion.get());
+    EXPECT_NO_THROW(context.wait());
+}
+
+TEST(moe_les_scheduler, epoch_rotation_discards_pending_speculation) {
+    cldnn::les_context context(2);
+    auto epoch = context.begin_epoch();
+    std::promise<void> release;
+    std::promise<void> started;
+    auto active = context.submit(epoch, [gate = release.get_future().share(), &started] {
+        started.set_value();
+        gate.wait();
+    });
+    EXPECT_EQ(started.get_future().wait_for(5s), std::future_status::ready);
+    std::atomic<bool> ran{false};
+    auto speculative = context.try_submit_speculative(epoch, [&] { ran = true; });
+    auto rotating = std::async(std::launch::async, [&] { return context.begin_epoch(); });
+    const auto status = speculative->completion.wait_for(5s);
+    release.set_value();
+    auto next = rotating.get();
+    EXPECT_EQ(status, std::future_status::ready);
+    EXPECT_THROW(speculative->completion.get(), cldnn::les_task_cancelled);
+    EXPECT_THROW(active.completion.get(), cldnn::les_task_cancelled);
+    EXPECT_FALSE(ran);
+    EXPECT_THROW(context.try_submit_speculative(epoch, [] {}), cldnn::les_task_cancelled);
+    EXPECT_NO_THROW(context.try_submit_speculative(next, [] {})->completion.get());
+}
+
 TEST(moe_les_lifecycle, destructor_joins_active_work_and_cancels_pending_work) {
     auto context = std::make_unique<cldnn::les_context>(1);
     auto epoch = context->begin_epoch();

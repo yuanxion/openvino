@@ -185,7 +185,7 @@ void OffloadExpertWeightProvider::prefetch_les_demand(const std::vector<uint32_t
         OPENVINO_ASSERT(_resident && _les_context->get_transfer_stream(), "LES provider is not bound to a transfer lane");
         _upload_events = std::make_shared<std::vector<cldnn::event::ptr>>();
         if (!_reservation->missing_experts.empty()) {
-            auto task = _les_context->submit(_les_epoch,
+            auto task = _les_context->try_submit_speculative(_les_epoch,
                 [this, events = _upload_events, transfer = _les_context->get_transfer_stream(), weights = *_resident,
                  missing = _reservation->missing_experts, slots = _reservation->missing_slots]() mutable {
                     try {
@@ -195,13 +195,22 @@ void OffloadExpertWeightProvider::prefetch_les_demand(const std::vector<uint32_t
                         _prefetch_error = std::current_exception();
                     }
                 });
-            _upload_completion = std::move(task.completion);
+            if (!task) {
+                release();
+                return;
+            }
+            _upload_completion = std::move(task->completion);
         }
         finish_les_demand(stream);
         if (auto* perf = moe_otd::get_perf_counters()) {
             perf->les_prefetch_experts.fetch_add(prefetched_slots, std::memory_order_relaxed);
         }
         release();
+    } catch (const cldnn::les_task_cancelled&) {
+        try {
+            release();
+        } catch (...) {
+        }
     } catch (const std::exception& error) {
         try {
             release();
