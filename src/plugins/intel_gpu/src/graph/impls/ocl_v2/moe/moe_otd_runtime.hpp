@@ -5,6 +5,7 @@
 #pragma once
 
 #include <atomic>
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -17,6 +18,20 @@
 #include "openvino/util/parallel_io.hpp"
 
 namespace ov::intel_gpu::ocl::moe_otd {
+
+struct LesSpeculationPolicy {
+    static constexpr size_t lookahead_layers = 1;
+    static constexpr size_t predict_k = 4;
+    static constexpr size_t max_experts = 4;
+    static constexpr size_t max_bytes = 16 * 1024 * 1024;
+
+    static size_t expert_budget(size_t capacity, size_t expert_bytes) {
+        if (capacity <= 1 || expert_bytes == 0) {
+            return 0;
+        }
+        return std::min({max_experts, std::max<size_t>(1, capacity / 4), max_bytes / expert_bytes});
+    }
+};
 
 // Lightweight perf counters for OTD profiling.
 // Enabled by setting MOE_OTD_PERF_LOG=1 environment variable.
@@ -46,6 +61,14 @@ struct OtdPerfCounters {
     std::atomic<uint64_t> les_proxy_submit_ns{0};
     std::atomic<uint64_t> les_prefetch_experts{0};
     std::atomic<uint64_t> les_prefetch_failures{0};
+    std::atomic<uint64_t> les_prefetch_useful_bytes{0};
+    std::atomic<uint64_t> les_prefetch_useless_bytes{0};
+    std::atomic<uint64_t> les_prefetch_late_bytes{0};
+    std::atomic<uint64_t> les_prefetch_extra_misses{0};
+    std::atomic<uint64_t> les_prefetch_deduplicated{0};
+    std::atomic<uint64_t> les_prefetch_promoted{0};
+    std::atomic<uint64_t> les_prefetch_skipped{0};
+    std::atomic<uint64_t> les_early_predictions{0};
 
     void dump() const;
 };
@@ -121,6 +144,7 @@ std::vector<cldnn::event::ptr> fill_weights_memory_async(cldnn::stream& transfer
                                                       ParallelWeightReader& weight_reader,
                                                       cldnn::moe_weights& weights,
                                                       const std::vector<uint32_t>& experts,
-                                                      const std::vector<size_t>& slots);
+                                                      const std::vector<size_t>& slots,
+                                                      uint64_t* uploaded_bytes = nullptr);
 
 }  // namespace ov::intel_gpu::ocl::moe_otd

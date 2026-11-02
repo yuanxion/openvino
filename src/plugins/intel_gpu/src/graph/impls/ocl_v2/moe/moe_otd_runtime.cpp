@@ -83,7 +83,15 @@ void OtdPerfCounters::dump() const {
                    << ", les_proxy_topk_ns=" << les_proxy_topk_ns.load(std::memory_order_relaxed)
                    << ", les_proxy_submit_ns=" << les_proxy_submit_ns.load(std::memory_order_relaxed)
                    << ", les_prefetch_experts=" << les_prefetch_experts.load(std::memory_order_relaxed)
-                   << ", les_prefetch_failures=" << les_prefetch_failures.load(std::memory_order_relaxed) << std::endl;
+                   << ", les_prefetch_failures=" << les_prefetch_failures.load(std::memory_order_relaxed)
+                   << ", les_prefetch_useful_bytes=" << les_prefetch_useful_bytes.load(std::memory_order_relaxed)
+                   << ", les_prefetch_useless_bytes=" << les_prefetch_useless_bytes.load(std::memory_order_relaxed)
+                   << ", les_prefetch_late_bytes=" << les_prefetch_late_bytes.load(std::memory_order_relaxed)
+                   << ", les_prefetch_extra_misses=" << les_prefetch_extra_misses.load(std::memory_order_relaxed)
+                   << ", les_prefetch_deduplicated=" << les_prefetch_deduplicated.load(std::memory_order_relaxed)
+                   << ", les_prefetch_promoted=" << les_prefetch_promoted.load(std::memory_order_relaxed)
+                   << ", les_prefetch_skipped=" << les_prefetch_skipped.load(std::memory_order_relaxed)
+                   << ", les_early_predictions=" << les_early_predictions.load(std::memory_order_relaxed) << std::endl;
 }
 
 OtdPerfCounters* get_perf_counters() {
@@ -327,7 +335,8 @@ std::vector<cldnn::event::ptr> fill_weights_memory_async(cldnn::stream& transfer
                                                       ParallelWeightReader& weight_reader,
                                                       cldnn::moe_weights& weights,
                                                       const std::vector<uint32_t>& experts,
-                                                      const std::vector<size_t>& slots) {
+                                                      const std::vector<size_t>& slots,
+                                                      uint64_t* uploaded_bytes) {
     constexpr size_t chunk_bytes = 8 * 1024 * 1024;
     const std::array<cldnn::memory::ptr, 9> tensors{weights.gate_w, weights.up_w, weights.down_w,
                                                 weights.gate_s, weights.up_s, weights.down_s,
@@ -397,6 +406,9 @@ std::vector<cldnn::event::ptr> fill_weights_memory_async(cldnn::stream& transfer
                 buffer.upload = plan.memory->copy_from(transfer_stream, buffer.bytes.data(), 0, plan.destination + offset, bytes, false);
                 OPENVINO_ASSERT(buffer.upload, "LES upload did not return a completion event");
                 events.push_back(buffer.upload);
+                if (uploaded_bytes) {
+                    *uploaded_bytes += bytes;
+                }
                 transfer_stream.flush();
                 if (perf) {
                     perf->les_upload_chunks.fetch_add(1, std::memory_order_relaxed);
