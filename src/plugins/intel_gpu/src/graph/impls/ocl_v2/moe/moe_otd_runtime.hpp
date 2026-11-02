@@ -66,6 +66,7 @@ struct OtdPerfCounters {
     std::atomic<uint64_t> les_upload_chunks{0};
     std::atomic<uint64_t> les_upload_bytes{0};
     std::atomic<uint64_t> les_waves{0};
+    std::atomic<uint64_t> les_decode_metadata_allocations{0};
     std::atomic<uint64_t> les_prefill_waves{0};
     std::atomic<uint64_t> les_prefill_pairs{0};
     std::atomic<uint64_t> les_prefill_grouped_waves{0};

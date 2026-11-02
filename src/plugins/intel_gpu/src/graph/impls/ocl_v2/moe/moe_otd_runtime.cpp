@@ -96,6 +96,7 @@ void OtdPerfCounters::dump() const {
                    << ", les_upload_chunks=" << les_upload_chunks.load(std::memory_order_relaxed)
                    << ", les_upload_bytes=" << les_upload_bytes.load(std::memory_order_relaxed)
                    << ", les_waves=" << les_waves.load(std::memory_order_relaxed)
+                   << ", les_decode_metadata_allocations=" << les_decode_metadata_allocations.load(std::memory_order_relaxed)
                    << ", les_prefill_waves=" << les_prefill_waves.load(std::memory_order_relaxed)
                    << ", les_prefill_pairs=" << les_prefill_pairs.load(std::memory_order_relaxed)
                    << ", les_prefill_grouped_waves=" << les_prefill_grouped_waves.load(std::memory_order_relaxed)
@@ -120,7 +121,10 @@ void OtdPerfCounters::dump() const {
 }
 
 OtdPerfCounters* get_perf_counters() {
-    static bool enabled = std::getenv("MOE_OTD_PERF_LOG") != nullptr;
+    static const bool enabled = [] {
+        const auto* value = std::getenv("MOE_OTD_PERF_LOG");
+        return value && std::strcmp(value, "1") == 0;
+    }();
     if (!enabled) {
         return nullptr;
     }
