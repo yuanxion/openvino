@@ -96,8 +96,8 @@ std::optional<les_context::ticket> les_context::submit_task(uint64_t epoch, std:
         discarded.emplace(std::move(*candidate));
         _pending.erase(candidate);
     }
-    task pending{epoch, speculative, std::move(work), {}};
-    ticket result{epoch, pending.completion.get_future().share()};
+    task pending{epoch, speculative, ++_next_task_id, std::move(work), {}};
+    ticket result{epoch, pending.completion.get_future().share(), pending.id};
     auto position = speculative ? _pending.end() :
         std::find_if(_pending.begin(), _pending.end(), [](const task& queued) { return queued.speculative; });
     _pending.insert(position, std::move(pending));
@@ -107,6 +107,43 @@ std::optional<les_context::ticket> les_context::submit_task(uint64_t epoch, std:
     }
     _changed.notify_all();
     return result;
+}
+
+bool les_context::promote(const ticket& pending) {
+    check_control_thread();
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (pending.epoch != _epoch || _invalidating || _stopping) {
+        return false;
+    }
+    auto found = std::find_if(_pending.begin(), _pending.end(), [&](const task& queued) { return queued.id == pending.id; });
+    if (found == _pending.end() || !found->speculative) {
+        return false;
+    }
+    auto promoted = std::move(*found);
+    _pending.erase(found);
+    promoted.speculative = false;
+    auto position = std::find_if(_pending.begin(), _pending.end(), [](const task& queued) { return queued.speculative; });
+    _pending.insert(position, std::move(promoted));
+    return true;
+}
+
+bool les_context::cancel_pending(const ticket& pending) {
+    check_control_thread();
+    std::optional<task> cancelled;
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        auto found = std::find_if(_pending.begin(), _pending.end(), [&](const task& queued) {
+            return queued.epoch == pending.epoch && queued.id == pending.id && queued.speculative;
+        });
+        if (found == _pending.end()) {
+            return false;
+        }
+        cancelled.emplace(std::move(*found));
+        _pending.erase(found);
+    }
+    cancelled->completion.set_exception(std::make_exception_ptr(les_task_cancelled{}));
+    _changed.notify_all();
+    return true;
 }
 
 void les_context::wait() {
