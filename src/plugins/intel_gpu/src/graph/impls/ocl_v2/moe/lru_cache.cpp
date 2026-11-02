@@ -14,7 +14,7 @@ ExpertSlotReservations::ExpertSlotReservations(size_t capacity) : _slots(capacit
     }
 }
 
-std::optional<ExpertSlotReservations::Ticket> ExpertSlotReservations::reserve(const std::vector<uint32_t>& experts, uint64_t epoch) {
+std::optional<ExpertSlotReservations::Ticket> ExpertSlotReservations::reserve(const std::vector<uint32_t>& experts, uint64_t epoch, bool speculative) {
     std::lock_guard<std::mutex> lock(_mutex);
     std::unordered_set<uint32_t> unique(experts.begin(), experts.end());
     if (unique.size() > _slots.size() || epoch < _epoch || (epoch != _epoch && !_active.empty())) {
@@ -22,7 +22,7 @@ std::optional<ExpertSlotReservations::Ticket> ExpertSlotReservations::reserve(co
     }
     auto planned = _slots;
     std::unordered_map<uint32_t, size_t> mapping;
-    Record record{epoch, {}};
+    Record record{epoch, {}, {}};
     Ticket result{_next_id + 1, epoch, {}, {}, {}, {}, {}};
     auto clock = _clock;
     for (auto expert : unique) {
@@ -33,7 +33,9 @@ std::optional<ExpertSlotReservations::Ticket> ExpertSlotReservations::reserve(co
                     return std::nullopt;
                 }
                 ++slot.pins;
-                slot.age = ++clock;
+                if (!speculative) {
+                    slot.age = ++clock;
+                }
                 mapping.emplace(expert, index);
                 record.generations.emplace_back(index, slot.generation);
                 break;
@@ -47,7 +49,8 @@ std::optional<ExpertSlotReservations::Ticket> ExpertSlotReservations::reserve(co
         size_t candidate = planned.size();
         for (size_t index = 0; index < planned.size(); ++index) {
             const auto& slot = planned[index];
-            if (slot.pins == 0 && (candidate == planned.size() || !slot.expert || slot.age < planned[candidate].age)) {
+            if (slot.pins == 0 &&
+                (candidate == planned.size() || !slot.expert || slot.age < planned[candidate].age)) {
                 candidate = index;
                 if (!slot.expert) {
                     break;
@@ -58,6 +61,9 @@ std::optional<ExpertSlotReservations::Ticket> ExpertSlotReservations::reserve(co
             return std::nullopt;
         }
         auto& slot = planned[candidate];
+        if (speculative) {
+            record.replaced.emplace_back(candidate, slot);
+        }
         slot.expert = expert;
         ++slot.generation;
         slot.age = ++clock;
@@ -79,6 +85,45 @@ std::optional<ExpertSlotReservations::Ticket> ExpertSlotReservations::reserve(co
     _clock = clock;
     ++_next_id;
     return result;
+}
+
+void ExpertSlotReservations::discard_unused(const Ticket& ticket, const std::vector<uint32_t>& used) {
+    std::lock_guard<std::mutex> lock(_mutex);
+    auto record = _active.find(ticket.id);
+    if (record == _active.end() || record->second.epoch != ticket.epoch) {
+        return;
+    }
+    for (size_t index = 0; index < ticket.missing_slots.size(); ++index) {
+        auto slot_index = ticket.missing_slots[index];
+        auto generation = std::find_if(record->second.generations.begin(), record->second.generations.end(),
+                                       [&](const auto& entry) { return entry.first == slot_index; });
+        auto& slot = _slots[slot_index];
+        if (generation != record->second.generations.end() && slot.generation == generation->second && slot.pins == 1 &&
+            std::find(used.begin(), used.end(), ticket.missing_experts[index]) == used.end()) {
+            slot.ready = false;
+        }
+    }
+}
+
+bool ExpertSlotReservations::rollback(const Ticket& ticket) {
+    std::lock_guard<std::mutex> lock(_mutex);
+    auto record = _active.find(ticket.id);
+    if (record == _active.end() || record->second.epoch != ticket.epoch) {
+        return false;
+    }
+    for (const auto& entry : record->second.generations) {
+        if (_slots[entry.first].generation != entry.second || _slots[entry.first].pins != 1) {
+            return false;
+        }
+    }
+    for (const auto& entry : record->second.generations) {
+        --_slots[entry.first].pins;
+    }
+    for (const auto& entry : record->second.replaced) {
+        _slots[entry.first] = entry.second;
+    }
+    _active.erase(record);
+    return true;
 }
 
 bool ExpertSlotReservations::complete(const Ticket& ticket) {

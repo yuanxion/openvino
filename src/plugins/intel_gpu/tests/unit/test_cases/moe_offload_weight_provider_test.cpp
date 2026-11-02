@@ -341,7 +341,7 @@ TEST_F(moe_les_upload, speculative_prefetch_failure_does_not_poison_real_demand)
     write(std::vector<uint8_t>(64, 7));
     MOECompressed::Config config{};
     config.num_expert = 2;
-    OffloadExpertWeightProvider provider(1, config, std::vector<size_t>{0, 32, 0, 0, 0, 0, 0, 0, 0}, path);
+    OffloadExpertWeightProvider provider(2, config, std::vector<size_t>{0, 32, 0, 0, 0, 0, 0, 0, 0}, path);
     moe_weights weights;
     weights.gate_w = buffer(16, data_types::u8, 2);
     weights.up_w = buffer(16, data_types::u8, 2);
@@ -397,7 +397,7 @@ TEST_F(moe_les_upload, rejected_speculation_releases_reservation_without_upload)
     write(file);
     MOECompressed::Config config{};
     config.num_expert = 2;
-    OffloadExpertWeightProvider provider(1, config, std::vector<size_t>(9), path);
+    OffloadExpertWeightProvider provider(2, config, std::vector<size_t>(9), path);
     moe_weights weights;
     weights.gate_w = buffer(16, data_types::u8, 2);
     provider.bind(weights);
@@ -428,6 +428,211 @@ TEST_F(moe_les_upload, rejected_speculation_releases_reservation_without_upload)
     ASSERT_TRUE(provider.try_acquire_simultaneous({1}, *compute));
     weights.gate_w->copy_to(*compute, actual.data(), 0, 0, actual.size(), true);
     EXPECT_EQ(actual, std::vector<uint8_t>(16, 11));
+    provider.release();
+}
+
+TEST(moe_les_reservations, speculation_cannot_evict_active_demand_and_unused_slots_are_reclaimed) {
+    ov::intel_gpu::ocl::moe::ExpertSlotReservations reservations(2);
+    auto demand = reservations.reserve({0}, 1);
+    ASSERT_TRUE(demand);
+    ASSERT_TRUE(reservations.complete(*demand));
+    auto speculative = reservations.reserve({1}, 1, true);
+    ASSERT_TRUE(speculative);
+    EXPECT_FALSE(reservations.reserve({2}, 1, true));
+    ASSERT_TRUE(reservations.release(*demand));
+    ASSERT_TRUE(reservations.complete(*speculative));
+    reservations.discard_unused(*speculative, {});
+    ASSERT_TRUE(reservations.release(*speculative));
+    auto original = reservations.reserve({0}, 1);
+    ASSERT_TRUE(original);
+    EXPECT_TRUE(original->missing_experts.empty());
+    EXPECT_TRUE(reservations.release(*original));
+    auto replacement = reservations.reserve({2}, 1, true);
+    ASSERT_TRUE(replacement);
+    EXPECT_EQ(replacement->missing_experts, (std::vector<uint32_t>{2}));
+    EXPECT_TRUE(reservations.release(*replacement));
+}
+
+TEST(moe_les_reservations, fixed_speculative_policy_separates_horizon_rank_and_byte_budget) {
+    using Policy = otd::LesSpeculationPolicy;
+    EXPECT_EQ(Policy::lookahead_layers, 1U);
+    EXPECT_EQ(Policy::predict_k, 4U);
+    EXPECT_EQ(Policy::expert_budget(1, 16), 0U);
+    EXPECT_EQ(Policy::expert_budget(16, 0), 0U);
+    EXPECT_EQ(Policy::expert_budget(16, 16), 4U);
+    EXPECT_EQ(Policy::expert_budget(4, 16), 1U);
+    EXPECT_EQ(Policy::expert_budget(16, Policy::max_bytes), 1U);
+    EXPECT_EQ(Policy::expert_budget(16, Policy::max_bytes + 1), 0U);
+}
+
+TEST(moe_les_reservations, rollback_unstarted_speculation_restores_full_cache) {
+    ov::intel_gpu::ocl::moe::ExpertSlotReservations reservations(2);
+    auto demand = reservations.reserve({0, 1}, 1);
+    ASSERT_TRUE(demand);
+    ASSERT_TRUE(reservations.complete(*demand));
+    ASSERT_TRUE(reservations.release(*demand));
+    auto speculative = reservations.reserve({2}, 1, true);
+    ASSERT_TRUE(speculative);
+    ASSERT_TRUE(reservations.rollback(*speculative));
+    EXPECT_FALSE(reservations.complete(*speculative));
+    auto original = reservations.reserve({0, 1}, 1);
+    ASSERT_TRUE(original);
+    EXPECT_TRUE(original->missing_experts.empty());
+    EXPECT_TRUE(reservations.release(*original));
+}
+
+TEST_F(moe_les_upload, async_prefetch_deduplicates_and_real_demand_reuses_upload) {
+    write(std::vector<uint8_t>(32, 11));
+    MOECompressed::Config config{};
+    config.num_expert = 2;
+    OffloadExpertWeightProvider provider(2, config, std::vector<size_t>(9), path);
+    moe_weights weights;
+    weights.gate_w = buffer(16, data_types::u8, 2);
+    provider.bind(weights);
+    cldnn::les_context context(3, lane());
+    auto epoch = context.begin_epoch();
+    provider.set_les_context(&context, epoch);
+    auto compute = lane();
+    auto* perf = otd::get_perf_counters();
+    auto uploaded = perf ? perf->les_upload_bytes.load() : 0;
+    auto useful = perf ? perf->les_prefetch_useful_bytes.load() : 0;
+    auto deduplicated = perf ? perf->les_prefetch_deduplicated.load() : 0;
+    auto skipped = perf ? perf->les_prefetch_skipped.load() : 0;
+    std::promise<void> release;
+    std::promise<void> started;
+    auto active = context.submit(epoch, [gate = release.get_future().share(), &started] {
+        started.set_value();
+        gate.wait();
+    });
+    EXPECT_EQ(started.get_future().wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    auto speculative = std::async(std::launch::async, [&] {
+        provider.prefetch_les_demand({1}, *compute);
+        provider.prefetch_les_demand({1}, *compute);
+        provider.prefetch_les_demand({0}, *compute);
+    });
+    auto status = speculative.wait_for(std::chrono::seconds(5));
+    if (status != std::future_status::ready) {
+        release.set_value();
+    }
+    EXPECT_EQ(status, std::future_status::ready);
+    speculative.get();
+    auto demand = std::async(std::launch::async, [&] { return provider.try_acquire_simultaneous({1}, *compute); });
+    if (status == std::future_status::ready) {
+        release.set_value();
+    }
+    ASSERT_TRUE(demand.get());
+    EXPECT_NO_THROW(active.completion.get());
+    std::vector<uint8_t> actual(16);
+    weights.gate_w->copy_to(*compute, actual.data(), 0, 0, actual.size(), true);
+    EXPECT_EQ(actual, std::vector<uint8_t>(16, 11));
+    if (perf) {
+        EXPECT_EQ(perf->les_upload_bytes.load() - uploaded, 16U);
+        EXPECT_EQ(perf->les_prefetch_useful_bytes.load() - useful, 16U);
+        EXPECT_EQ(perf->les_prefetch_deduplicated.load() - deduplicated, 1U);
+        EXPECT_EQ(perf->les_prefetch_skipped.load() - skipped, 1U);
+    }
+    provider.release();
+}
+
+TEST_F(moe_les_upload, wrong_completed_prediction_counts_useless_bytes_without_extra_miss) {
+    write(std::vector<uint8_t>(32, 11));
+    MOECompressed::Config config{};
+    config.num_expert = 2;
+    OffloadExpertWeightProvider provider(2, config, std::vector<size_t>(9), path);
+    moe_weights weights;
+    weights.gate_w = buffer(16, data_types::u8, 2);
+    provider.bind(weights);
+    cldnn::les_context context(2, lane());
+    provider.set_les_context(&context, context.begin_epoch());
+    auto compute = lane();
+    auto* perf = otd::get_perf_counters();
+    auto useless = perf ? perf->les_prefetch_useless_bytes.load() : 0;
+    auto useful = perf ? perf->les_prefetch_useful_bytes.load() : 0;
+    auto extra = perf ? perf->les_prefetch_extra_misses.load() : 0;
+    provider.prefetch_les_demand({1}, *compute);
+    context.wait();
+    ASSERT_TRUE(provider.try_acquire_simultaneous({0}, *compute));
+    provider.release();
+    if (perf) {
+        EXPECT_EQ(perf->les_prefetch_useless_bytes.load() - useless, 16U);
+        EXPECT_EQ(perf->les_prefetch_useful_bytes.load() - useful, 0U);
+        EXPECT_EQ(perf->les_prefetch_extra_misses.load() - extra, 0U);
+    }
+    auto next = provider.begin_les_demand({0});
+    ASSERT_TRUE(next);
+    EXPECT_TRUE(next->missing_pairs.empty());
+    provider.finish_les_demand(*compute);
+    provider.release();
+}
+
+TEST_F(moe_les_upload, full_cache_speculation_records_pollution_against_demand_shadow) {
+    write(std::vector<uint8_t>(48, 11));
+    MOECompressed::Config config{};
+    config.num_expert = 3;
+    OffloadExpertWeightProvider provider(2, config, std::vector<size_t>(9), path);
+    moe_weights weights;
+    weights.gate_w = buffer(16, data_types::u8, 3);
+    provider.bind(weights);
+    cldnn::les_context context(2, lane());
+    provider.set_les_context(&context, context.begin_epoch());
+    auto compute = lane();
+    ASSERT_TRUE(provider.try_acquire_simultaneous({0, 1}, *compute));
+    provider.release();
+    auto* perf = otd::get_perf_counters();
+    auto useless = perf ? perf->les_prefetch_useless_bytes.load() : 0;
+    auto extra = perf ? perf->les_prefetch_extra_misses.load() : 0;
+    provider.prefetch_les_demand({2}, *compute);
+    context.wait();
+    ASSERT_TRUE(provider.try_acquire_simultaneous({0}, *compute));
+    provider.release();
+    if (perf) {
+        EXPECT_EQ(perf->les_prefetch_useless_bytes.load() - useless, 16U);
+        EXPECT_EQ(perf->les_prefetch_extra_misses.load() - extra, 1U);
+    }
+}
+
+TEST_F(moe_les_upload, queued_prefetch_epoch_cancel_restores_mapping_and_retries) {
+    write(std::vector<uint8_t>(48, 11));
+    MOECompressed::Config config{};
+    config.num_expert = 3;
+    OffloadExpertWeightProvider provider(2, config, std::vector<size_t>(9), path);
+    moe_weights weights;
+    weights.gate_w = buffer(16, data_types::u8, 3);
+    provider.bind(weights);
+    cldnn::les_context context(2, lane());
+    auto epoch = context.begin_epoch();
+    provider.set_les_context(&context, epoch);
+    auto compute = lane();
+    ASSERT_TRUE(provider.try_acquire_simultaneous({0, 1}, *compute));
+    provider.release();
+    auto* perf = otd::get_perf_counters();
+    auto uploaded = perf ? perf->les_upload_bytes.load() : 0;
+    auto failed = perf ? perf->les_prefetch_failures.load() : 0;
+    std::promise<void> release;
+    std::promise<void> started;
+    auto active = context.submit(epoch, [gate = release.get_future().share(), &started] {
+        started.set_value();
+        gate.wait();
+    });
+    started.get_future().wait();
+    provider.prefetch_les_demand({2}, *compute);
+    auto sentinel = context.submit(epoch, [] {});
+    auto cancelled = std::async(std::launch::async, [&] { context.cancel(); });
+    auto status = sentinel.completion.wait_for(std::chrono::seconds(5));
+    release.set_value();
+    cancelled.get();
+    ASSERT_EQ(status, std::future_status::ready);
+    EXPECT_THROW(sentinel.completion.get(), cldnn::les_task_cancelled);
+    provider.set_les_context(&context, context.begin_epoch());
+    ASSERT_TRUE(provider.try_acquire_simultaneous({0, 1}, *compute));
+    provider.release();
+    if (perf) {
+        EXPECT_EQ(perf->les_upload_bytes.load(), uploaded);
+        EXPECT_EQ(perf->les_prefetch_failures.load(), failed);
+    }
+    provider.prefetch_les_demand({2}, *compute);
+    context.wait();
+    ASSERT_TRUE(provider.try_acquire_simultaneous({2}, *compute));
     provider.release();
 }
 }  // namespace
