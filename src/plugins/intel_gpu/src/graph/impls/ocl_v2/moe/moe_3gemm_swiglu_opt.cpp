@@ -2841,7 +2841,8 @@ public:
 
         if (cur_net.is_les_prediction_enabled()) {
             for (const auto& link : cur_net.get_les_router_links()) {
-                if (link.status != program::les_router_status::supported || link.chain.source_moe != instance.id()) {
+                if (moe_otd::LesSpeculationPolicy::lookahead_layers != 1 ||
+                    link.status != program::les_router_status::supported || link.chain.source_moe != instance.id()) {
                     continue;
                 }
                 auto source_hidden = instance.input_memory_ptr(0);
@@ -2855,6 +2856,8 @@ public:
                 stream.enqueue_barrier(events);
                 auto snapshot_ready = snapshot->copy_from(stream, *source_hidden, false);
                 cur_net.set_les_proxy_hidden(link.chain.target_moe, std::move(snapshot), std::move(snapshot_ready));
+                auto router = cur_net.get_primitive(link.router);
+                router->get_impl()->enqueue_les_prediction(*router);
             }
         }
 

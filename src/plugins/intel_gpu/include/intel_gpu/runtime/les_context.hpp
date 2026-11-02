@@ -26,6 +26,7 @@ public:
     struct ticket {
         uint64_t epoch;
         std::shared_future<void> completion;
+        uint64_t id;
     };
 
     explicit les_context(size_t queue_capacity, std::shared_ptr<stream> transfer_stream = {});
@@ -36,6 +37,8 @@ public:
     uint64_t begin_epoch();
     ticket submit(uint64_t epoch, std::function<void()> work);
     std::optional<ticket> try_submit_speculative(uint64_t epoch, std::function<void()> work);
+    bool promote(const ticket& pending);
+    bool cancel_pending(const ticket& pending);
     void wait();
     void cancel();
     void stop();
@@ -45,6 +48,7 @@ private:
     struct task {
         uint64_t epoch;
         bool speculative;
+        uint64_t id;
         std::function<void()> work;
         std::promise<void> completion;
     };
@@ -62,6 +66,7 @@ private:
     std::condition_variable _changed;
     std::deque<task> _pending;
     uint64_t _epoch = 0;
+    uint64_t _next_task_id = 0;
     bool _active = false;
     bool _invalidating = false;
     bool _stopping = false;

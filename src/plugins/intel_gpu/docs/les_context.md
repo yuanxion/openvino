@@ -560,10 +560,82 @@ chains, 2,520 compared slots per prediction mode, 2,520 prefetched slots per
 prefetch mode, zero prefetch failures and unchanged warm cache blobs. Evidence:
 workspace `les/results/p5_1_olmoe_acceptance_20261102/acceptance.json`.
 
-This is the P5 scheduling foundation, not the complete P5 milestone. Prefetch
-still blocks at the target Router. Pending expert-task deduplication/promotion,
-earlier submission, separate lookahead/predict-k policy, anti-pollution budgets
-and useful/useless/late/extra-miss accounting remain pending. Queue admission is
-not physical cache admission: a rejected speculative submission currently
-releases its reservation but does not restore any cached mapping changed while
-reserving. No P5 performance, full GPU suite, ZE LES or new TSan result is claimed.
+At the P5.1 checkpoint this was only the scheduling foundation: prefetch still
+blocked at the target Router and rejection did not restore replaced mappings.
+The remaining P5 implementation and validation follow below.
+
+## P5: Early, Bounded Speculation And Pollution Accounting
+
+The source MoE snapshots its qualified single-token hidden input and invokes the
+next Router's proxy stage before submitting source expert compute. The proxy uses
+fixed single-token scratch, not the unexecuted target's dynamic input/output
+buffers. Actual routing and expert arithmetic are unchanged. The Router reuses
+the existing proxy result rather than predicting twice. The small prediction and
+ID readback still have a Host wait; weight reads/repacking/uploads run on the
+worker and no longer block the source until their completion. This enables
+overlap but is not a new measured device-overlap or speedup claim.
+
+`LesSpeculationPolicy` separates `lookahead_layers=1` from `predict_k=4`.
+Each provider keeps at most one speculative batch. Its admission limit is the
+minimum of four experts, `max(1, capacity / 4)` slots and 16 MiB divided by the
+complete per-expert W/S/ZP byte size. Capacity one, zero-byte metadata and experts
+larger than 16 MiB disable speculation. These are fixed internal limits, not new
+public properties or a cross-layer memory budget. No adaptive or trained
+predictor is required.
+
+Matching pending expert requests reuse the original task. A different request
+does not create another batch. Real demand promotes a matching queued task to
+required FIFO priority instead of uploading again, or cancels an unneeded queued
+task. Active uploads cannot be preempted; demand may wait for that bounded batch.
+Epoch cancellation drains active DMA, drops pending work and allows retry.
+
+Speculation may replace only unpinned LRU slots; real active reservations are
+never victims. Predicted hits do not refresh demand recency. A task rejected or
+cancelled before any upload rolls back replaced metadata because device bytes
+are still unchanged. Once any DMA has occurred, rollback is forbidden: cleanup
+waits for all issued transfers, invalidates unused predictions and releases pins.
+Useful predicted slots remain ready for actual demand. This is bounded soft
+protection, not a guarantee of zero cache pollution. Independent demand-only
+shadow reservations track the same successful demand sequence and capacity,
+without prediction or any device allocations.
+
+Counters are cumulative and require `MOE_OTD_PERF_LOG=1`:
+
+- `les_early_predictions`: proxy predictions created from the source hook.
+- `les_prefetch_experts`: admitted missing experts, not proof of completed DMA.
+- `les_prefetch_useful_bytes`: successfully uploaded missing experts used by the
+  next actual demand batch.
+- `les_prefetch_useless_bytes`: submitted speculative bytes not useful above,
+  including partial failed transfers. Cancelled unstarted work contributes zero.
+- `les_prefetch_late_bytes`: useful bytes whose upload future was not ready when
+  actual demand arrived; this is a subset of useful bytes, not an extra total.
+- `les_prefetch_extra_misses`: actual missing experts that hit in the demand-only
+  shadow cache, measured on successful demand completion.
+- `les_prefetch_deduplicated`, `les_prefetch_promoted`, `les_prefetch_skipped`:
+  matching pending requests, queued-task promotions and policy/admission skips.
+
+Final Lunar Lake OCL Debug validation passed 405/405 focused tests in 32 suites
+and the overlapping 182/182 forced grouped/micro-Prefill-fallback subset, with
+zero failures/skips. Deterministic gated tests cover priority/promotion,
+duplicate versus different requests, cancellation, rollback, full-cache
+speculation, pollution attribution and single-upload reuse. The queued-prefetch
+epoch recovery check also passed 20 repeated runs. Evidence is in workspace
+`les/p5_complete_final_results.xml`, `les/p5_complete_final_fallback_results.xml`
+and `les/p5_epoch_final_results.xml`.
+
+OLMoE LLM and Qwen VLM each passed all six modes (off/demand/predict/prefetch/
+cache-cold/cache-warm), 18 repeated texts/token counts equal per model, with warm
+cache blobs unchanged. The prefetch runs recorded respectively 315/819 early
+predictions, 213/702 admitted experts, 676,601,856/1,026,342,912 useful bytes,
+19,611,648/120,938,496 useless bytes, 22,880,256/34,320,384 late bytes and 26/34
+extra misses; prefetch failures were zero. All 12 mode results passed the P5
+early-execution and byte-budget/accounting gates. Evidence is in workspace
+`les/results/p5_complete_olmoe_20261102/acceptance.json` and
+`les/results/p5_complete_qwen_20261102/acceptance.json`; the existing acceptance
+script now offers `--p5` and positive/negative parser self-tests.
+
+P5 is complete within the existing plain-FP16, single-token, OCL qualification
+boundary. LES remains default-off. These short sequential Debug samples do not
+establish formal performance, model/logit accuracy, complete GPU-suite coverage,
+ZE LES support or a new TSan result. P0 gaps remain deferred; larger-Prefill
+overlap, cross-layer pools and the full compatibility matrix remain P6-P8.

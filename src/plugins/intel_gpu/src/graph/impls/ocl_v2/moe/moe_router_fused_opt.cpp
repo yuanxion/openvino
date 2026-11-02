@@ -140,6 +140,15 @@ public:
     }
 
     cldnn::event::ptr execute(const std::vector<cldnn::event::ptr>& events, cldnn::primitive_inst& instance) override {
+        return execute_routing(events, instance, false);
+    }
+
+    void enqueue_les_prediction(cldnn::primitive_inst& instance) override {
+        execute_routing({}, instance, true);
+    }
+
+    cldnn::event::ptr execute_routing(const std::vector<cldnn::event::ptr>& events,
+                                    cldnn::primitive_inst& instance, bool proxy_only) {
         kernel_dump_info.clear_entries();
 
         auto& network = instance.get_network();
@@ -148,12 +157,15 @@ public:
         const auto& config = desc->_config;
 
         // Determine token count from input layout
-        auto input_mem = instance.input_memory_ptr(0);
-        auto input_layout = instance.dependencies()[0].first->get_impl_params()->get_output_layout(instance.dependencies()[0].second);
-        auto input_shape = input_layout.get_shape();
-        size_t token_num = input_shape[0];
-        if (input_shape.size() >= 3) {
-            token_num = input_shape[0] * input_shape[1];
+        auto input_mem = proxy_only ? memory::ptr{} : instance.input_memory_ptr(0);
+        size_t token_num = 1;
+        if (!proxy_only) {
+            auto input_layout = instance.dependencies()[0].first->get_impl_params()->get_output_layout(instance.dependencies()[0].second);
+            auto input_shape = input_layout.get_shape();
+            token_num = input_shape[0];
+            if (input_shape.size() >= 3) {
+                token_num = input_shape[0] * input_shape[1];
+            }
         }
         size_t lws_size = config.num_expert;
 
@@ -170,8 +182,8 @@ public:
 
         // Kernel signature: (input, output_index, output_weights)
         // MoERouterFused outputs: 0 = topk_weights, 1 = topk_indices
-        auto topk_weights_mem = instance.output_memory_ptr(0);
-        auto topk_indices_mem = instance.output_memory_ptr(1);
+        auto topk_weights_mem = proxy_only ? memory::ptr{} : instance.output_memory_ptr(0);
+        auto topk_indices_mem = proxy_only ? memory::ptr{} : instance.output_memory_ptr(1);
         cldnn::event::ptr proxy_prediction_ready;
         const program::les_router_link* active_proxy_link = nullptr;
 
@@ -181,7 +193,11 @@ public:
                                                    return link.router == instance.id() &&
                                                           link.status == program::les_router_status::supported;
                                                });
-        if (token_num == 1 && network.is_les_prediction_enabled() && network.get_les_context() &&
+        if (runtime_link != network.get_les_router_links().end()) {
+            proxy_prediction_ready = network.get_les_proxy_state(runtime_link->chain.target_moe).prediction_ready;
+        }
+        bool prediction_created = false;
+        if (!proxy_prediction_ready && token_num == 1 && network.is_les_prediction_enabled() && network.get_les_context() &&
             runtime_link != network.get_les_router_links().end()) {
             OPENVINO_ASSERT(les_proxy_fc, "Qualified LES proxy Router stage was not compiled for ", instance.id());
             const auto& proxy_link = *runtime_link;
@@ -194,11 +210,15 @@ public:
                                 ? memory::ptr{}
                                 : network.get_primitive(proxy_link.projection_bias)->output_memory_ptr();
                 const auto logits_layout = cldnn::layout({1, 1, 1, static_cast<int64_t>(proxy_link.experts)},
-                                                          inputs.front()->get_layout().data_type,
+                                                          state.hidden->get_layout().data_type,
                                                           cldnn::format::bfyx);
                 auto logits = network.get_engine().allocate_memory(logits_layout);
-                auto proxy_indices = network.get_engine().allocate_memory(instance.get_impl_params()->get_output_layout(1));
-                auto proxy_weights = network.get_engine().allocate_memory(instance.get_impl_params()->get_output_layout(0));
+                auto proxy_indices = network.get_engine().allocate_memory(cldnn::layout(
+                    {1, 1, 1, static_cast<int64_t>(proxy_link.top_k)},
+                    instance.get_impl_params()->get_output_layout(1).data_type, cldnn::format::bfyx));
+                auto proxy_weights = network.get_engine().allocate_memory(cldnn::layout(
+                    {1, 1, 1, static_cast<int64_t>(proxy_link.top_k)},
+                    state.hidden->get_layout().data_type, cldnn::format::bfyx));
 
                 cldnn::kernel_arguments_data fc_args;
                 cldnn::kernel_arguments_desc fc_desc;
@@ -255,7 +275,33 @@ public:
                                                  std::move(proxy_weights),
                                                  std::move(prediction_ready));
                 proxy_prediction_ready = network.get_les_proxy_state(proxy_link.chain.target_moe).prediction_ready;
+                prediction_created = true;
+                if (proxy_only) {
+                    if (auto* perf = moe_otd::get_perf_counters()) {
+                        perf->les_early_predictions.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
             }
+        }
+
+        if (network.is_les_prefetch_enabled() && prediction_created && proxy_prediction_ready && active_proxy_link) {
+            try {
+                stream.flush();
+                proxy_prediction_ready->wait();
+                const auto proxy = network.get_les_proxy_state(active_proxy_link->chain.target_moe);
+                std::vector<uint32_t> predicted_ids(std::min(active_proxy_link->top_k,
+                                                            moe_otd::LesSpeculationPolicy::predict_k));
+                proxy.predicted_indices->copy_to(stream, predicted_ids.data(), 0, 0,
+                                                 predicted_ids.size() * sizeof(uint32_t), true);
+                auto target = network.get_primitive(active_proxy_link->chain.target_moe);
+                target->get_impl()->enqueue_les_prefetch(*target, predicted_ids, proxy_prediction_ready);
+            } catch (const std::exception& error) {
+                GPU_DEBUG_INFO << "[LES_PREDICT_PREFETCH] target=" << active_proxy_link->chain.target_moe
+                               << " skipped=" << error.what() << std::endl;
+            }
+        }
+        if (proxy_only) {
+            return proxy_prediction_ready;
         }
 
         // Build kernel arguments manually (same as execute_stage in moe_3gemm)
@@ -283,24 +329,6 @@ public:
                                                           {},
                                                           events,
                                                           instance.needs_completion_event());
-        if (network.is_les_prefetch_enabled() && proxy_prediction_ready && active_proxy_link) {
-            try {
-                proxy_prediction_ready->wait();
-                const auto proxy = network.get_les_proxy_state(active_proxy_link->chain.target_moe);
-                std::vector<uint32_t> predicted_ids(active_proxy_link->top_k);
-                proxy.predicted_indices->copy_to(stream,
-                                                 predicted_ids.data(),
-                                                 0,
-                                                 0,
-                                                 predicted_ids.size() * sizeof(uint32_t),
-                                                 true);
-                auto target = network.get_primitive(active_proxy_link->chain.target_moe);
-                target->get_impl()->enqueue_les_prefetch(*target, predicted_ids, proxy_prediction_ready);
-            } catch (const std::exception& error) {
-                GPU_DEBUG_INFO << "[LES_PREDICT_PREFETCH] target=" << active_proxy_link->chain.target_moe
-                               << " skipped=" << error.what() << std::endl;
-            }
-        }
         return actual_routing_ready;
     }
 };
