@@ -44,7 +44,7 @@ FuseMoESoftmaxRouter::FuseMoESoftmaxRouter(const std::vector<ov::element::Type>&
     auto topk_k_m = wrap_const();
     auto topk_m = wrap_type_strict_index<ov::op::v11::TopK>({softmax_m, topk_k_m});
 
-    auto reduce_m = wrap_type<ov::op::v1::ReduceSum>({topk_m->output(0), any_input()}, consumers_count(1));
+    auto reduce_m = wrap_type<ov::op::v1::ReduceSum>({topk_m->output(0), any_input()});
     auto norm_m = wrap_type<ov::op::v1::Divide>({topk_m->output(0), reduce_m});
 
     ov::matcher_pass_callback callback = [OV_CAPTURE_CPY_AND_THIS](ov::pass::pattern::Matcher& m) {
@@ -82,6 +82,7 @@ FuseMoESoftmaxRouter::FuseMoESoftmaxRouter(const std::vector<ov::element::Type>&
             }
         }
         OPENVINO_ASSERT(ov::replace_output_update_name(indices_output, router_node->output(1)), "MoERouter fusion failed");
+        indices_output.get_tensor().set_names({});
         return true;
     };
 

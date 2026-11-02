@@ -499,3 +499,35 @@ and 2.404974 s prefetch: speculation regressed, rather than demonstrating speedu
 Page cache was uncontrolled and diagnostic comparison readback was enabled.
 Prefetch remains blocking at the target Router; no P5 early scheduling, P6/P7
 support, general GPU suite, ZE LES or new TSan result is claimed.
+
+## P4.5: OLMoE Export And Selected-Weight Sum
+
+Softmax Router fusion permits additional consumers of the selected-weight
+ReduceSum. It replaces normalized routing and indices but preserves the original
+TopK/value-sum computation for other consumers. The replaced old indices tensor
+names are cleared because the original TopK may remain live. A transformation
+regression checks that the extra sum output survives; all 34 Router fusion tests
+passed. This does not add a native non-normalizing fused Router mode.
+
+The workspace-only OLMoE adapter exports tiled three-MatMul experts. For
+`norm_topk_prob=false`, it uses normalized Top-k and multiplies the expert sum by
+the original selected-weight sum. This is mathematically equivalent, not a
+bitwise-preserving arithmetic rewrite. FP16 tracing must read the real stashed
+Linear parameters, not the frontend's zero FP32 placeholders. Tiny FP32 logits
+and two FP16 stateful prefill/decode/reset sequences passed PyTorch comparisons.
+Final expert weights are INT4 with all 16 Router matrices kept as FP16 constants.
+
+On OCL Debug, the complete OLMoE model passed six modes with one warm-up and two
+measured eight-token generations each: off, demand, prediction, prefetch, cold
+compiled cache and warm reuse. All 18 texts/counts agree. Fifteen chains executed
+2,520 prediction slot comparisons per enabled mode, with 885 ordered slot matches;
+prefetch modes recorded 2,520 slots and zero failures. Warm reuse left its single
+blob unchanged and predictions active. Load time was 7.469 s cold / 1.179 s warm.
+Evidence: workspace `les/results/olmoe_p4_acceptance2_20261102/acceptance.json`.
+
+Measured generation means were 1.131499 s demand, 1.216670 s prediction and
+1.231448 s prefetch. Prefetch uploaded 8,302,264,320 bytes versus demand's
+7,890,419,712 bytes across three generations. These short diagnostic runs show
+neither useful-byte efficiency nor performance acceptance. Full-model PyTorch
+logit/quality validation, long contexts, the full GPU suite, ZE LES and fresh
+TSan remain unverified. Default VLM/Qwen smoke also passed after runner changes.
