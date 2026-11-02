@@ -78,7 +78,26 @@ std::optional<ExpertWeightMemoryPool::Lease> ExpertWeightMemoryPool::try_acquire
         ++_reuses;
     } else {
         if (bytes > _budget_bytes - _allocated_bytes) {
-            return std::nullopt;
+            size_t reclaimable = 0;
+            for (const auto& candidate : _blocks) {
+                if (!candidate.leased && (!candidate.consumer || candidate.consumer->is_set())) {
+                    reclaimable += candidate.bytes;
+                }
+            }
+            if (bytes > _budget_bytes - _allocated_bytes + reclaimable) {
+                return std::nullopt;
+            }
+            for (auto candidate = _blocks.begin(); bytes > _budget_bytes - _allocated_bytes;) {
+                if (candidate->leased || (candidate->consumer && !candidate->consumer->is_set())) {
+                    ++candidate;
+                    continue;
+                }
+                if (candidate->consumer) {
+                    candidate->consumer->wait();
+                }
+                _allocated_bytes -= candidate->bytes;
+                candidate = _blocks.erase(candidate);
+            }
         }
         cldnn::moe_weights weights;
         std::array<cldnn::memory::ptr, 9> allocations;

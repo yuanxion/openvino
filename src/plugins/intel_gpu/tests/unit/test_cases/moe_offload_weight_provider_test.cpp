@@ -116,10 +116,45 @@ TEST_F(moe_les_upload, pool_layout_classes_budget_and_owner_are_isolated) {
     EXPECT_FALSE(pool.try_acquire(changed));
     changed = descriptor;
     changed.logical_layouts[0] = layout{data_types::u8, format::bfyx, {2, 1, 2, 8}};
-    EXPECT_FALSE(pool.try_acquire(changed));
+    auto changed_lease = pool.try_acquire(changed);
+    ASSERT_TRUE(changed_lease);
+    EXPECT_EQ(changed_lease->weights.gate_w->get_layout(), *changed.logical_layouts[0]);
+    EXPECT_EQ(pool.statistics().allocations, 3U);
+    EXPECT_TRUE(pool.release(*changed_lease, consumer));
     EXPECT_TRUE(pool.release(*signed_lease, consumer));
     EXPECT_TRUE(other.release(*independent, consumer));
     EXPECT_EQ(pool.statistics().allocated_bytes, 32U);
+}
+
+TEST_F(moe_les_upload, pool_reclaims_completed_incompatible_layout_only_when_admissible) {
+    using Pool = ov::intel_gpu::ocl::moe::ExpertWeightMemoryPool;
+    Pool::Descriptor descriptor;
+    descriptor.num_experts = 2;
+    descriptor.slots = 1;
+    descriptor.logical_layouts[0] = layout{data_types::u8, format::bfyx, {2, 1, 1, 16}};
+    Pool pool(get_test_engine(), 16);
+    auto lease = pool.try_acquire(descriptor);
+    ASSERT_TRUE(lease);
+    auto incompatible = descriptor;
+    incompatible.logical_layouts[0] = layout{data_types::i8, format::bfyx, {2, 1, 2, 8}};
+    EXPECT_FALSE(pool.try_acquire(incompatible));
+    cl::UserEvent gate(dynamic_cast<cldnn::ocl::ocl_engine&>(get_test_engine()).get_cl_context());
+    auto consumer = std::make_shared<cldnn::ocl::ocl_event>(gate);
+    EXPECT_TRUE(pool.release(*lease, consumer));
+    EXPECT_FALSE(pool.try_acquire(incompatible));
+    gate.setStatus(CL_COMPLETE);
+    auto oversized = incompatible;
+    oversized.logical_layouts[3] = layout{data_types::f16, format::bfyx, {2, 1, 1, 1}};
+    EXPECT_FALSE(pool.try_acquire(oversized));
+    EXPECT_EQ(pool.statistics().allocated_bytes, 16U);
+    EXPECT_EQ(pool.statistics().allocations, 1U);
+    auto replacement = pool.try_acquire(incompatible);
+    ASSERT_TRUE(replacement);
+    EXPECT_EQ(replacement->weights.gate_w->get_layout(), *incompatible.logical_layouts[0]);
+    EXPECT_EQ(pool.statistics().allocated_bytes, 16U);
+    EXPECT_EQ(pool.statistics().allocations, 2U);
+    EXPECT_EQ(pool.statistics().reuses, 0U);
+    EXPECT_TRUE(pool.release(*replacement, consumer));
 }
 
 TEST_F(moe_les_upload, pool_rejects_invalid_descriptors_and_missing_fences) {
