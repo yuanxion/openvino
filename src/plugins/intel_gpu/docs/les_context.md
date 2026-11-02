@@ -815,8 +815,12 @@ Physical allocations retain slot-sized layouts; provider-facing views retain
 the full logical expert dimension. Logical view `size()` is not physical
 allocation accounting. Budget admission counts the retained physical payload,
 not driver overhead, staging, activations or existing per-layer constants.
-Idle incompatible allocations are retained, not evicted, and can prevent a new
-layout class from fitting. Budget rejection returns no lease without waiting.
+Exact completed layout classes are reused first. Under budget pressure, released
+blocks with completed consumer fences can be reclaimed for a different layout;
+the new layout is allocated separately, never reinterpreted from an incompatible
+class. Active leases and incomplete consumers cannot be reclaimed. Admission
+checks total eligible bytes before eviction, so an unsatisfiable request leaves
+existing blocks intact and returns no lease without waiting for consumers.
 
 Leases have pool ownership and unique IDs. Callers must explicitly release
 every lease with a native consumer event covering all upload/compute uses from
@@ -833,6 +837,12 @@ and concurrent admission. Final directed validation passed 43/43; the complete
 focused run passed 546/546 in 37 suites, zero failures/skips. The actual GPU
 plugin also rebuilt successfully. Workspace evidence is
 `les/p7_pool_final_results.xml` and `les/p7_foundation_full_results.xml`.
+
+The subsequent heterogeneous-admission regression first reproduced the completed
+incompatible-layout blockage, then passed with reclamation. All six pool tests
+and 26 provider tests pass, and the source plugin rebuilt. Evidence is workspace
+`les/p7_reclaim_{repro,pool,provider}_results.xml`. This admission extension is
+still unenabled in production and is not network/budget integration.
 
 This foundation is not connected to production network allocations and adds
 no runtime switch. P7 remains incomplete: network-scoped ownership/budget,
