@@ -889,7 +889,12 @@ TEST_P(moe_3gemm_compressed_gpu_random, moe_accuracy_test_random) {
             network.get_stream(), next_router_ids.data(), 0, 0, next_router_ids.size() * sizeof(uint32_t), true);
         EXPECT_EQ(next_proxy_ids, prior_proxy_ids);
         EXPECT_EQ(next_router_ids, prior_router_ids);
-        (void)next_outputs.begin()->second.get_memory();
+        auto next_result = next_outputs.begin()->second.get_memory();
+        mem_lock<ov::float16, mem_lock_type::read> next_values(next_result, network.get_stream());
+        for (size_t index = 0; index < config.hidden_size; ++index) {
+            EXPECT_EQ(std::memcmp(&baseline_values[index], &next_values[index], sizeof(ov::float16)), 0)
+                << "Repeated proxy output mismatch " << index;
+        }
         return;
     }
 
