@@ -105,6 +105,7 @@ struct LesTraceContext {
 };
 uint64_t les_trace_next_id();
 bool les_trace_enabled();
+bool les_decode_single_pass_enabled();
 bool les_prediction_compare_enabled();
 uint64_t les_device_time(cldnn::stream& stream);
 void les_trace_interval(const char* kind, uint64_t start, uint64_t end, const LesTraceContext& context = {});

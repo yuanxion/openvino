@@ -1762,6 +1762,7 @@ public:
                                << std::endl;
 
         {
+            const bool single_pass = split_les && moe_otd::les_decode_single_pass_enabled();
             std::vector<std::pair<const char*, event::ptr>> trace_events;
             bool pass_a = false;
             auto enqueue_pairs = [&](const std::vector<event::ptr>& dependencies, const memory::ptr& indices,
@@ -1784,7 +1785,8 @@ public:
                                                {token_num * compute_experts, subgroup_size, static_cast<size_t>(_intermediate_size / N_BLOCK)},
                                                {1, subgroup_size, SUBGROUP_NUM}, split_les);
                 if (split_les && moe_otd::les_trace_enabled()) {
-                    trace_events.emplace_back(pass_a ? "pass_a_gate" : "pass_b_gate", ret_event);
+                    trace_events.emplace_back(single_pass ? "single_pass_gate" :
+                                              (pass_a ? "pass_a_gate" : "pass_b_gate"), ret_event);
                 }
 
                 std::vector<memory::ptr> args_down = {indices, mlp_down_wei_mem, mlp_down_scale_mem, mlp_down_zp_mem};
@@ -1808,7 +1810,8 @@ public:
                                           {1, subgroup_size, SUBGROUP_NUM},
                                           split_les);
                 if (split_les && moe_otd::les_trace_enabled()) {
-                    trace_events.emplace_back(pass_a ? "pass_a_down" : "pass_b_down", ret_event);
+                    trace_events.emplace_back(single_pass ? "single_pass_down" :
+                                              (pass_a ? "pass_a_down" : "pass_b_down"), ret_event);
                 }
                 return ret_event;
             };
@@ -1901,6 +1904,9 @@ public:
                         for (auto index : demand->missing_pairs) {
                             auto pair = wave_pairs[index];
                             missing_mask[pair / max_topk * compute_experts + pair % max_topk] = 1;
+                            if (single_pass) {
+                                ready_mask[pair / max_topk * compute_experts + pair % max_topk] = 1;
+                            }
                         }
                         if (shared_pending) {
                             for (size_t token = 0; token < token_num; ++token) {
@@ -1928,16 +1934,17 @@ public:
                         auto missing_memory = upload(missing_mask, 2);
                         trace_window("decode_metadata_window", metadata_start);
                         std::vector<event::ptr> dependencies = ret_event ? std::vector<event::ptr>{ret_event} : events;
-                        if (!demand->ready_pairs.empty() || shared_pending) {
+                        if (!single_pass && (!demand->ready_pairs.empty() || shared_pending)) {
                             pass_a = true;
                             ret_event = enqueue_pairs(dependencies, indices, ready_memory);
                             dependencies = {ret_event};
                             stream.flush();
                         }
                         _weight_provider->finish_les_demand(stream);
-                        if (!demand->missing_pairs.empty()) {
+                        // The opt-in control trades ready-first overlap for one masked compute pass.
+                        if (single_pass || !demand->missing_pairs.empty()) {
                             pass_a = false;
-                            ret_event = enqueue_pairs(dependencies, indices, missing_memory);
+                            ret_event = enqueue_pairs(dependencies, indices, single_pass ? ready_memory : missing_memory);
                         }
                         OPENVINO_ASSERT(ret_event, "LES wave produced no consumer");
                         stream.flush();
