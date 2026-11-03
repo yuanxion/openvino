@@ -56,6 +56,21 @@ their clock reads and logging are skipped when trace is off. The trace-on
 consumer window does not measure a wait that exists on the final production
 wave. `upload_join_window` remains the worker-future wait diagnostic.
 
+## Experimental Single-Pass Decode Control
+
+`MOE_LES_DECODE_SINGLE_PASS=1` is an opt-in control for the LES batched GEMV
+path (Decode/small batches). Only the exact value `1` enables it; the process
+samples it once. Default ready-first scheduling and Prefill are unchanged.
+The control joins missing uploads before one gate/down pass over both ready
+and missing pairs. Shared experts still execute once, and existing consumer
+events, metadata reuse waits and reservation fences remain intact.
+
+Trace records use `single_pass_gate` and `single_pass_down`. Fewer submissions
+trade away ready-compute/DMA overlap; this is not a default performance policy.
+Source Debug/OCL validation passed 96 directed and 572 full focused tests with
+the control enabled. Unprofiled single/dual timing is blocked by concurrent
+compilation, so no net speedup or Release acceptance is claimed.
+
 ## Worker Contract
 
 [les_context](../include/intel_gpu/runtime/les_context.hpp) owns one worker and

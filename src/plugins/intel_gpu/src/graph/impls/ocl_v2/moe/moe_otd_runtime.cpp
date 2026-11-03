@@ -52,6 +52,14 @@ bool les_trace_enabled() {
     return enabled;
 }
 
+bool les_decode_single_pass_enabled() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("MOE_LES_DECODE_SINGLE_PASS");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
 bool les_prediction_compare_enabled() {
     static const bool enabled = [] {
         const auto* value = std::getenv("OV_GPU_LES_PREDICT_COMPARE");
