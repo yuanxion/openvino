@@ -13,6 +13,7 @@
 
 #include "intel_gpu/runtime/debug_configuration.hpp"
 #include "runtime/ocl/ocl_stream.hpp"
+#include "runtime/ocl/ocl_event.hpp"
 
 namespace ov::intel_gpu::ocl::moe_otd {
 
@@ -71,11 +72,33 @@ uint64_t les_device_time(cldnn::stream& stream) {
     return device_time;
 }
 
-void les_trace_interval(const char* kind, uint64_t start, uint64_t end) {
+uint64_t les_trace_next_id() {
+    static std::atomic<uint64_t> next{0};
+    return next.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+static void les_trace_record(const char* kind, uint64_t start, uint64_t end, const LesTraceContext& context,
+                             int64_t expert, int64_t slot, int64_t component, size_t bytes) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
     GPU_DEBUG_INFO << "[LES_TRACE] {\"kind\":\"" << kind << "\",\"start_ns\":" << start
-                   << ",\"end_ns\":" << end << "}" << std::endl;
+                   << ",\"end_ns\":" << end << ",\"network\":" << context.network << ",\"layer\":" << context.layer
+                   << ",\"epoch\":" << context.epoch << ",\"tokens\":" << context.tokens
+                   << ",\"phase\":\"" << (context.tokens == 0 ? "unknown" : context.tokens == 1 ? "decode" :
+                                           context.tokens > 32 ? "prefill" : "batched")
+                   << "\",\"chunk\":" << context.chunk << ",\"wave\":" << context.wave << ",\"demand\":" << context.demand
+                   << ",\"speculative\":" << (context.speculative ? "true" : "false")
+                   << ",\"expert\":" << expert << ",\"slot\":" << slot << ",\"component\":" << component
+                   << ",\"bytes\":" << bytes << "}" << std::endl;
+}
+
+void les_trace_interval(const char* kind, uint64_t start, uint64_t end, const LesTraceContext& context) {
+    les_trace_record(kind, start, end, context, -1, -1, -1, 0);
+}
+
+void les_trace_weight_interval(const char* kind, uint64_t start, uint64_t end,
+                               uint32_t expert, size_t slot, int64_t component, size_t bytes, const LesTraceContext& context) {
+    les_trace_record(kind, start, end, context, expert, slot, component, bytes);
 }
 
 void OtdPerfCounters::dump() const {
@@ -263,7 +286,8 @@ void fill_weights_memory(cldnn::stream& exec_stream,
                          ParallelWeightReader& weight_reader,
                          cldnn::moe_weights& wei_mem,
                          const std::vector<uint32_t>& experts_list,
-                         const std::vector<size_t>& lru_experts) {
+                         const std::vector<size_t>& lru_experts,
+                         const LesTraceContext& trace) {
     struct tensor_fill_plan {
         size_t per_expert_size = 0;
         size_t src_offset = 0;
@@ -319,6 +343,7 @@ void fill_weights_memory(cldnn::stream& exec_stream,
 
             if (plan.per_expert_size != 0) {
                 payload.resize(plan.per_expert_size);
+                const auto read_start = les_trace_enabled() ? les_device_time(exec_stream) : 0;
                 if (perf) {
                     auto t0 = std::chrono::steady_clock::now();
                     weight_reader.read(reinterpret_cast<char*>(payload.data()), plan.per_expert_size, plan.src_offset);
@@ -328,15 +353,21 @@ void fill_weights_memory(cldnn::stream& exec_stream,
                 } else {
                     weight_reader.read(reinterpret_cast<char*>(payload.data()), plan.per_expert_size, plan.src_offset);
                 }
+                if (les_trace_enabled()) {
+                    les_trace_weight_interval("read_sync", read_start, les_device_time(exec_stream),
+                                              expert, lru_experts[index], offset_pos, plan.per_expert_size, trace);
+                }
             }
 
             // Transpose + GPU copy
             auto mem = tensors_by_offset[offset_pos];
             if (mem && plan.per_expert_size != 0) {
+                uint64_t copy_start = 0;
                 if (perf) {
                     auto t0 = std::chrono::steady_clock::now();
                     maybe_transpose_scale_zp(config, offset_pos, mem->get_layout(), payload, plan.per_expert_size);
                     auto t1 = std::chrono::steady_clock::now();
+                    copy_start = les_trace_enabled() ? les_device_time(exec_stream) : 0;
                     mem->copy_from(exec_stream, payload.data(), 0, plan.dst_offset, plan.per_expert_size, true);
                     auto t2 = std::chrono::steady_clock::now();
                     perf->transpose_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()),
@@ -346,7 +377,12 @@ void fill_weights_memory(cldnn::stream& exec_stream,
                     perf->tensor_load_count.fetch_add(1, std::memory_order_relaxed);
                 } else {
                     maybe_transpose_scale_zp(config, offset_pos, mem->get_layout(), payload, plan.per_expert_size);
+                    copy_start = les_trace_enabled() ? les_device_time(exec_stream) : 0;
                     mem->copy_from(exec_stream, payload.data(), 0, plan.dst_offset, plan.per_expert_size, true);
+                }
+                if (les_trace_enabled()) {
+                    les_trace_weight_interval("copy_sync_window", copy_start, les_device_time(exec_stream),
+                                              expert, lru_experts[index], offset_pos, plan.per_expert_size, trace);
                 }
             }
         }
@@ -362,13 +398,16 @@ std::vector<cldnn::event::ptr> fill_weights_memory_async(cldnn::stream& transfer
                                                       cldnn::moe_weights& weights,
                                                       const std::vector<uint32_t>& experts,
                                                       const std::vector<size_t>& slots,
-                                                      uint64_t* uploaded_bytes) {
+                                                      uint64_t* uploaded_bytes,
+                                                      const LesTraceContext& trace) {
     constexpr size_t chunk_bytes = 8 * 1024 * 1024;
     const std::array<cldnn::memory::ptr, 9> tensors{weights.gate_w, weights.up_w, weights.down_w,
                                                 weights.gate_s, weights.up_s, weights.down_s,
                                                 weights.gate_z, weights.up_z, weights.down_z};
     struct ReadPlan {
         cldnn::memory::ptr memory;
+        uint32_t expert;
+        size_t slot;
         size_t component;
         size_t source;
         size_t destination;
@@ -398,7 +437,7 @@ std::vector<cldnn::event::ptr> fill_weights_memory_async(cldnn::stream& transfer
             OPENVINO_ASSERT(bytes <= file_size - source, "LES tensor read outside weight file");
             OPENVINO_ASSERT(slots[index] < memory->size() / bytes, "LES upload outside physical slot buffer");
             OPENVINO_ASSERT(component < 3 || bytes <= chunk_bytes, "LES transposed metadata exceeds 8 MiB per expert");
-            plans.push_back({memory, component, source, slots[index] * bytes, bytes});
+            plans.push_back({memory, experts[index], slots[index], component, source, slots[index] * bytes, bytes});
         }
     }
     struct Staging {
@@ -407,6 +446,7 @@ std::vector<cldnn::event::ptr> fill_weights_memory_async(cldnn::stream& transfer
     };
     std::array<Staging, 2> staging;
     std::vector<cldnn::event::ptr> events;
+    std::vector<ReadPlan> trace_plans;
     size_t cursor = 0;
     std::exception_ptr error;
     auto* perf = get_perf_counters();
@@ -426,12 +466,18 @@ std::vector<cldnn::event::ptr> fill_weights_memory_async(cldnn::stream& transfer
                 const auto read_start = les_trace_enabled() ? les_device_time(transfer_stream) : 0;
                 weight_reader.read(reinterpret_cast<char*>(buffer.bytes.data()), bytes, plan.source + offset);
                 if (les_trace_enabled()) {
-                    les_trace_interval("read", read_start, les_device_time(transfer_stream));
+                    les_trace_weight_interval("read", read_start, les_device_time(transfer_stream),
+                                              plan.expert, plan.slot, plan.component, bytes, trace);
                 }
                 maybe_transpose_scale_zp(config, plan.component, plan.memory->get_layout(), buffer.bytes, bytes);
                 buffer.upload = plan.memory->copy_from(transfer_stream, buffer.bytes.data(), 0, plan.destination + offset, bytes, false);
                 OPENVINO_ASSERT(buffer.upload, "LES upload did not return a completion event");
                 events.push_back(buffer.upload);
+                if (les_trace_enabled()) {
+                    auto trace_plan = plan;
+                    trace_plan.bytes = bytes;
+                    trace_plans.push_back(std::move(trace_plan));
+                }
                 if (uploaded_bytes) {
                     *uploaded_bytes += bytes;
                 }
@@ -459,6 +505,14 @@ std::vector<cldnn::event::ptr> fill_weights_memory_async(cldnn::stream& transfer
     }
     if (error) {
         std::rethrow_exception(error);
+    }
+    for (size_t index = 0; index < trace_plans.size(); ++index) {
+        auto* native = dynamic_cast<cldnn::ocl::ocl_event*>(events[index].get());
+        OPENVINO_ASSERT(native, "LES copy trace requires native events and profiling");
+        const auto& plan = trace_plans[index];
+        les_trace_weight_interval("copy", native->get().getProfilingInfo<CL_PROFILING_COMMAND_START>(),
+                                 native->get().getProfilingInfo<CL_PROFILING_COMMAND_END>(),
+                                 plan.expert, plan.slot, plan.component, plan.bytes, trace);
     }
     return events;
 }

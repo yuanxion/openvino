@@ -210,6 +210,7 @@ std::shared_ptr<OffloadExpertWeightProvider> OffloadExpertWeightProvider::make_l
                     "LES Prefill bank exceeds resident capacity");
     auto provider = std::make_shared<OffloadExpertWeightProvider>(capacity, _config, _weight_bin_offsets, _weights_path);
     provider->_slot_offset = _slot_offset + slot_offset;
+    provider->_trace = _trace;
     return provider;
 }
 
@@ -312,16 +313,31 @@ std::optional<ExpertDemand> OffloadExpertWeightProvider::begin_les_demand(const 
         OPENVINO_ASSERT(_shadow_reservation, "LES demand shadow reservation failed");
         OPENVINO_ASSERT(_resident && _les_context->get_transfer_stream(), "LES provider is not bound to a transfer lane");
         ExpertDemand demand{physical_slots(_reservation->slots), _reservation->ready_pairs, _reservation->missing_pairs};
+        if (moe_otd::les_trace_enabled()) {
+            _trace.demand = moe_otd::les_trace_next_id();
+            _trace.speculative = false;
+            auto unique = experts;
+            std::sort(unique.begin(), unique.end());
+            unique.erase(std::unique(unique.begin(), unique.end()), unique.end());
+            for (auto expert : unique) {
+                const auto pair = static_cast<size_t>(std::find(experts.begin(), experts.end(), expert) - experts.begin());
+                const bool missing = std::find(_reservation->missing_experts.begin(), _reservation->missing_experts.end(), expert) !=
+                                     _reservation->missing_experts.end();
+                auto timestamp = moe_otd::les_device_time(*_les_context->get_transfer_stream());
+                moe_otd::les_trace_weight_interval(missing ? "miss" : "hit", timestamp, timestamp,
+                                                   expert, demand.slots[pair], -1, 0, _trace);
+            }
+        }
         _upload_events = std::make_shared<std::vector<cldnn::event::ptr>>();
         if (!_reservation->missing_experts.empty()) {
             auto task = _les_context->submit(_les_epoch,
             [this, events = _upload_events, transfer = _les_context->get_transfer_stream(), weights = *_resident,
-                 missing = _reservation->missing_experts, slots = physical_slots(_reservation->missing_slots)]() mutable {
+                 missing = _reservation->missing_experts, slots = physical_slots(_reservation->missing_slots), trace = _trace]() mutable {
                     if (auto* perf = moe_otd::get_perf_counters()) {
                         perf->les_worker_tasks.fetch_add(1, std::memory_order_relaxed);
                     }
                     *events = moe_otd::fill_weights_memory_async(*transfer, _config, _weight_bin_offsets, _weight_reader,
-                                                               weights, missing, slots);
+                                                               weights, missing, slots, nullptr, trace);
                 });
             _upload_completion = std::move(task.completion);
         }
@@ -336,7 +352,11 @@ void OffloadExpertWeightProvider::finish_les_demand(cldnn::stream& stream) {
     OPENVINO_ASSERT(_reservation && !_demand_finished, "LES demand is missing or already finished");
     try {
         if (_upload_completion.valid()) {
+            const auto wait_start = moe_otd::les_trace_enabled() ? moe_otd::les_device_time(stream) : 0;
             _upload_completion.get();
+            if (moe_otd::les_trace_enabled()) {
+                moe_otd::les_trace_interval("upload_join_window", wait_start, moe_otd::les_device_time(stream), _trace);
+            }
         }
         if (_prefetch_error) {
             auto error = _prefetch_error;
@@ -469,6 +489,18 @@ void OffloadExpertWeightProvider::prefetch_les_demand(const std::vector<uint32_t
             return;
         }
         const auto prefetched_slots = _reservation->missing_experts.size();
+        if (moe_otd::les_trace_enabled()) {
+            _trace.demand = moe_otd::les_trace_next_id();
+            _trace.speculative = true;
+            for (size_t index = 0; index < selected.size(); ++index) {
+                const auto expert = selected[index];
+                const bool missing = std::find(_reservation->missing_experts.begin(), _reservation->missing_experts.end(), expert) !=
+                                     _reservation->missing_experts.end();
+                const auto timestamp = moe_otd::les_device_time(*_les_context->get_transfer_stream());
+                moe_otd::les_trace_weight_interval(missing ? "prefetch_miss" : "prefetch_hit", timestamp, timestamp,
+                    expert, _reservation->slots[index] + _slot_offset, -1, 0, _trace);
+            }
+        }
         if (!prefetched_slots) {
             release();
             return;
@@ -478,10 +510,10 @@ void OffloadExpertWeightProvider::prefetch_les_demand(const std::vector<uint32_t
         if (!_reservation->missing_experts.empty()) {
             auto task = _les_context->try_submit_speculative(_les_epoch,
                 [this, events = _upload_events, transfer = _les_context->get_transfer_stream(), weights = *_resident,
-                 missing = _reservation->missing_experts, slots = physical_slots(_reservation->missing_slots)]() mutable {
+                 missing = _reservation->missing_experts, slots = physical_slots(_reservation->missing_slots), trace = _trace]() mutable {
                     try {
                         *events = moe_otd::fill_weights_memory_async(*transfer, _config, _weight_bin_offsets, _weight_reader,
-                                                                     weights, missing, slots, &_prefetch_uploaded_bytes);
+                                                                     weights, missing, slots, &_prefetch_uploaded_bytes, trace);
                     } catch (...) {
                         _prefetch_error = std::current_exception();
                     }
@@ -566,6 +598,11 @@ std::optional<ExpertSlotLease> OffloadExpertWeightProvider::try_acquire_simultan
 
         const auto item = _cache->get_lru_item(expert);
         const auto slot = item.first;
+        if (moe_otd::les_trace_enabled()) {
+            _trace.demand = moe_otd::les_trace_next_id();
+            const auto timestamp = moe_otd::les_device_time(stream);
+            moe_otd::les_trace_weight_interval(item.second ? "hit" : "miss", timestamp, timestamp, expert, slot, -1, 0, _trace);
+        }
 
         if (item.second) {
             if (perf) {
@@ -576,7 +613,7 @@ std::optional<ExpertSlotLease> OffloadExpertWeightProvider::try_acquire_simultan
                 perf->gpu_misses.fetch_add(1, std::memory_order_relaxed);
             }
             OPENVINO_ASSERT(_resident != nullptr, "OffloadExpertWeightProvider: resident buffers not bound");
-            moe_otd::fill_weights_memory(stream, _config, _weight_bin_offsets, _weight_reader, *_resident, {expert}, {slot});
+            moe_otd::fill_weights_memory(stream, _config, _weight_bin_offsets, _weight_reader, *_resident, {expert}, {slot}, _trace);
             _cache->set_filled(slot);
         }
 
@@ -597,6 +634,11 @@ size_t OffloadExpertWeightProvider::acquire_one(uint32_t expert, cldnn::stream& 
 
     const auto item = _cache->get_lru_item(expert);
     const auto slot = item.first;
+    if (moe_otd::les_trace_enabled()) {
+        _trace.demand = moe_otd::les_trace_next_id();
+        const auto timestamp = moe_otd::les_device_time(stream);
+        moe_otd::les_trace_weight_interval(item.second ? "hit" : "miss", timestamp, timestamp, expert, slot, -1, 0, _trace);
+    }
 
     if (item.second) {
         if (perf) {
@@ -607,7 +649,7 @@ size_t OffloadExpertWeightProvider::acquire_one(uint32_t expert, cldnn::stream& 
             perf->gpu_misses.fetch_add(1, std::memory_order_relaxed);
         }
         OPENVINO_ASSERT(_resident != nullptr, "OffloadExpertWeightProvider: resident buffers not bound");
-        moe_otd::fill_weights_memory(stream, _config, _weight_bin_offsets, _weight_reader, *_resident, {expert}, {slot});
+        moe_otd::fill_weights_memory(stream, _config, _weight_bin_offsets, _weight_reader, *_resident, {expert}, {slot}, _trace);
         _cache->set_filled(slot);
     }
 

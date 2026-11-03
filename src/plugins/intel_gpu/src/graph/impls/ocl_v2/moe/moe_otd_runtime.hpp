@@ -93,10 +93,24 @@ struct OtdPerfCounters {
 };
 
 OtdPerfCounters* get_perf_counters();
+struct LesTraceContext {
+    uint64_t network = 0;
+    uint64_t layer = 0;
+    uint64_t epoch = 0;
+    uint64_t tokens = 0;
+    uint64_t chunk = 0;
+    uint64_t wave = 0;
+    uint64_t demand = 0;
+    bool speculative = false;
+};
+uint64_t les_trace_next_id();
 bool les_trace_enabled();
 bool les_prediction_compare_enabled();
 uint64_t les_device_time(cldnn::stream& stream);
-void les_trace_interval(const char* kind, uint64_t start, uint64_t end);
+void les_trace_interval(const char* kind, uint64_t start, uint64_t end, const LesTraceContext& context = {});
+void les_trace_weight_interval(const char* kind, uint64_t start, uint64_t end,
+                               uint32_t expert, size_t slot, int64_t component, size_t bytes,
+                               const LesTraceContext& context = {});
 
 class ParallelWeightReader {
 public:
@@ -155,7 +169,8 @@ void fill_weights_memory(cldnn::stream& exec_stream,
                          ParallelWeightReader& weight_reader,
                          cldnn::moe_weights& wei_mem,
                          const std::vector<uint32_t>& experts_list,
-                         const std::vector<size_t>& lru_experts);
+                         const std::vector<size_t>& lru_experts,
+                         const LesTraceContext& trace = {});
 
 std::vector<cldnn::event::ptr> fill_weights_memory_async(cldnn::stream& transfer_stream,
                                                       const cldnn::MOECompressed::Config& config,
@@ -164,6 +179,7 @@ std::vector<cldnn::event::ptr> fill_weights_memory_async(cldnn::stream& transfer
                                                       cldnn::moe_weights& weights,
                                                       const std::vector<uint32_t>& experts,
                                                       const std::vector<size_t>& slots,
-                                                      uint64_t* uploaded_bytes = nullptr);
+                                                      uint64_t* uploaded_bytes = nullptr,
+                                                      const LesTraceContext& trace = {});
 
 }  // namespace ov::intel_gpu::ocl::moe_otd
