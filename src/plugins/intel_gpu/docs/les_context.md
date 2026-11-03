@@ -35,6 +35,27 @@ worker before releasing network resources. P2 callbacks drain their issued DMA
 before returning, including failure paths. There is no new public infer-request
 cancellation interface.
 
+## Decode Metadata And Completion
+
+LES Decode retains three network-local `usm_host` metadata buffers. Host writes
+use `mem_lock<int32_t, mem_lock_type::write>` rather than blocking OpenCL memcpy.
+The preceding wave consumer completes before these buffers are reused. This
+does not change the memory budget, expert slots, kernel arithmetic or masks.
+
+The last wave need not block the Host before reduction submission. Reduction
+depends on its native consumer event, which the weight provider also retains
+and waits on before slot release. Non-final waves still wait before metadata
+reuse. Trace mode still waits to obtain native event timings; it is deliberately
+not equivalent to production scheduling.
+
+With `MOE_LES_TRACE=1` and `OV_VERBOSE=1`, Decode additionally emits
+`route_readback_window`, `demand_reserve_window`, `decode_metadata_window` and
+`consumer_wait_window`. They are Host windows in the existing device-clock
+domain, not native GPU commands. These windows add no new device dependency;
+their clock reads and logging are skipped when trace is off. The trace-on
+consumer window does not measure a wait that exists on the final production
+wave. `upload_join_window` remains the worker-future wait diagnostic.
+
 ## Worker Contract
 
 [les_context](../include/intel_gpu/runtime/les_context.hpp) owns one worker and
