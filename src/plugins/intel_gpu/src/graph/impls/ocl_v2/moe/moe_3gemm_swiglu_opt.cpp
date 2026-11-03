@@ -1817,6 +1817,14 @@ public:
             if (!split_les) {
                 ret_event = enqueue_pairs(events, batch_mem_ptr, nullptr);
             } else {
+                const bool trace_decode = moe_otd::les_trace_enabled();
+                auto trace_window = [&](const char* kind, uint64_t start) {
+                    if (trace_decode) {
+                        moe_otd::les_trace_interval(kind, start, moe_otd::les_device_time(stream),
+                            std::dynamic_pointer_cast<moe::OffloadExpertWeightProvider>(_weight_provider)->trace_context());
+                    }
+                };
+                const auto route_start = trace_decode ? moe_otd::les_device_time(stream) : 0;
                 for (const auto& dependency : events) {
                     if (dependency) {
                         dependency->wait();
@@ -1825,6 +1833,7 @@ public:
                 const size_t pair_count = token_num * static_cast<size_t>(max_topk);
                 std::vector<uint32_t> experts(pair_count);
                 scratch.topk_id->copy_to(stream, experts.data(), 0, 0, pair_count * sizeof(uint32_t), true);
+                trace_window("route_readback_window", route_start);
                 if (cur_net.is_les_prediction_enabled() && moe_otd::les_prediction_compare_enabled()) {
                     auto prediction = cur_net.get_les_proxy_state(instance.id());
                     if (prediction.predicted_indices && prediction.prediction_ready) {
@@ -1869,7 +1878,9 @@ public:
                             wave_experts.push_back(experts[pair]);
                             wave_pairs.push_back(pair);
                         }
+                        const auto reserve_start = trace_decode ? moe_otd::les_device_time(stream) : 0;
                         auto demand = _weight_provider->begin_les_demand(wave_experts);
+                        trace_window("demand_reserve_window", reserve_start);
                         OPENVINO_ASSERT(demand && !wave_pairs.empty(), "LES wave reservation cannot progress");
                         if (auto* perf = moe_otd::get_perf_counters()) {
                             perf->les_waves.fetch_add(1, std::memory_order_relaxed);
@@ -1906,12 +1917,16 @@ public:
                                     perf->les_decode_metadata_allocations.fetch_add(1, std::memory_order_relaxed);
                                 }
                             }
-                            memory->copy_from(stream, values.data(), 0, 0, values.size() * sizeof(int32_t), true);
+                            // The previous wave consumer has completed; host USM needs no queue copy.
+                            mem_lock<int32_t, mem_lock_type::write> metadata(memory, stream);
+                            std::copy(values.begin(), values.end(), metadata.data());
                             return memory;
                         };
+                        const auto metadata_start = trace_decode ? moe_otd::les_device_time(stream) : 0;
                         auto indices = upload(slots, 0);
                         auto ready_memory = upload(ready_mask, 1);
                         auto missing_memory = upload(missing_mask, 2);
+                        trace_window("decode_metadata_window", metadata_start);
                         std::vector<event::ptr> dependencies = ret_event ? std::vector<event::ptr>{ret_event} : events;
                         if (!demand->ready_pairs.empty() || shared_pending) {
                             pass_a = true;
@@ -1927,7 +1942,12 @@ public:
                         OPENVINO_ASSERT(ret_event, "LES wave produced no consumer");
                         stream.flush();
                         _weight_provider->set_consumer(ret_event);
-                        ret_event->wait();
+                        // Reuse needs completion; the final reduction and slot release already retain this fence.
+                        if (trace_decode || wave_pairs.size() < remaining) {
+                            const auto consumer_start = trace_decode ? moe_otd::les_device_time(stream) : 0;
+                            ret_event->wait();
+                            trace_window("consumer_wait_window", consumer_start);
+                        }
                         for (const auto& entry : trace_events) {
                             auto* native = dynamic_cast<cldnn::ocl::ocl_event*>(entry.second.get());
                             OPENVINO_ASSERT(native, "LES trace requires native kernel events");
