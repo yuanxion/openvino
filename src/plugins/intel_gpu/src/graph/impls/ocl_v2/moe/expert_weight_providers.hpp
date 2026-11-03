@@ -134,6 +134,8 @@ public:
     std::shared_ptr<IExpertWeightProvider> clone() const override;
     std::shared_ptr<OffloadExpertWeightProvider> make_les_bank(size_t capacity, size_t slot_offset) const;
     void reset_les_cache();
+    void set_trace_context(const moe_otd::LesTraceContext& context) { _trace = context; }
+    moe_otd::LesTraceContext trace_context() const { return _trace; }
     void set_les_context(cldnn::les_context* context, uint64_t epoch) override;
     void set_consumer(cldnn::event::ptr consumer) override;
     std::optional<ExpertDemand> begin_les_demand(const std::vector<uint32_t>& experts) override;
@@ -167,6 +169,7 @@ private:
     bool _bound = false;
     cldnn::les_context* _les_context = nullptr;
     uint64_t _les_epoch = 0;
+    moe_otd::LesTraceContext _trace;
     std::unique_ptr<ExpertSlotReservations> _reservations;
     std::optional<ExpertSlotReservations::Ticket> _reservation;
     std::unique_ptr<ExpertSlotReservations> _demand_shadow;

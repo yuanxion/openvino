@@ -1065,6 +1065,7 @@ TEST_P(moe_3gemm_compressed_gpu_random, moe_accuracy_test_random) {
         auto prefill_waves = perf ? perf->les_prefill_waves.load() : 0;
         auto prefill_pairs = perf ? perf->les_prefill_pairs.load() : 0;
         auto prefill_chunks = perf ? perf->les_prefill_chunks.load() : 0;
+        auto expert_misses = perf ? perf->gpu_misses.load() : 0;
         auto metadata_allocations = perf ? perf->les_decode_metadata_allocations.load() : 0;
         auto path_waves = [&]() -> uint64_t {
             if (!perf) return 0;
@@ -1081,6 +1082,9 @@ TEST_P(moe_3gemm_compressed_gpu_random, moe_accuracy_test_random) {
             EXPECT_GT(perf->les_prefill_waves.load(), prefill_waves);
             EXPECT_EQ(perf->les_prefill_pairs.load() - prefill_pairs, config.seq_len * config.top_k);
             EXPECT_EQ(perf->les_prefill_chunks.load() - prefill_chunks, (config.seq_len + 127) / 128);
+            if (config.seq_len > 128 && (param.prefill_path == 1 || grouped_fallback)) {
+                EXPECT_LE(perf->gpu_misses.load() - expert_misses, config.num_experts);
+            }
             EXPECT_EQ(path_waves() - previous_path_waves, perf->les_prefill_waves.load() - prefill_waves);
             const auto& buffers = network.get_primitive("moe_3gemm_fused_compressed")->get_intermediates_memories();
             EXPECT_LE(buffers[1]->get_layout().count(), 128 * config.top_k * config.hidden_size);

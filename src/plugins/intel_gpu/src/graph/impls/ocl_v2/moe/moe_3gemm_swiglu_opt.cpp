@@ -638,6 +638,12 @@ public:
         }
         _weight_provider->set_les_context(context, network.get_les_epoch());
         auto& instance = reinterpret_cast<typed_primitive_inst<moe_3gemm_fused_compressed>&>(ins);
+        if (moe_otd::les_trace_enabled()) {
+            auto provider = std::dynamic_pointer_cast<moe::OffloadExpertWeightProvider>(_weight_provider);
+            OPENVINO_ASSERT(provider, "LES prefetch trace requires offload provider");
+            provider->set_trace_context({network.get_id(), instance.get_impl_params()->unique_id,
+                                         network.get_les_epoch(), 1});
+        }
         bind_weights_on_first_exec(instance);
         _weight_provider->prefetch_les_demand(experts, network.get_stream());
     }
@@ -1927,7 +1933,8 @@ public:
                             OPENVINO_ASSERT(native, "LES trace requires native kernel events");
                             moe_otd::les_trace_interval(entry.first,
                                 native->get().getProfilingInfo<CL_PROFILING_COMMAND_START>(),
-                                native->get().getProfilingInfo<CL_PROFILING_COMMAND_END>());
+                                native->get().getProfilingInfo<CL_PROFILING_COMMAND_END>(),
+                                std::dynamic_pointer_cast<moe::OffloadExpertWeightProvider>(_weight_provider)->trace_context());
                         }
                         trace_events.clear();
                         shared_pending = false;
@@ -2972,30 +2979,66 @@ public:
                     ov::Shape{std::min(token_count, prefill_chunk_tokens) * top_k, static_cast<size_t>(_hidden_size)},
                     data_types::f16, format::bfyx));
             }
-            for (size_t start = 0; start < token_count; start += prefill_chunk_tokens) {
+            const bool expert_major = !use_grouped_prefill && !use_micro_gemm_prefill && token_count > prefill_chunk_tokens;
+            std::vector<uint32_t> all_routed;
+            if (expert_major) {
+                all_routed.resize(token_count * top_k);
+                original_ids->copy_to(stream, all_routed.data(), 0, 0, all_routed.size() * sizeof(uint32_t), true);
+                instance.output_memory_ptr(0)->fill(stream, 0u);
+                result = stream.enqueue_marker({});
+            }
+            const auto global_plan = moe_otd::plan_prefill_waves(all_routed, config.num_expert, resident_slot_count());
+            const size_t chunk_count = (token_count + prefill_chunk_tokens - 1) / prefill_chunk_tokens;
+            const size_t steps = expert_major ? global_plan.waves.size() * chunk_count : chunk_count;
+            std::array<std::optional<moe::ExpertDemand>, 2> demands;
+            for (size_t step = 0; step < steps; ++step) {
+                const size_t start = (expert_major ? step % chunk_count : step) * prefill_chunk_tokens;
+                std::vector<std::pair<event::ptr, moe_otd::LesTraceContext>> compute_trace;
                 auto& execution = *scratch.prefill;
                 execution.tokens = std::min(prefill_chunk_tokens, token_count - start);
                 execution.hidden = view(instance.input_memory_ptr(0), start, execution.tokens, _hidden_size);
                 execution.output = view(instance.output_memory_ptr(0), start, execution.tokens, _hidden_size);
                 scratch.topk_id = view(original_ids, start, execution.tokens, top_k);
                 scratch.topk_weights = view(original_weights, start, execution.tokens, top_k);
-                if (!use_grouped_prefill && !use_micro_gemm_prefill) {
+                if (!use_grouped_prefill && !use_micro_gemm_prefill && !expert_major) {
                     execution.output->fill(stream, 0u);
                 }
                 std::vector<uint32_t> routed(execution.tokens * top_k);
-                scratch.topk_id->copy_to(stream, routed.data(), 0, 0, routed.size() * sizeof(uint32_t), true);
-                auto plan = moe_otd::plan_prefill_waves(routed, config.num_expert, resident_slot_count());
-                std::array<std::optional<moe::ExpertDemand>, 2> demands;
-                for (size_t wave_index = 0; wave_index < plan.waves.size(); ++wave_index) {
+                if (expert_major) {
+                    std::copy_n(all_routed.begin() + start * top_k, routed.size(), routed.begin());
+                } else {
+                    scratch.topk_id->copy_to(stream, routed.data(), 0, 0, routed.size() * sizeof(uint32_t), true);
+                }
+                const auto chunk_plan = moe_otd::plan_prefill_waves(expert_major ? std::vector<uint32_t>{} : routed,
+                                                                  config.num_expert, resident_slot_count());
+                const auto& plan = expert_major ? global_plan : chunk_plan;
+                const size_t first_wave = expert_major ? step / chunk_count : 0;
+                const size_t last_wave = expert_major ? first_wave + 1 : plan.waves.size();
+                for (size_t wave_index = first_wave; wave_index < last_wave; ++wave_index) {
                     const auto& wave = plan.waves[wave_index];
                     auto bank = wave.bank;
                     if (!demands[bank]) {
+                        if (moe_otd::les_trace_enabled()) {
+                            auto trace = provider->trace_context();
+                            trace.chunk = start;
+                            trace.wave = wave_index;
+                            banks[bank]->set_trace_context(trace);
+                        }
                         demands[bank] = banks[bank]->begin_les_demand(wave.experts);
                     }
                     OPENVINO_ASSERT(demands[bank], "LES Prefill wave reservation failed");
-                    banks[bank]->finish_les_demand(stream);
-                    if (wave_index + 1 < plan.waves.size() && plan.waves[wave_index + 1].bank != bank) {
+                    if (!expert_major || start == 0) {
+                        banks[bank]->finish_les_demand(stream);
+                    }
+                    if (wave_index + 1 < plan.waves.size() && plan.waves[wave_index + 1].bank != bank &&
+                        (!expert_major || start == 0)) {
                         const auto& next = plan.waves[wave_index + 1];
+                        if (moe_otd::les_trace_enabled()) {
+                            auto trace = provider->trace_context();
+                            trace.chunk = start;
+                            trace.wave = wave_index + 1;
+                            banks[next.bank]->set_trace_context(trace);
+                        }
                         demands[next.bank] = banks[next.bank]->begin_les_demand(next.experts);
                         OPENVINO_ASSERT(demands[next.bank], "LES Prefill lookahead reservation failed");
                     }
@@ -3014,6 +3057,12 @@ public:
                             }
                             auto offset = execution.gather_tokens.size();
                             for (auto pair : wave.pairs) {
+                                if (expert_major) {
+                                    if (pair < start * top_k || pair >= (start + execution.tokens) * top_k) {
+                                        continue;
+                                    }
+                                    pair -= start * top_k;
+                                }
                                 if (routed[pair] == wave.experts[index]) {
                                     execution.row_lut[pair] = static_cast<int32_t>(execution.gather_tokens.size());
                                     execution.gather_tokens.push_back(static_cast<int32_t>(pair / top_k));
@@ -3025,6 +3074,27 @@ public:
                         }
                         execution.offsets[slot] = static_cast<int32_t>(execution.gather_tokens.size());
                     }
+                    if (expert_major) {
+                        execution.routed_experts.clear();
+                        execution.resident_slots.clear();
+                        for (size_t index = 0; index < wave.experts.size(); ++index) {
+                            if (std::find(routed.begin(), routed.end(), wave.experts[index]) != routed.end()) {
+                                execution.routed_experts.push_back(wave.experts[index]);
+                                execution.resident_slots.push_back(demands[bank]->slots[index]);
+                            }
+                        }
+                        if (execution.routed_experts.empty()) {
+                            if (start + execution.tokens == token_count) {
+                                demands[bank].reset();
+                            }
+                            continue;
+                        }
+                        if (moe_otd::les_trace_enabled()) {
+                            auto trace = banks[bank]->trace_context();
+                            trace.chunk = start;
+                            banks[bank]->set_trace_context(trace);
+                        }
+                    }
                     if (use_micro_gemm_prefill) {
                         result = exec_prefill_micro_gemm({}, instance, scratch, false);
                     } else if (use_grouped_prefill) {
@@ -3033,11 +3103,17 @@ public:
                         result = exec_prefill_onednn({}, stream, instance, scratch);
                     }
                     banks[bank]->set_consumer(result);
+                    if (moe_otd::les_trace_enabled()) {
+                        compute_trace.emplace_back(result, banks[bank]->trace_context());
+                    }
                     stream.flush();
-                    demands[bank].reset();
+                    if (!expert_major || start + execution.tokens == token_count) {
+                        demands[bank].reset();
+                    }
                     if (auto* perf = moe_otd::get_perf_counters()) {
                         perf->les_prefill_waves.fetch_add(1, std::memory_order_relaxed);
-                        perf->les_prefill_pairs.fetch_add(wave.pairs.size(), std::memory_order_relaxed);
+                        perf->les_prefill_pairs.fetch_add(expert_major ? execution.gather_tokens.size() : wave.pairs.size(),
+                                                         std::memory_order_relaxed);
                         auto& path = use_micro_gemm_prefill ? perf->les_prefill_micro_waves :
                                      use_grouped_prefill ? perf->les_prefill_grouped_waves : perf->les_prefill_per_expert_waves;
                         path.fetch_add(1, std::memory_order_relaxed);
@@ -3053,7 +3129,7 @@ public:
                                            {execution.canonical, scratch.topk_weights, lut}, {execution.output},
                                            {execution.tokens * local, 1, 1}, {local, 1, 1}, true);
                 }
-                if (_has_shared_expert) {
+                if (_has_shared_expert && (!expert_major || first_wave + 1 == global_plan.waves.size())) {
                     result->wait();
                     init_shared_primitives(engine, scratch.moe_fusion_wei_addr, static_cast<int>(execution.tokens));
                     execute_shared_expert(stream.get_onednn_stream(), static_cast<int>(execution.tokens),
@@ -3062,16 +3138,25 @@ public:
                 }
                 stream.flush();
                 result->wait();
+                for (const auto& entry : compute_trace) {
+                    auto* native = dynamic_cast<cldnn::ocl::ocl_event*>(entry.first.get());
+                    OPENVINO_ASSERT(native, "LES Prefill compute trace requires native profiling events");
+                    moe_otd::les_trace_interval("compute_tail",
+                        native->get().getProfilingInfo<CL_PROFILING_COMMAND_START>(),
+                        native->get().getProfilingInfo<CL_PROFILING_COMMAND_END>(), entry.second);
+                }
                 for (const auto& event : execution.trace_events) {
                     auto* native = dynamic_cast<cldnn::ocl::ocl_event*>(event.get());
                     OPENVINO_ASSERT(native, "LES Prefill trace requires native kernel events");
                     moe_otd::les_trace_interval("prefill_micro",
                         native->get().getProfilingInfo<CL_PROFILING_COMMAND_START>(),
-                        native->get().getProfilingInfo<CL_PROFILING_COMMAND_END>());
+                        native->get().getProfilingInfo<CL_PROFILING_COMMAND_END>(), provider->trace_context());
                 }
                 execution.trace_events.clear();
-                if (auto* perf = moe_otd::get_perf_counters()) {
-                    perf->les_prefill_chunks.fetch_add(1, std::memory_order_relaxed);
+                if (!expert_major || first_wave + 1 == global_plan.waves.size()) {
+                    if (auto* perf = moe_otd::get_perf_counters()) {
+                        perf->les_prefill_chunks.fetch_add(1, std::memory_order_relaxed);
+                    }
                 }
             }
             for (const auto& bank : banks) {
@@ -3092,11 +3177,37 @@ public:
         return result;
     }
 
+    cldnn::event::ptr execute_impl_traced(const std::vector<cldnn::event::ptr>& events, cldnn::primitive_inst& ins) {
+        if (!moe_otd::les_trace_enabled()) {
+            return execute_impl(events, ins);
+        }
+        auto& instance = static_cast<typed_primitive_inst<moe_3gemm_fused_compressed>&>(ins);
+        auto& network = ins.get_network();
+        auto& stream = network.get_stream();
+        auto hidden_layout = instance.input_memory_ptr(0)->get_layout();
+        moe_otd::LesTraceContext trace{network.get_id(), instance.get_impl_params()->unique_id,
+                          network.get_les_epoch(), get_seq_len(hidden_layout)};
+        if (auto provider = std::dynamic_pointer_cast<moe::OffloadExpertWeightProvider>(_weight_provider)) {
+            provider->set_trace_context(trace);
+        }
+        auto begin = stream.enqueue_marker(events);
+        auto result = execute_impl(events, ins);
+        auto end = stream.enqueue_marker({});
+        stream.flush();
+        end->wait();
+        auto* native_begin = dynamic_cast<cldnn::ocl::ocl_event*>(begin.get());
+        auto* native_end = dynamic_cast<cldnn::ocl::ocl_event*>(end.get());
+        OPENVINO_ASSERT(native_begin && native_end, "MoE trace requires native profiling markers");
+        moe_otd::les_trace_interval("moe_span", native_begin->get().getProfilingInfo<CL_PROFILING_COMMAND_END>(),
+                                   native_end->get().getProfilingInfo<CL_PROFILING_COMMAND_END>(), trace);
+        return result;
+    }
+
     cldnn::event::ptr execute(const std::vector<cldnn::event::ptr>& events, cldnn::primitive_inst& ins) override {
         auto& network = ins.get_network();
         auto* context = network.get_les_context();
         if (!context || !_weight_provider->is_offloaded()) {
-            return execute_impl(events, ins);
+            return execute_impl_traced(events, ins);
         }
         auto& stream = network.get_stream();
         if (_les_owner != context) {
@@ -3106,7 +3217,7 @@ public:
         }
         _weight_provider->set_les_context(context, network.get_les_epoch());
         try {
-            auto result = execute_impl(events, ins);
+            auto result = execute_impl_traced(events, ins);
             auto consumer = stream.enqueue_marker({});
             stream.flush();
             _weight_provider->set_consumer(std::move(consumer));

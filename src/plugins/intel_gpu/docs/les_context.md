@@ -326,6 +326,32 @@ support is an error, not a fabricated Host-enqueue interval. Trace is off by
 default and perturbs timings; reads may be served from page cache. It demonstrates
 read/compute concurrency, not cold-SSD DMA or dedicated-copy-engine throughput.
 
+Diagnostic records now include network/layer IDs, LES epoch, token count,
+chunk/wave, a process-local demand ID, expert ID, physical slot, component and
+byte count. `hit`/`miss` records describe actual cache reservations. Worker
+`read` and native-event `copy` records share those identifiers, so each demand
+transfer can be joined to its preceding miss. `prefetch_hit`/`prefetch_miss`
+describe speculative target-cache reservations separately; speculative copies
+must not be counted as actual-demand misses.
+
+`moe_span` uses queue markers and includes host dispatch gaps, compilation and
+waits. Trace-only markers wait at the end of each MoE and perturb scheduling.
+`upload_join_window` describes the host future wait, not GPU execution.
+Legacy synchronous `read_sync` and `copy_sync_window` describe blocking host
+calls in the device-clock domain; a blocking copy need not return a native
+event. Async `copy` and observed kernels use actual native START/END timestamps.
+Prefill `compute_tail` covers only the final observed wave kernel; oneDNN GEMMs
+are not completely instrumented. No observed kernel records does not mean no
+GPU execution. Phase labels are inferred: one token is Decode, more than 32 is
+Prefill, and 2..32 is batched. Tracks represent logical roles, not OS thread IDs.
+
+Workspace `les/analyze_les_timeline.py` exports CSV, separate Prefill/Decode
+Markdown tables, summary JSON and a Perfetto-compatible trace. It validates
+miss-before-transfer associations and unions intervals before measuring
+observed overlap. These diagnostic samples are separate from trace/counters-off
+performance runs. The historical branch-base runtime and current LES-off runtime
+are distinct comparison rows; switching LES off is not a pre-LES baseline.
+
 The trace GPU probe observed 148 read/Pass-A interval intersections. Actual source
 Qwen ratio-80, 21-input/8-output-token generation passed and observed 437 such
 intersections, with no synthetic delay. Its counters recorded 361 waves, 1,659
@@ -656,6 +682,21 @@ fit the original resident capacity. Otherwise LES uses per-expert arithmetic
 inside bounded waves, preserving fused routing weights and ascending-expert
 accumulation. Sparse routing that fits still uses grouped waves. Micro-GEMM
 selection is unchanged. No cross-path bitwise equivalence is assumed.
+
+For the per-expert path above 128 tokens, expert waves now form the outer loop
+and bounded token chunks form the inner loop. A wave's weights remain pinned
+while all chunks consume them, so each routed expert uploads at most once per
+Prefill. Actual pair indices are translated to chunk-local indices. Absent
+experts are skipped; an empty final chunk still clears the local demand. The
+last consumer event protects bank reuse, and shared expert work runs only after
+all routed waves have accumulated each chunk. Ascending-expert accumulation is
+unchanged. Grouped/micro scheduling and Decode remain unchanged.
+
+GPU scratch remains limited to 128 tokens. CPU routing metadata retains
+the whole Prefill Top-k index array and wave pairs, proportional to tokens times
+Top-k; this is not a claim that all Host metadata is chunk-bounded. Existing
+Prefill tests retain bitwise/path checks, pair/chunk counts and scratch limits;
+per-expert multi-chunk cases also bound misses by the configured expert count.
 
 The two banks partition the existing resident slot count, including odd counts;
 they do not each receive a full-capacity allocation. Capacity one advances
