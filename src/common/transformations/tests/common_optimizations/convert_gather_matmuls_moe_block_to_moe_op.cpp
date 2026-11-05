@@ -282,7 +282,8 @@ inline std::shared_ptr<ov::Model> build_3gemm_moe_pattern_model() {
 inline std::shared_ptr<ov::Model> build_3gemm_bgm_model(
     ov::op::internal::MOE::Activation_type activation_type = ov::op::internal::MOE::Activation_type::SWIGLU,
     bool has_batch_dim = true,
-    bool restore_output_shape = false) {
+    bool restore_output_shape = false,
+    bool zero_output_pattern = false) {
     using namespace ov;
 
     const size_t batch = 2;
@@ -357,7 +358,8 @@ inline std::shared_ptr<ov::Model> build_3gemm_bgm_model(
                                             false);
 
     const std::vector<int64_t> output_shape =
-        restore_output_shape ? std::vector<int64_t>{-1, static_cast<int64_t>(batch), static_cast<int64_t>(hidden_size)}
+        zero_output_pattern ? std::vector<int64_t>{0, static_cast<int64_t>(hidden_size)}
+        : restore_output_shape ? std::vector<int64_t>{-1, static_cast<int64_t>(batch), static_cast<int64_t>(hidden_size)}
         : has_batch_dim      ? std::vector<int64_t>{static_cast<int64_t>(batch), -1, static_cast<int64_t>(hidden_size)}
                              : std::vector<int64_t>{-1, static_cast<int64_t>(hidden_size)};
     auto end_reshape = std::make_shared<op::v1::Reshape>(
@@ -791,6 +793,22 @@ TEST_F(TransformationTestsF, Convert3GatherMatmulMoeBlockToMoeOp_restores_output
     model = build_3gemm_bgm_model(ov::op::internal::MOE::Activation_type::SWIGLU, true, true);
     manager.register_pass<ov::pass::Convert3GatherMatmulMoeBlockToMoeOp>();
     model_ref = build_3gemm_bgm_to_moe_reference_model(ov::op::internal::MOE::Activation_type::SWIGLU, true, true);
+}
+
+TEST(MoeOpFusion, special_zero_preserves_flattened_tokens) {
+    auto model = build_3gemm_bgm_model(ov::op::internal::MOE::Activation_type::SWIGLU, true, false, true);
+    ov::pass::Manager manager;
+    manager.register_pass<ov::pass::Convert3GatherMatmulMoeBlockToMoeOp>();
+    manager.run_passes(model);
+    size_t moe_count = 0;
+    for (const auto& operation : model->get_ordered_ops()) {
+        moe_count += ov::is_type<ov::op::internal::MOE>(operation);
+    }
+    ASSERT_EQ(moe_count, 1);
+    for (const size_t tokens : {1031, 1, 7, 1031}) {
+        model->reshape(ov::PartialShape{2, static_cast<int64_t>(tokens), 2048});
+        EXPECT_EQ(model->get_output_shape(0), (ov::Shape{2 * tokens, 2048}));
+    }
 }
 
 TEST_F(TransformationTestsF, Convert3GatherMatmulMoeBlockToMoeOp_gelu_tanh) {

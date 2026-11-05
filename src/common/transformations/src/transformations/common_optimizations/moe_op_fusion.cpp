@@ -4,6 +4,7 @@
 
 #include "transformations/common_optimizations/moe_op_fusion.hpp"
 
+#include <algorithm>
 #include <limits>
 
 #include "itt.hpp"
@@ -20,6 +21,7 @@
 #include "openvino/op/multiply.hpp"
 #include "openvino/op/reduce_sum.hpp"
 #include "openvino/op/reshape.hpp"
+#include "openvino/op/shape_of.hpp"
 #include "openvino/op/slice.hpp"
 #include "openvino/op/swish.hpp"
 #include "openvino/op/transpose.hpp"
@@ -233,9 +235,23 @@ Convert3GatherMatmulMoeBlockToMoeOp::Convert3GatherMatmulMoeBlockToMoeOp() {
         auto replacement = moe_node;
         if (!hidden_states.get_partial_shape().same_scheme(pm.at(end_reshape_m).get_partial_shape())) {
             moe_node->set_friendly_name(m.get_match_root()->get_friendly_name() + "/MOE");
-            replacement = pm.at(end_reshape_m)
-                              .get_node_shared_ptr()
-                              ->clone_with_new_inputs({moe_node, pm.at(end_reshape_shape_m)});
+            const auto end_reshape = ov::as_type_ptr<v1::Reshape>(pm.at(end_reshape_m).get_node_shared_ptr());
+            const auto pattern = ov::as_type_ptr<v0::Constant>(end_reshape->get_input_node_shared_ptr(1));
+            const auto pattern_values = pattern ? pattern->cast_vector<int64_t>() : std::vector<int64_t>{};
+            const bool may_copy_dimension = end_reshape->get_special_zero() &&
+                                            (!pattern || std::find(pattern_values.begin(), pattern_values.end(), 0) !=
+                                                             pattern_values.end());
+            auto reshape_input = moe_node;
+            if (may_copy_dimension &&
+                moe_node->get_output_partial_shape(0).rank() != pm.at(reduce_sum_m).get_partial_shape().rank()) {
+                auto original_shape = std::make_shared<ov::op::v3::ShapeOf>(
+                    pm.at(unsqueeze_m).get_node_shared_ptr()->input_value(0), ov::element::i64);
+                reshape_input = std::make_shared<v1::Reshape>(moe_node, original_shape, false);
+                ov::copy_runtime_info(m.get_matched_nodes(), {original_shape, reshape_input});
+                register_new_node(original_shape);
+                register_new_node(reshape_input);
+            }
+            replacement = end_reshape->clone_with_new_inputs({reshape_input, pm.at(end_reshape_shape_m)});
             register_new_node(replacement);
         }
         replacement->set_friendly_name(m.get_match_root()->get_friendly_name());
