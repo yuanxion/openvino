@@ -3,6 +3,7 @@
 //
 
 #include "test_utils.h"
+#include "intel_gpu/runtime/debug_configuration.hpp"
 
 #include "runtime/ocl/ocl_device_clock.hpp"
 #include "runtime/ocl/ocl_engine.hpp"
@@ -16,10 +17,46 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <set>
+#include <sstream>
 #include <thread>
 
 using namespace cldnn;
 using namespace ::tests;
+
+TEST(gpu_debug_logging, concurrent_records_do_not_interleave) {
+#ifdef GPU_DEBUG_CONFIG
+    if (!ov::intel_gpu::ExecutionConfig::get_log_to_file().empty()) {
+        GTEST_SKIP();
+    }
+    std::set<std::string> expected;
+    for (size_t worker = 0; worker < 6; ++worker) {
+        for (size_t record = 0; record < 64; ++record)
+            expected.insert("[GPU_LOG_TEST] worker=" + std::to_string(worker) + " record=" + std::to_string(record));
+    }
+    testing::internal::CaptureStdout();
+    std::vector<std::thread> writers;
+    for (size_t worker = 0; worker < 6; ++worker) {
+        writers.emplace_back([worker] {
+            for (size_t record = 0; record < 64; ++record)
+                GPU_DEBUG_COUT << "[GPU_LOG_TEST] worker=" << worker << " record=" << record << std::endl;
+        });
+    }
+    for (auto& writer : writers)
+        writer.join();
+    std::istringstream captured(testing::internal::GetCapturedStdout());
+    std::string line;
+    while (std::getline(captured, line)) {
+        const auto marker = line.find("[GPU_LOG_TEST]");
+        if (marker != std::string::npos) {
+            EXPECT_EQ(expected.erase(line.substr(marker)), 1U) << line;
+        }
+    }
+    EXPECT_TRUE(expected.empty());
+#else
+    GTEST_SKIP();
+#endif
+}
 
 class cross_queue_event : public ::testing::TestWithParam<bool> {
 protected:

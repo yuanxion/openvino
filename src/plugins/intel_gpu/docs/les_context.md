@@ -17,6 +17,52 @@ They cannot be passed through the public `compile_model()` property map. Use
 internal GPU tests can set the typed properties directly.
 The capacity excludes the running task and is not a staging-byte budget.
 
+### Diagnostic Flags
+
+LES and speculation are opt-in. The following switches are disabled unless set
+to the exact value `1`:
+
+| Environment Variable | Purpose |
+| --- | --- |
+| `OV_GPU_ENABLE_LES` | Enable the network-local LES service. |
+| `OV_GPU_LES_PREDICT` | Compute lookahead expert predictions for supported Router links. |
+| `OV_GPU_LES_PREFETCH` | Prefetch predicted experts; requires LES and prediction. |
+| `OV_GPU_LES_PREDICT_COMPARE` | Compare predictions with actual expert routing. |
+| `MOE_LES_TRACE` | Record scheduling and transfer diagnostics; adds synchronization overhead. |
+| `MOE_OTD_PERF_LOG` | Enable cache, prediction and transfer performance counters. |
+| `MOE_LES_DECODE_SINGLE_PASS` | Experimental single-pass Decode, not a logging switch. |
+
+For diagnostic Demand + predict + prefetch, set all switches above to `1`
+except `MOE_LES_DECODE_SINGLE_PASS=0` to retain dual-pass scheduling.
+Use `OV_VERBOSE=3 OV_VERBOSE_COLOR=0 OV_GPU_LOG_TO_FILE=/absolute/path/verbose.txt`
+with a debug-capable GPU build. Keep each process's file path distinct.
+Capture stdout/stderr as well: runtime counter summaries and direct trace output
+can appear there rather than in the GPU verbose stream. Trace/compare runs are
+diagnostic runs, not production latency measurements.
+Enable `PERF_COUNT=true` in the compile configuration when using trace, because
+native event timestamps require profiling-enabled queues. The summary includes
+`les_prediction_matches`, `les_prediction_pairs` and `les_prediction_recall_at_k`.
+
+### Compressed Router Projection
+
+The original LES proxy FC accepted only plain FP16 projection weights. The
+`projection_compressed_weights` rejection was a limitation of that implementation,
+not an algorithmic requirement of LES. Removing the rejection without decoding
+the weights would incorrectly interpret packed integers as FP16 values.
+
+The proxy now supports constant, contiguous i4/u4/i8/u8 weights with FP16 scalar,
+per-expert or grouped scales and supported constant zero points. The group count
+must divide the hidden width. On first prediction, OpenVINO constant conversion
+unpacks the values and the proxy caches an FP16 weight copy. The actual Router
+and expert weight paths are unchanged. MiniCPM-V4.7 uses grouped Router weights
+with hidden width 2048 and group size 64. Unsupported layouts still report a
+qualification rejection instead of running with an incorrect interpretation.
+
+`[LES_PROXY_DECOMPRESS]` records initialization of the proxy weight cache.
+Successful qualification alone is not activation: check prediction events and
+nonzero prediction/prefetch counters, then inspect measured recall and cache
+statistics. A correct generated answer does not prove prediction was active.
+
 ## Network Ownership
 
 [network](../src/graph/network.cpp) creates a context only for a non-internal
@@ -492,6 +538,17 @@ upload failure drains issued DMA, discards the incomplete reservation and does
 not poison the request epoch; real demand retries via the normal path.
 Unsupported graphs never build a prediction stage and remain demand-only.
 
+The diagnostic comparison also emits `[LES_PREDICTION]` JSON with `network`,
+`layer`, `epoch`, `tokens`, `rank_matches`, `expert_matches` and `pairs`.
+`rank_matches / pairs` compares identical Top-k slots; `expert_matches / pairs`
+compares membership in the actual Top-k of the same token, independent of rank.
+Absent comparisons are unavailable, not zero recall. The extra computation and
+logging occur only inside the existing default-off comparison branch, after
+its already-required readbacks; no production fence or readback is added.
+Enabled instrumentation has overhead and must be disabled for latency A/B.
+Existing `[LES_TRACE]` hit/miss and native copy/pass records can be aggregated
+offline by layer/epoch; asynchronous submission alone is not overlap proof.
+
 Eight GPU variants cover Softmax/SigmoidBias, FC bias on/off, prediction-only and
 prefetch. The prediction tests observe 0/8, 1/8, 3/8 and 8/8 Top-k matches. They
 check valid IDs, preserve actual Router output and compare final target outputs
@@ -719,20 +776,21 @@ inside bounded waves, preserving fused routing weights and ascending-expert
 accumulation. Sparse routing that fits still uses grouped waves. Micro-GEMM
 selection is unchanged. No cross-path bitwise equivalence is assumed.
 
-For the per-expert path above 128 tokens, expert waves now form the outer loop
-and bounded token chunks form the inner loop. A wave's weights remain pinned
-while all chunks consume them, so each routed expert uploads at most once per
-Prefill. Actual pair indices are translated to chunk-local indices. Absent
-experts are skipped; an empty final chunk still clears the local demand. The
-last consumer event protects bank reuse, and shared expert work runs only after
-all routed waves have accumulated each chunk. Ascending-expert accumulation is
-unchanged. Grouped/micro scheduling and Decode remain unchanged.
+The per-expert path, including the grouped capacity fallback, keeps the full
+token set for each expert. Splitting it into 128-token chunks changes oneDNN's
+matrix M and can select different FP16 arithmetic than LES-off. Expert waves
+retain ascending-expert accumulation and banked weight loading; shared expert
+work runs after all routed waves. The last consumer event protects bank reuse,
+and each routed expert uploads at most once per Prefill. Grouped/micro wave
+computation and Decode scheduling are unchanged.
 
-GPU scratch remains limited to 128 tokens. CPU routing metadata retains
+Per-expert scratch scales with the full token count. Micro scratch remains
+limited to 128 tokens; grouped scratch is conservatively full-token because a
+capacity miss can select the per-expert fallback. CPU routing metadata retains
 the whole Prefill Top-k index array and wave pairs, proportional to tokens times
-Top-k; this is not a claim that all Host metadata is chunk-bounded. Existing
-Prefill tests retain bitwise/path checks, pair/chunk counts and scratch limits;
-per-expert multi-chunk cases also bound misses by the configured expert count.
+Top-k. Prefill tests check the selected path, pair/chunk counts, path-dependent
+scratch limits and expert-upload bounds. Per-expert and grouped capacity
+fallbacks require bitwise output agreement with same-capacity LES-off controls.
 
 The two banks partition the existing resident slot count, including odd counts;
 they do not each receive a full-capacity allocation. Capacity one advances
@@ -742,16 +800,17 @@ consumer events protect reuse. Exceptions drain issued compute and uploads
 before cleanup. Switching to bank execution invalidates the main provider's
 cache metadata, preventing later Decode from treating overwritten data as ready.
 
-Tokens are processed in chunks of at most 128. Gather, gate/up/down, routing
-metadata and canonical scratch are reused across chunks. Full input/output
-tensors remain full-sized, and small layout-dependent metadata still scales
-with the configured expert count. This is a token-bound scratch contract, not
-a global fixed-byte memory ceiling or cross-layer pool. Empty token inputs keep
+Grouped/micro wave computation processes tokens in chunks of at most 128 and
+reuses gather, gate/up/down, routing metadata and canonical scratch across chunks.
+Per-expert computation keeps one full-token chunk for numerical compatibility.
+Full input/output tensors remain full-sized, and small layout-dependent metadata
+still scales with the configured expert count. There is no universal token-bound
+scratch contract, global fixed-byte ceiling or cross-layer pool. Empty inputs keep
 the existing non-Prefill path; the wave planner accepts empty routes without
 fabricating work. Large-prefill constants still have the existing P2/P5 private
 allocation overhead, which P7 must address.
 
-Final focused tests passed 541/541 in 37 suites and the overlapping forced
+The original P6 milestone's focused tests passed 541/541 in 37 suites and its overlapping forced
 grouped/micro fallback subset passed 258/258 in 14 suites, zero failures/skips.
 Coverage includes U4/U8, both routing modes, profiling off/on, odd and one-slot
 capacities, 33/65/257-token execution, a partial final chunk, changing routes,
@@ -761,6 +820,16 @@ Per-expert/grouped and shape-matched micro outputs are compared bitwise with
 same-path full-capacity controls. Micro versus the old unchunked shape is also
 checked with the original numerical tolerance: chunking can change micro-kernel
 floating-point rounding by one ULP, so unchunked bitwise parity is not claimed.
+
+After the MiniCPM accuracy repair, 138 focused GPU cases passed: 130 per-expert
+and grouped cases, including H=2048/intermediate=512/group=128 geometry, plus
+eight correct/wrong prediction and prefetch proxy cases. Eleven transformation
+tests passed, including special-zero reshapes across dynamic token lengths.
+The real 1031-input/512-output MiniCPM workload passed two Off and two Demand
+runs with identical token IDs and text. Separate prefill/first-decode captures
+have bitwise-identical first-layer MoE outputs and full-vocabulary logits.
+This is not a rerun of the historical 541-case suite or activation of prediction
+for MiniCPM compressed Router weights, which remain unqualified.
 
 OLMoE LLM and Qwen VLM six-mode acceptance passed with respectively 267/272
 input tokens, eight output tokens, 18 equal repeated outputs per model, active

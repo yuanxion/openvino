@@ -26,6 +26,7 @@
 #include "../test_utils/test_utils.h"
 #include "moe_3gemm_test_data.h"
 #include "primitive_inst.h"
+#include "ocl/kernels_cache.hpp"
 #include "ocl_v2/moe/moe_otd_runtime.hpp"
 #include "intel_gpu/graph/serialization/binary_buffer.hpp"
 
@@ -438,6 +439,8 @@ struct Moe3GemmTestParams {
     bool prefill_waves = false;
     int prefill_path = 0;
     bool prefill_sparse = false;
+    bool proxy_compressed = false;
+    bool proxy_runtime_kernels = false;
 };
 
 class scoped_moe_env {
@@ -701,12 +704,30 @@ TEST_P(moe_3gemm_compressed_gpu_random, moe_accuracy_test_random) {
     if (param.proxy_router) {
         auto router_weight_memory = engine.allocate_memory(
             layout{ov::PartialShape{static_cast<int64_t>(config.num_experts), static_cast<int64_t>(config.hidden_size)},
-                   data_types::f16,
+                   param.proxy_compressed ? (param.is_u4 ? data_types::u4 : data_types::u8) : data_types::f16,
                    format::bfyx});
         auto router_weights = param.proxy_perfect_recall
                       ? std::vector<ov::float16>(config.num_experts * config.hidden_size, ov::float16(0.0f))
                       : rg.generate_random_1d<ov::float16>(config.num_experts * config.hidden_size, -0.25f, 0.25f, 1000);
-        set_values(router_weight_memory, router_weights);
+        if (param.proxy_compressed) {
+            auto quantized = rg.generate_random_1d<uint8_t>(router_weights.size(), 0, 15);
+            if (param.proxy_perfect_recall) {
+                std::fill(quantized.begin(), quantized.end(), 8);
+            }
+            set_values(router_weight_memory, ref.pack(quantized));
+            const size_t groups = config.hidden_size / 64;
+            auto scales = engine.allocate_memory(layout{ov::PartialShape{static_cast<int64_t>(config.num_experts),
+                                                                        static_cast<int64_t>(groups)},
+                                                       data_types::f16, format::fbyx});
+            set_values(scales, rg.generate_random_1d<ov::float16>(config.num_experts * groups, 0.01f, 0.1f, 1000));
+            auto zeros = engine.allocate_memory(layout{ov::PartialShape{static_cast<int64_t>(config.num_experts),
+                                                                       static_cast<int64_t>(groups)},
+                                                      data_types::u8, format::fbyx});
+            set_values(zeros, std::vector<uint8_t>(config.num_experts * groups, 8));
+            topology.add(data("proxy_router_scales", scales), data("proxy_router_zeros", zeros));
+        } else {
+            set_values(router_weight_memory, router_weights);
+        }
         get_test_stream().finish();
         topology.add(data("proxy_router_weights", router_weight_memory));
         std::string proxy_projection_bias_id;
@@ -718,11 +739,18 @@ TEST_P(moe_3gemm_compressed_gpu_random, moe_accuracy_test_random) {
             get_test_stream().finish();
             topology.add(data(proxy_projection_bias_id, projection_bias));
         }
-        topology.add(fully_connected("proxy_router_projection",
+        if (param.proxy_compressed) {
+            topology.add(fully_connected("proxy_router_projection",
+                                         input_info("moe_3gemm_fused_compressed"),
+                                         "proxy_router_weights", proxy_projection_bias_id,
+                                         "proxy_router_scales", "proxy_router_zeros", data_types::f16, 3));
+        } else {
+            topology.add(fully_connected("proxy_router_projection",
                                      input_info("moe_3gemm_fused_compressed"),
                                      "proxy_router_weights",
                                      proxy_projection_bias_id,
                                      3));
+        }
         MoERouterFused::Config proxy_router_config;
         proxy_router_config.num_expert = config.num_experts;
         proxy_router_config.top_k = config.top_k;
@@ -779,7 +807,18 @@ TEST_P(moe_3gemm_compressed_gpu_random, moe_accuracy_test_random) {
             prediction_prefetch_env = std::make_unique<scoped_moe_env>("OV_GPU_LES_PREFETCH", "1");
         }
     }
-    network network(engine, topology, net_config);
+    const auto fresh_topology = [&] {
+        cldnn::topology result;
+        for (const auto& entry : topology.get_primitives()) {
+            if (entry.second->type == data::type_id()) {
+                result.add(*std::static_pointer_cast<data>(entry.second));
+            } else {
+                result.add_primitive(entry.second);
+            }
+        }
+        return result;
+    };
+    network network(engine, fresh_topology(), net_config);
     EXPECT_EQ(network.get_les_context() != nullptr, param.enable_les && param.lru_expert_num > 0);
     std::unique_ptr<cldnn::network> independent;
     if (network.get_les_context()) {
@@ -791,17 +830,28 @@ TEST_P(moe_3gemm_compressed_gpu_random, moe_accuracy_test_random) {
         if (routing_type == cldnn::MoERouterFused::RoutingType::SOFTMAX && param.seq_len == 1) {
             auto invalid = net_config.clone();
             invalid.set_property(ov::num_streams(2));
-            EXPECT_THROW((void)cldnn::network(engine, topology, invalid), ov::Exception);
+            EXPECT_THROW((void)cldnn::network(engine, fresh_topology(), invalid), ov::Exception);
             invalid = net_config.clone();
             invalid.set_property(ov::intel_gpu::offload_ratio(100));
-            EXPECT_THROW((void)cldnn::network(engine, topology, invalid), ov::Exception);
+            EXPECT_THROW((void)cldnn::network(engine, fresh_topology(), invalid), ov::Exception);
             invalid = net_config.clone();
             invalid.set_property(ov::intel_gpu::record_replay(true));
-            EXPECT_THROW((void)cldnn::network(engine, topology, invalid), ov::Exception);
+            EXPECT_THROW((void)cldnn::network(engine, fresh_topology(), invalid), ov::Exception);
         }
     }
     network.set_input_data("hidden_states", hidden_states_mem);
     network.set_input_data("routing_weights", routing_weights_mem);
+
+    if (param.proxy_runtime_kernels) {
+        auto router = network.get_primitive("proxy_router");
+        auto binaries = router->get_impl()->get_kernels();
+        cldnn::kernels_cache::compiled_kernels compiled;
+        auto& kernels = compiled[*router->get_impl_params()];
+        for (size_t index = 0; index < binaries.size(); ++index) {
+            kernels.emplace_back(binaries[index], index);
+        }
+        router->get_impl()->set_kernels(std::move(compiled));
+    }
 
     if (param.proxy_router) {
         ASSERT_NE(network.get_les_context(), nullptr);
@@ -839,7 +889,7 @@ TEST_P(moe_3gemm_compressed_gpu_random, moe_accuracy_test_random) {
 
         auto baseline_config = net_config.clone();
         baseline_config.set_property(ov::intel_gpu::enable_les(false));
-        cldnn::network baseline(engine, topology, baseline_config);
+        cldnn::network baseline(engine, fresh_topology(), baseline_config);
         baseline.set_input_data("hidden_states", hidden_states_mem);
         baseline.set_input_data("routing_weights", routing_weights_mem);
         auto baseline_outputs = baseline.execute();
@@ -939,7 +989,7 @@ TEST_P(moe_3gemm_compressed_gpu_random, moe_accuracy_test_random) {
         auto baseline_config = net_config.clone();
         baseline_config.set_property(ov::intel_gpu::enable_les(false));
         if (param.prefill_waves && param.seq_len > 128) {
-            legacy_prefill = std::make_unique<cldnn::network>(engine, baseline_topology, baseline_config);
+            legacy_prefill = std::make_unique<cldnn::network>(engine, grouped_fallback ? topology : baseline_topology, baseline_config);
             legacy_prefill->set_input_data("hidden_states", hidden_states_mem);
             baseline_config.set_property(ov::intel_gpu::enable_les(true));
         } else if (param.prefill_waves && param.prefill_path == 2 && param.seq_len == 48) {
@@ -1081,13 +1131,16 @@ TEST_P(moe_3gemm_compressed_gpu_random, moe_accuracy_test_random) {
         if (param.prefill_waves && perf) {
             EXPECT_GT(perf->les_prefill_waves.load(), prefill_waves);
             EXPECT_EQ(perf->les_prefill_pairs.load() - prefill_pairs, config.seq_len * config.top_k);
-            EXPECT_EQ(perf->les_prefill_chunks.load() - prefill_chunks, (config.seq_len + 127) / 128);
+            const bool per_expert = param.prefill_path < 2 || grouped_fallback;
+            EXPECT_EQ(perf->les_prefill_chunks.load() - prefill_chunks,
+                      per_expert ? 1 : (config.seq_len + 127) / 128);
             if (config.seq_len > 128 && (param.prefill_path == 1 || grouped_fallback)) {
                 EXPECT_LE(perf->gpu_misses.load() - expert_misses, config.num_experts);
             }
             EXPECT_EQ(path_waves() - previous_path_waves, perf->les_prefill_waves.load() - prefill_waves);
             const auto& buffers = network.get_primitive("moe_3gemm_fused_compressed")->get_intermediates_memories();
-            EXPECT_LE(buffers[1]->get_layout().count(), 128 * config.top_k * config.hidden_size);
+            const size_t scratch_tokens = param.prefill_path == 3 ? std::min<size_t>(config.seq_len, 128) : config.seq_len;
+            EXPECT_LE(buffers[1]->get_layout().count(), scratch_tokens * config.top_k * config.hidden_size);
         }
         if (network.get_les_context()) {
             EXPECT_GT(network.get_les_epoch(), previous_epoch);
@@ -1112,9 +1165,9 @@ TEST_P(moe_3gemm_compressed_gpu_random, moe_accuracy_test_random) {
             auto legacy_output = legacy_prefill->execute().begin()->second.get_memory();
             cldnn::mem_lock<ov::float16, mem_lock_type::read> legacy_values(legacy_output, legacy_prefill->get_stream());
             for (size_t index = 0; index < expected.size(); ++index) {
-                if (param.prefill_path == 2 && config.seq_len == 48) {
+                if (param.prefill_path == 0 || grouped_fallback || (param.prefill_path == 2 && config.seq_len == 48)) {
                     ASSERT_EQ(std::memcmp(&output_ptr[index], &legacy_values[index], sizeof(ov::float16)), 0)
-                        << "Legacy grouped OTD fallback mismatch at " << index << ", iteration " << iteration;
+                        << "Legacy per-expert OTD fallback mismatch at " << index << ", iteration " << iteration;
                 }
                 ASSERT_NEAR(static_cast<float>(output_ptr[index]), static_cast<float>(legacy_values[index]), tolerance)
                     << "Legacy Prefill path mismatch " << index;
@@ -1189,6 +1242,9 @@ INSTANTIATE_TEST_SUITE_P(smoke_les_p6_per_expert,
                     }
                 }
             }
+            Moe3GemmTestParams minicpm_geometry{129, true, 2048, 512, 6, 3, 128, false, 3, true};
+            minicpm_geometry.prefill_waves = true;
+            parameters.push_back(minicpm_geometry);
             return parameters;
         }())));
 
@@ -1254,6 +1310,28 @@ INSTANTIATE_TEST_SUITE_P(smoke_les_p4_proxy,
                           Moe3GemmTestParams{1, true, 128, 128, 16, 8, 128, false, 8, true, false, false, true, true},
                           Moe3GemmTestParams{1, true, 128, 128, 16, 8, 128, false, 8, true, false, false, true, false, true},
                           Moe3GemmTestParams{1, true, 128, 128, 16, 8, 128, false, 8, true, false, false, true, false, true, true})));
+
+INSTANTIATE_TEST_SUITE_P(smoke_les_p4_compressed_proxy,
+    moe_3gemm_compressed_gpu_random,
+    ::testing::Combine(
+        ::testing::Values(cldnn::MoERouterFused::RoutingType::SOFTMAX,
+                          cldnn::MoERouterFused::RoutingType::SIGMOID_BIAS),
+        ::testing::ValuesIn([] {
+            std::vector<Moe3GemmTestParams> parameters;
+            for (bool u4 : {false, true}) {
+                for (bool perfect : {false, true}) {
+                    Moe3GemmTestParams parameter{1, u4, 128, 128, 16, 8, 128, false, 8, true};
+                    parameter.proxy_router = true;
+                    parameter.proxy_prefetch = true;
+                    parameter.proxy_compressed = true;
+                    parameter.proxy_perfect_recall = perfect;
+                    parameters.push_back(parameter);
+                    parameter.proxy_runtime_kernels = true;
+                    parameters.push_back(parameter);
+                }
+            }
+            return parameters;
+        }())));
 
 INSTANTIATE_TEST_SUITE_P(smoke_offload,
     moe_3gemm_compressed_gpu_random,

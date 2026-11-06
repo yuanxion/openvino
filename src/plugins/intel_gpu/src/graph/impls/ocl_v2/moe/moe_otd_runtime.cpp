@@ -114,6 +114,8 @@ void OtdPerfCounters::dump() const {
     const auto misses = gpu_misses.load(std::memory_order_relaxed);
     const auto total = hits + misses;
     const auto loads = tensor_load_count.load(std::memory_order_relaxed);
+    const auto prediction_matches = les_prediction_matches.load(std::memory_order_relaxed);
+    const auto prediction_pairs = les_prediction_pairs.load(std::memory_order_relaxed);
     GPU_DEBUG_INFO << "[OTD_PERF] gpu_hits=" << hits << ", gpu_misses=" << misses << ", gpu_hit_rate=" << (total > 0 ? 100.0 * hits / total : 0.0) << "%"
                    << ", tensor_loads=" << loads << ", avg_disk_io_us=" << (loads > 0 ? disk_io_ns.load(std::memory_order_relaxed) / 1000 / loads : 0)
                    << ", avg_transpose_us=" << (loads > 0 ? transpose_ns.load(std::memory_order_relaxed) / 1000 / loads : 0)
@@ -137,8 +139,9 @@ void OtdPerfCounters::dump() const {
                    << ", les_ready_pairs=" << les_ready_pairs.load(std::memory_order_relaxed)
                    << ", les_missing_pairs=" << les_missing_pairs.load(std::memory_order_relaxed)
                    << ", les_shared_pairs=" << les_shared_pairs.load(std::memory_order_relaxed)
-                   << ", les_prediction_matches=" << les_prediction_matches.load(std::memory_order_relaxed)
-                   << ", les_prediction_pairs=" << les_prediction_pairs.load(std::memory_order_relaxed)
+                   << ", les_prediction_matches=" << prediction_matches
+                   << ", les_prediction_pairs=" << prediction_pairs
+                   << ", les_prediction_recall_at_k=" << (prediction_pairs > 0 ? 100.0 * prediction_matches / prediction_pairs : 0.0) << "%"
                    << ", les_prefetch_experts=" << les_prefetch_experts.load(std::memory_order_relaxed)
                    << ", les_prefetch_failures=" << les_prefetch_failures.load(std::memory_order_relaxed)
                    << ", les_prefetch_useful_bytes=" << les_prefetch_useful_bytes.load(std::memory_order_relaxed)

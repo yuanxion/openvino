@@ -6,6 +6,7 @@
 #include <cstring>
 #include <iostream>
 #include <filesystem>
+#include <mutex>
 
 #include "intel_gpu/runtime/execution_config.hpp"
 namespace ov::intel_gpu {
@@ -37,6 +38,7 @@ enum class LogLevel : int8_t {
     TRACE_DETAIL = 4
 };
 
+std::mutex& get_verbose_mutex();
 std::ostream& get_verbose_stream();
 }  // namespace ov::intel_gpu
 
@@ -75,13 +77,13 @@ static constexpr const char* prefix = "GPU_Debug: ";
 #define GPU_DEBUG_SET_ACTIVE_LUID(luid)
 #endif
 
-#define GPU_DEBUG_LOG_PREFIX ov::intel_gpu::get_verbose_stream() \
+#define GPU_DEBUG_LOG_PREFIX (std::lock_guard<std::mutex>{ov::intel_gpu::get_verbose_mutex()}, ov::intel_gpu::get_verbose_stream()) \
                              << prefix \
                              << std::filesystem::path(__FILE__).filename().generic_string() << ":" \
                              << std::to_string(__LINE__) << ":" \
                              << __func__ << ": "
 
-#define GPU_DEBUG_LOG_COLOR_PREFIX ov::intel_gpu::get_verbose_stream() \
+#define GPU_DEBUG_LOG_COLOR_PREFIX (std::lock_guard<std::mutex>{ov::intel_gpu::get_verbose_mutex()}, ov::intel_gpu::get_verbose_stream()) \
                                    << color::dark_gray << std::string(prefix) \
                                    << color::blue << std::filesystem::path(__FILE__).filename().generic_string() << ":" \
                                    << color::purple << std::to_string(__LINE__) << ":" \

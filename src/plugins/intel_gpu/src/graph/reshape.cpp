@@ -338,12 +338,20 @@ void reshape_inst::update_output_memory() {
         return;
     }
 
+    build_deps();
+    if (_impl_params->get_input_layout(0).is_static() && _impl_params->get_output_layout().is_static()) {
+        const auto& desc = get_typed_desc<reshape>();
+        OPENVINO_ASSERT(_impl_params->get_input_layout(0).count() == _impl_params->get_output_layout().count(),
+                        "Reshape changes element count: ", id(), " input=", _impl_params->get_input_layout(0).to_short_string(),
+                        " output=", _impl_params->get_output_layout().to_short_string(), " mode=", desc->mode,
+                        " pattern_size=", desc->output_pattern.size(), " special_zero=", desc->special_zero);
+    }
+
     if (_outputs[0] && _network.get_engine().is_the_same_buffer(output_memory(), input_memory()) &&
         output_memory().get_layout() == _impl_params->get_output_layout()) {
         return;
     }
 
-    build_deps();  // reshape need deps
     if (input_memory_ptr() == nullptr) {
         return;
     }

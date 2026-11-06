@@ -6,8 +6,14 @@
 #include "intel_gpu/runtime/execution_config.hpp"
 #include <iostream>
 #include <fstream>
+#include <mutex>
 
 namespace ov::intel_gpu {
+std::mutex& get_verbose_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
 std::ostream& get_verbose_stream() {
 #ifdef GPU_DEBUG_CONFIG
     if (!ExecutionConfig::get_log_to_file().empty()) {
@@ -18,7 +24,6 @@ std::ostream& get_verbose_stream() {
         return fout;
     }
     return std::cout;
-
 #else
     return std::cout;
 #endif

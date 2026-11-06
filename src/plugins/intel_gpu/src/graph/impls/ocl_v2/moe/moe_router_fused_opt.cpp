@@ -11,8 +11,10 @@
 #include "../utils/kernel_generator.hpp"
 #include <cstdlib>
 #include "intel_gpu/primitives/data.hpp"
+#include "intel_gpu/primitives/fully_connected.hpp"
 #include "intel_gpu/primitives/moe_router_fused.hpp"
 #include "moe_otd_runtime.hpp"
+#include "openvino/op/constant.hpp"
 
 namespace ov::intel_gpu::ocl {
 namespace {
@@ -99,6 +101,70 @@ public:
     Stage::Ptr sigmoid_bias_topk = make_stage<MoeRouterSigmoidBiasTopK>();
     Stage::Ptr les_proxy_fc;
     program::les_router_link les_proxy_link;
+    memory::ptr les_proxy_weights;
+    memory::ptr les_proxy_weights_source;
+
+    memory::ptr get_proxy_weights(cldnn::network& network, const program::les_router_link& link) {
+        auto weights = network.get_primitive(link.weights)->output_memory_ptr();
+        auto projection_instance = network.get_primitive(link.projection);
+        auto projection = projection_instance->get_typed_desc<fully_connected>();
+        if (!projection->compressed_weights) {
+            return weights;
+        }
+        if (les_proxy_weights && les_proxy_weights_source == weights) {
+            return les_proxy_weights;
+        }
+        auto& stream = network.get_stream();
+        const auto read_values = [&stream](const memory::ptr& parameter) {
+            const auto& parameter_layout = parameter->get_layout();
+            std::vector<uint8_t> bytes(parameter_layout.bytes_count());
+            parameter->copy_to(stream, bytes.data(), 0, 0, bytes.size(), true);
+            ov::op::v0::Constant constant(parameter_layout.data_type, parameter_layout.get_shape(), bytes.data());
+            return constant.cast_vector<float>();
+        };
+        const auto& dependencies = projection_instance->dependencies();
+        const size_t scale_index = projection->bias.is_valid() ? 3U : 2U;
+        auto scale_memory = dependencies[scale_index].first->output_memory_ptr(dependencies[scale_index].second);
+        auto packed = read_values(weights);
+        auto scales = read_values(scale_memory);
+        auto zero_memory = projection->decompression_zero_point.is_valid()
+                               ? dependencies[scale_index + 1].first->output_memory_ptr(dependencies[scale_index + 1].second)
+                               : memory::ptr{};
+        auto zeros = zero_memory ? read_values(zero_memory)
+                                 : std::vector<float>{projection->decompression_zero_point_scalar.value_or(0.0f)};
+        const size_t hidden_size = weights->get_layout().get_shape()[1];
+        const auto parameter_index = [&](const memory::ptr& parameter, size_t count, size_t expert, size_t hidden) {
+            if (count == 1) {
+                return size_t{0};
+            }
+            const size_t groups = count / link.experts;
+            const size_t group = hidden / (hidden_size / groups);
+            const auto& parameter_layout = parameter->get_layout();
+            const bool experts_first = parameter_layout.get_shape().front() == link.experts;
+            cldnn::tensor coordinates(0);
+            coordinates.batch[0] = static_cast<int32_t>(experts_first ? expert : group);
+            coordinates.feature[0] = static_cast<int32_t>(experts_first ? group : expert);
+            return parameter_layout.get_linear_offset(coordinates);
+        };
+        std::vector<ov::float16> decompressed(packed.size());
+        for (size_t expert = 0; expert < link.experts; ++expert) {
+            for (size_t hidden = 0; hidden < hidden_size; ++hidden) {
+                const size_t index = expert * hidden_size + hidden;
+                const auto difference = ov::float16(packed[index] - zeros[parameter_index(zero_memory, zeros.size(), expert, hidden)]);
+                decompressed[index] = ov::float16(static_cast<float>(difference) *
+                    scales[parameter_index(scale_memory, scales.size(), expert, hidden)]);
+            }
+        }
+        les_proxy_weights = network.get_engine().allocate_memory(
+            cldnn::layout{weights->get_layout().get_partial_shape(), data_types::f16, format::bfyx});
+        les_proxy_weights->copy_from(stream, decompressed.data(), true);
+        les_proxy_weights_source = weights;
+        GPU_DEBUG_INFO << "[LES_PROXY_DECOMPRESS] router=" << link.router << " weights=" << weights->get_layout().data_type
+                       << " experts=" << link.experts << " hidden=" << hidden_size
+                       << " groups=" << (scales.size() == 1 ? 1 : scales.size() / link.experts)
+                       << " bytes=" << decompressed.size() * sizeof(ov::float16) << std::endl;
+        return les_proxy_weights;
+    }
 
     MoeRouterFusedImpl() : PrimitiveImplOCL(MoeRouterFusedOpt::get_type_info_static()) {
         les_proxy_fc = make_stage<MoeLesProxyFC>();
@@ -107,23 +173,17 @@ public:
         auto desc = params.typed_desc<moe_router_fused>();
         const auto* prediction = std::getenv("OV_GPU_LES_PREDICT");
         if (params.prog->get_config().get_enable_les() && prediction && std::strcmp(prediction, "1") == 0) {
+            add_stage(les_proxy_fc, params);
             const auto router_links = params.prog->get_les_router_links();
-            const bool has_supported_proxy = std::any_of(router_links.begin(), router_links.end(), [](const auto& link) {
-                return link.status == program::les_router_status::supported;
-            });
-            if (has_supported_proxy) {
-                les_proxy_fc->codegen = std::make_shared<MoeLesProxyFC>();
-                add_stage(les_proxy_fc, params);
-                for (const auto& link : router_links) {
-                    if (link.router == node.id() && link.status == program::les_router_status::supported) {
-                        les_proxy_link = link;
-                        break;
-                    }
+            for (const auto& link : router_links) {
+                if (link.router == node.id() && link.status == program::les_router_status::supported) {
+                    les_proxy_link = link;
+                    break;
                 }
             }
         }
         GPU_DEBUG_INFO << "[LES_PROXY_IMPL] router=" << node.id() << " enabled="
-                   << params.prog->get_config().get_enable_les() << " stage=" << static_cast<bool>(les_proxy_fc)
+                   << params.prog->get_config().get_enable_les() << " proxy_stage_compiled=" << static_cast<bool>(les_proxy_fc->kd.code)
                        << " status=" << static_cast<int>(les_proxy_link.status) << std::endl;
         if (desc->_config.routing_type == MoERouterFused::RoutingType::SOFTMAX) {
             add_stage(softmax_topk, params);
@@ -199,13 +259,14 @@ public:
         bool prediction_created = false;
         if (!proxy_prediction_ready && token_num == 1 && network.is_les_prediction_enabled() && network.get_les_context() &&
             runtime_link != network.get_les_router_links().end()) {
-            OPENVINO_ASSERT(les_proxy_fc, "Qualified LES proxy Router stage was not compiled for ", instance.id());
+            OPENVINO_ASSERT(les_proxy_fc && les_proxy_fc->kernel && routing_stage && routing_stage->kernel,
+                            "Qualified LES proxy Router kernels were not initialized for ", instance.id());
             const auto& proxy_link = *runtime_link;
             active_proxy_link = &proxy_link;
             auto state = network.get_les_proxy_state(proxy_link.chain.target_moe);
             if (state.hidden && state.hidden_ready &&
                 state.hidden->get_layout().count() == state.hidden->get_layout().get_shape().back()) {
-                auto weights = network.get_primitive(proxy_link.weights)->output_memory_ptr();
+                auto weights = get_proxy_weights(network, proxy_link);
                 auto bias = proxy_link.projection_bias.empty()
                                 ? memory::ptr{}
                                 : network.get_primitive(proxy_link.projection_bias)->output_memory_ptr();

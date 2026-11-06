@@ -1457,7 +1457,7 @@ public:
         auto hidden_states_layout = params.input_layouts[0];
         auto token_num = get_seq_len(hidden_states_layout);
         if (params.prog->get_config().get_enable_les() && cur_moe->_otd.lru_expert_num > 0 &&
-            token_num > batched_gemv_threshold) {
+            token_num > batched_gemv_threshold && use_micro_gemm_prefill) {
             token_num = std::min(token_num, prefill_chunk_tokens);
         }
         auto data_type = hidden_states_layout.data_type;
@@ -1533,7 +1533,7 @@ public:
         // Routing weights scratch buffer (used in prefill paths and reused as shared_gate_vals in batched GEMV)
         scratch.routing_weights = intermediates_memories[MOE_INTERNAL_BUFFER_ROUTING_WEIGHTS];
         const auto desc = instance.get_typed_desc<moe_3gemm_fused_compressed>();
-        if (_les_owner && token_num > batched_gemv_threshold) {
+        if (_les_owner && token_num > batched_gemv_threshold && use_micro_gemm_prefill) {
             token_num = std::min(token_num, prefill_chunk_tokens);
         }
         const bool single_token_fallback = desc->_otd.lru_expert_num > 0 &&
@@ -1849,8 +1849,12 @@ public:
                                                               pair_count * sizeof(uint32_t),
                                                               true);
                         uint64_t matches = 0;
+                        uint64_t expert_matches = 0;
                         for (size_t pair = 0; pair < pair_count; ++pair) {
                             matches += predicted[pair] == experts[pair];
+                            const auto token_begin = experts.begin() + (pair / max_topk) * max_topk;
+                            expert_matches += std::find(token_begin, token_begin + max_topk, predicted[pair]) !=
+                                              token_begin + max_topk;
                         }
                         if (auto* perf = moe_otd::get_perf_counters()) {
                             perf->les_prediction_matches.fetch_add(matches, std::memory_order_relaxed);
@@ -1858,6 +1862,12 @@ public:
                         }
                         GPU_DEBUG_INFO << "[LES_PREDICT] target=" << instance.id() << " matches=" << matches << "/"
                                        << pair_count << std::endl;
+                        GPU_DEBUG_INFO << "[LES_PREDICTION] {\"network\":" << cur_net.get_id()
+                                       << ",\"layer\":" << instance.get_impl_params()->unique_id
+                                       << ",\"epoch\":" << cur_net.get_les_epoch()
+                                       << ",\"tokens\":" << token_num << ",\"rank_matches\":" << matches
+                                       << ",\"expert_matches\":" << expert_matches << ",\"pairs\":" << pair_count
+                                       << "}" << std::endl;
                     }
                 }
                 std::vector<bool> done(pair_count, false);
@@ -3015,14 +3025,15 @@ public:
                 result = stream.enqueue_marker({});
             }
             const auto global_plan = moe_otd::plan_prefill_waves(all_routed, config.num_expert, resident_slot_count());
-            const size_t chunk_count = (token_count + prefill_chunk_tokens - 1) / prefill_chunk_tokens;
+            const size_t chunk_tokens = !use_grouped_prefill && !use_micro_gemm_prefill ? token_count : prefill_chunk_tokens;
+            const size_t chunk_count = (token_count + chunk_tokens - 1) / chunk_tokens;
             const size_t steps = expert_major ? global_plan.waves.size() * chunk_count : chunk_count;
             std::array<std::optional<moe::ExpertDemand>, 2> demands;
             for (size_t step = 0; step < steps; ++step) {
-                const size_t start = (expert_major ? step % chunk_count : step) * prefill_chunk_tokens;
+                const size_t start = (expert_major ? step % chunk_count : step) * chunk_tokens;
                 std::vector<std::pair<event::ptr, moe_otd::LesTraceContext>> compute_trace;
                 auto& execution = *scratch.prefill;
-                execution.tokens = std::min(prefill_chunk_tokens, token_count - start);
+                execution.tokens = std::min(chunk_tokens, token_count - start);
                 execution.hidden = view(instance.input_memory_ptr(0), start, execution.tokens, _hidden_size);
                 execution.output = view(instance.output_memory_ptr(0), start, execution.tokens, _hidden_size);
                 scratch.topk_id = view(original_ids, start, execution.tokens, top_k);
