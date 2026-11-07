@@ -163,6 +163,9 @@ public:
             cldnn::layout{weights->get_layout().get_partial_shape(), data_types::f16, format::bfyx});
         les_proxy_weights->copy_from(stream, decompressed.data(), true);
         les_proxy_weights_source = weights;
+        if (auto* perf = moe_otd::get_perf_counters()) {
+            perf->les_proxy_weight_initializations.fetch_add(1, std::memory_order_relaxed);
+        }
         return les_proxy_weights;
     }
 
