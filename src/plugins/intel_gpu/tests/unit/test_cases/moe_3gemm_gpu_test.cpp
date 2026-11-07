@@ -1193,6 +1193,12 @@ INSTANTIATE_TEST_SUITE_P(smoke_les_p4_runtime_proxy,
                 parameter.proxy_runtime_kernels = true;
                 parameters.push_back(parameter);
             }
+            Moe3GemmTestParams small{1, true, 128, 128, 4, 2, 128};
+            small.enable_les = true;
+            small.lru_expert_num = 2;
+            small.proxy_router = true;
+            small.proxy_runtime_kernels = true;
+            parameters.push_back(small);
             return parameters;
         }())));
 // Sub-128 weight quantization group size (e.g. trinity-mini afmoe uses group_size=64

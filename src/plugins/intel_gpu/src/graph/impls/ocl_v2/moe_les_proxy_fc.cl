@@ -10,6 +10,9 @@ KERNEL(moe_les_proxy_fc)(const __global MOE_DTYPE* hidden,
                          const uint has_bias,
                          __global MOE_DTYPE* logits) {
     const uint expert = (uint)get_global_id(0);
+    if (expert >= LES_PROXY_EXPERTS) {
+        return;
+    }
     float sum = has_bias ? (float)bias[expert] : 0.0f;
     for (uint index = 0; index < hidden_size; ++index) {
         sum = fma((float)weights[expert * hidden_size + index], (float)hidden[index], sum);
