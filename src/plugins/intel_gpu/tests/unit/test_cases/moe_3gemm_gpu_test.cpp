@@ -791,7 +791,7 @@ TEST_P(moe_3gemm_compressed_gpu_random, moe_accuracy_test_random) {
     }
     if (param.enable_les) {
         net_config.set_property({ov::intel_gpu::enable_les(true),
-                                 ov::enable_profiling(param.profiling),
+                                 ov::enable_profiling(param.profiling || ov::intel_gpu::ocl::moe_otd::les_trace_enabled()),
                                  ov::intel_gpu::les_queue_capacity(2),
                                  ov::intel_gpu::offload_ratio(param.lru_expert_num > 0 ? 50 : 0)});
     }

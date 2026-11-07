@@ -1858,15 +1858,28 @@ public:
                         }
                         if (auto* perf = moe_otd::get_perf_counters()) {
                             perf->les_prediction_matches.fetch_add(matches, std::memory_order_relaxed);
+                            perf->les_prediction_expert_matches.fetch_add(expert_matches, std::memory_order_relaxed);
                             perf->les_prediction_pairs.fetch_add(pair_count, std::memory_order_relaxed);
                         }
                         GPU_DEBUG_INFO << "[LES_PREDICT] target=" << instance.id() << " matches=" << matches << "/"
                                        << pair_count << std::endl;
+                        std::ostringstream predicted_ids;
+                        std::ostringstream actual_ids;
+                        for (size_t pair = 0; pair < pair_count; ++pair) {
+                            if (pair != 0) {
+                                predicted_ids << ',';
+                                actual_ids << ',';
+                            }
+                            predicted_ids << predicted[pair];
+                            actual_ids << experts[pair];
+                        }
                         GPU_DEBUG_INFO << "[LES_PREDICTION] {\"network\":" << cur_net.get_id()
                                        << ",\"layer\":" << instance.get_impl_params()->unique_id
                                        << ",\"epoch\":" << cur_net.get_les_epoch()
                                        << ",\"tokens\":" << token_num << ",\"rank_matches\":" << matches
                                        << ",\"expert_matches\":" << expert_matches << ",\"pairs\":" << pair_count
+                                       << ",\"predicted_ids\":[" << predicted_ids.str()
+                                       << "],\"actual_ids\":[" << actual_ids.str() << ']'
                                        << "}" << std::endl;
                     }
                 }

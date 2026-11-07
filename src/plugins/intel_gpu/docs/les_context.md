@@ -41,7 +41,10 @@ can appear there rather than in the GPU verbose stream. Trace/compare runs are
 diagnostic runs, not production latency measurements.
 Enable `PERF_COUNT=true` in the compile configuration when using trace, because
 native event timestamps require profiling-enabled queues. The summary includes
-`les_prediction_matches`, `les_prediction_pairs` and `les_prediction_recall_at_k`.
+`les_prediction_matches` (rank matches), `les_prediction_expert_matches`,
+`les_prediction_pairs`, `les_prediction_rank_hit_at_k` and
+`les_prediction_recall_at_k` (expert membership recall). Older logs without
+`les_prediction_expert_matches` incorrectly called rank hit rate recall.
 
 ### Compressed Router Projection
 
@@ -529,17 +532,20 @@ implementation cache path. Data cache records use the separate partial-OTD marke
 documented above.
 
 `OV_GPU_LES_PREDICT_COMPARE=1` waits for proxy and real Router IDs and records
-Top-k slot recall. This mode is diagnostic and synchronizes Host readback; it is
+Top-k rank and expert membership matches. This mode is diagnostic and synchronizes Host readback; it is
 off by default. `OV_GPU_LES_PREFETCH=1` separately opts into worker-side loading
 for predicted experts. It uses the bounded LES worker, reservation and transfer
 lane, skips demands that cannot fit, releases speculative pins after upload, and
 lets real demand reserve and validate the actual experts. A speculative read or
 upload failure drains issued DMA, discards the incomplete reservation and does
 not poison the request epoch; real demand retries via the normal path.
-Unsupported graphs never build a prediction stage and remain demand-only.
+Unsupported links never enqueue prediction and remain demand-only. A proxy
+kernel may still be compiled when prediction is requested, because final graph
+qualification can differ from intermediate compilation-time qualification.
 
 The diagnostic comparison also emits `[LES_PREDICTION]` JSON with `network`,
-`layer`, `epoch`, `tokens`, `rank_matches`, `expert_matches` and `pairs`.
+`layer`, `epoch`, `tokens`, `rank_matches`, `expert_matches`, `pairs`,
+`predicted_ids` and `actual_ids`. The ID arrays are token-major, Top-k rank order.
 `rank_matches / pairs` compares identical Top-k slots; `expert_matches / pairs`
 compares membership in the actual Top-k of the same token, independent of rank.
 Absent comparisons are unavailable, not zero recall. The extra computation and
@@ -548,6 +554,35 @@ its already-required readbacks; no production fence or readback is added.
 Enabled instrumentation has overhead and must be disabled for latency A/B.
 Existing `[LES_TRACE]` hit/miss and native copy/pass records can be aggregated
 offline by layer/epoch; asynchronous submission alone is not overlap proof.
+Trace records additionally carry the emitting C++ `host_thread` ID. Host
+`read`/`repack` records identify the copy worker; Host route/reservation/wait
+windows identify the inference control thread. A thread emitting a GPU event
+record is not the GPU execution thread or a hardware engine identifier.
+
+For large logs, run the workspace analyzer with `--summary-only`:
+
+```bash
+python les/analyze_les_timeline.py /absolute/path/verbose.txt \
+  --summary-only --output les/results/new_les_report
+```
+
+Use a new output directory. `cache_layers.csv` separates demand and speculative
+lookup statistics by network/layer/phase. `predictions.csv` correlates each
+network/layer/epoch with ranked prediction/actual arrays when available,
+observed demand expert IDs and actual cache-miss IDs. `expert_cache_events.csv`
+retains every lookup and its original file/line. `summary.json` and `summary.md`
+include independent rank hit and expert recall, thread witnesses and positive
+copy/kernel overlap examples with original timestamps and source lines.
+Overlap examples use bounded samples, not exhaustive coverage percentages.
+Missing ID arrays or thread IDs in old logs are reported as unavailable. Negative
+intervals retain counters, are reported explicitly and are excluded from
+overlap evidence. Dedicated hardware copy-engine use requires driver/native
+engine profiling; two queues or a memcpy API alone cannot prove it.
+
+The parser runs offline without modifying inference. New formatting/counters
+remain inside existing opt-in comparison/trace branches; no additional production
+readback, wait or kernel is introduced. Enabled comparison/trace still has real
+overhead and must be disabled for performance comparisons.
 
 Eight GPU variants cover Softmax/SigmoidBias, FC bias on/off, prediction-only and
 prefetch. The prediction tests observe 0/8, 1/8, 3/8 and 8/8 Top-k matches. They

@@ -10,6 +10,7 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <thread>
 
 #include "intel_gpu/runtime/debug_configuration.hpp"
 #include "runtime/ocl/ocl_stream.hpp"
@@ -92,6 +93,7 @@ static void les_trace_record(const char* kind, uint64_t start, uint64_t end, con
     GPU_DEBUG_INFO << "[LES_TRACE] {\"kind\":\"" << kind << "\",\"start_ns\":" << start
                    << ",\"end_ns\":" << end << ",\"network\":" << context.network << ",\"layer\":" << context.layer
                    << ",\"epoch\":" << context.epoch << ",\"tokens\":" << context.tokens
+                   << ",\"host_thread\":\"" << std::this_thread::get_id() << "\""
                    << ",\"phase\":\"" << (context.tokens == 0 ? "unknown" : context.tokens == 1 ? "decode" :
                                            context.tokens > 32 ? "prefill" : "batched")
                    << "\",\"chunk\":" << context.chunk << ",\"wave\":" << context.wave << ",\"demand\":" << context.demand
@@ -115,6 +117,7 @@ void OtdPerfCounters::dump() const {
     const auto total = hits + misses;
     const auto loads = tensor_load_count.load(std::memory_order_relaxed);
     const auto prediction_matches = les_prediction_matches.load(std::memory_order_relaxed);
+    const auto prediction_expert_matches = les_prediction_expert_matches.load(std::memory_order_relaxed);
     const auto prediction_pairs = les_prediction_pairs.load(std::memory_order_relaxed);
     GPU_DEBUG_INFO << "[OTD_PERF] gpu_hits=" << hits << ", gpu_misses=" << misses << ", gpu_hit_rate=" << (total > 0 ? 100.0 * hits / total : 0.0) << "%"
                    << ", tensor_loads=" << loads << ", avg_disk_io_us=" << (loads > 0 ? disk_io_ns.load(std::memory_order_relaxed) / 1000 / loads : 0)
@@ -141,7 +144,9 @@ void OtdPerfCounters::dump() const {
                    << ", les_shared_pairs=" << les_shared_pairs.load(std::memory_order_relaxed)
                    << ", les_prediction_matches=" << prediction_matches
                    << ", les_prediction_pairs=" << prediction_pairs
-                   << ", les_prediction_recall_at_k=" << (prediction_pairs > 0 ? 100.0 * prediction_matches / prediction_pairs : 0.0) << "%"
+                   << ", les_prediction_rank_hit_at_k=" << (prediction_pairs > 0 ? 100.0 * prediction_matches / prediction_pairs : 0.0) << "%"
+                   << ", les_prediction_expert_matches=" << prediction_expert_matches
+                   << ", les_prediction_recall_at_k=" << (prediction_pairs > 0 ? 100.0 * prediction_expert_matches / prediction_pairs : 0.0) << "%"
                    << ", les_prefetch_experts=" << les_prefetch_experts.load(std::memory_order_relaxed)
                    << ", les_prefetch_failures=" << les_prefetch_failures.load(std::memory_order_relaxed)
                    << ", les_prefetch_useful_bytes=" << les_prefetch_useful_bytes.load(std::memory_order_relaxed)
