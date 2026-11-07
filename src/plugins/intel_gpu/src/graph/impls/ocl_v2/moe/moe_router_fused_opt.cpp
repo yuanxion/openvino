@@ -104,6 +104,9 @@ public:
     program::les_router_link les_proxy_link;
     memory::ptr les_proxy_weights;
     memory::ptr les_proxy_weights_source;
+    memory::ptr les_proxy_logits;
+    memory::ptr les_proxy_indices;
+    memory::ptr les_proxy_routing_weights;
 
     memory::ptr get_proxy_weights(cldnn::network& network, const program::les_router_link& link) {
         auto weights = network.get_primitive(link.weights)->output_memory_ptr();
@@ -193,7 +196,11 @@ public:
     }
 
     [[nodiscard]] std::unique_ptr<primitive_impl> clone() const override {
-        return make_deep_copy<MoeRouterFusedImpl>(this);
+        auto copy = make_deep_copy<MoeRouterFusedImpl>(this);
+        copy->les_proxy_logits.reset();
+        copy->les_proxy_indices.reset();
+        copy->les_proxy_routing_weights.reset();
+        return copy;
     }
 
     cldnn::event::ptr execute(const std::vector<cldnn::event::ptr>& events, cldnn::primitive_inst& instance) override {
@@ -253,9 +260,15 @@ public:
                 const auto logits_layout = cldnn::layout({1, 1, 1, static_cast<int64_t>(proxy_link.experts)},
                                                           inputs.front()->get_layout().data_type,
                                                           cldnn::format::bfyx);
-                auto logits = network.get_engine().allocate_memory(logits_layout);
-                auto proxy_indices = network.get_engine().allocate_memory(instance.get_impl_params()->get_output_layout(1));
-                auto proxy_weights = network.get_engine().allocate_memory(instance.get_impl_params()->get_output_layout(0));
+                const auto reuse = [&network](memory::ptr& memory, const cldnn::layout& desired) {
+                    if (!memory || memory.use_count() > 1 || memory->get_layout() != desired) {
+                        memory = network.get_engine().allocate_memory(desired);
+                    }
+                    return memory;
+                };
+                auto logits = reuse(les_proxy_logits, logits_layout);
+                auto proxy_indices = reuse(les_proxy_indices, instance.get_impl_params()->get_output_layout(1));
+                auto proxy_weights = reuse(les_proxy_routing_weights, instance.get_impl_params()->get_output_layout(0));
 
                 cldnn::kernel_arguments_data fc_args;
                 cldnn::kernel_arguments_desc fc_desc;
