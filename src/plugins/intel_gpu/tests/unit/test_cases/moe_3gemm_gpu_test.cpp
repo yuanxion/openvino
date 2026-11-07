@@ -27,6 +27,7 @@
 #include "moe_3gemm_test_data.h"
 #include "common_test_utils/common_utils.hpp"
 #include "primitive_inst.h"
+#include "ocl/kernels_cache.hpp"
 #include "intel_gpu/graph/serialization/binary_buffer.hpp"
 
 using namespace cldnn;
@@ -616,6 +617,8 @@ struct Moe3GemmTestParams {
     bool proxy_fc_bias = false;
     bool proxy_perfect_recall = false;
     bool proxy_prefetch = false;
+    bool proxy_compressed = false;
+    bool proxy_runtime_kernels = false;
 };
 
 class scoped_moe_env {
@@ -833,12 +836,30 @@ TEST_P(moe_3gemm_compressed_gpu_random, moe_accuracy_test_random) {
     if (param.proxy_router) {
         auto router_weight_memory = engine.allocate_memory(
             layout{ov::PartialShape{static_cast<int64_t>(config.num_experts), static_cast<int64_t>(config.hidden_size)},
-                   data_types::f16,
+                   param.proxy_compressed ? (param.is_u4 ? data_types::u4 : data_types::u8) : data_types::f16,
                    format::bfyx});
         auto router_weights = param.proxy_perfect_recall
                       ? std::vector<ov::float16>(config.num_experts * config.hidden_size, ov::float16(0.0f))
                       : rg.generate_random_1d<ov::float16>(config.num_experts * config.hidden_size, -0.25f, 0.25f, 1000);
-        set_values(router_weight_memory, router_weights);
+        if (param.proxy_compressed) {
+            auto quantized = rg.generate_random_1d<uint8_t>(router_weights.size(), 0, 15);
+            if (param.proxy_perfect_recall) {
+                std::fill(quantized.begin(), quantized.end(), 8);
+            }
+            set_values(router_weight_memory, ref.pack(quantized));
+            const size_t groups = config.hidden_size / 64;
+            auto scales = engine.allocate_memory(layout{ov::PartialShape{static_cast<int64_t>(config.num_experts),
+                                                                        static_cast<int64_t>(groups)},
+                                                       data_types::f16, format::fbyx});
+            set_values(scales, rg.generate_random_1d<ov::float16>(config.num_experts * groups, 0.01f, 0.1f, 1000));
+            auto zeros = engine.allocate_memory(layout{ov::PartialShape{static_cast<int64_t>(config.num_experts),
+                                                                       static_cast<int64_t>(groups)},
+                                                      data_types::u8, format::fbyx});
+            set_values(zeros, std::vector<uint8_t>(config.num_experts * groups, 8));
+            topology.add(data("proxy_router_scales", scales), data("proxy_router_zeros", zeros));
+        } else {
+            set_values(router_weight_memory, router_weights);
+        }
         get_test_stream().finish();
         topology.add(data("proxy_router_weights", router_weight_memory));
         std::string proxy_projection_bias_id;
@@ -850,11 +871,18 @@ TEST_P(moe_3gemm_compressed_gpu_random, moe_accuracy_test_random) {
             get_test_stream().finish();
             topology.add(data(proxy_projection_bias_id, projection_bias));
         }
-        topology.add(fully_connected("proxy_router_projection",
+        if (param.proxy_compressed) {
+            topology.add(fully_connected("proxy_router_projection",
+                                         input_info("moe_3gemm_fused_compressed"),
+                                         "proxy_router_weights", proxy_projection_bias_id,
+                                         "proxy_router_scales", "proxy_router_zeros", data_types::f16, 3));
+        } else {
+            topology.add(fully_connected("proxy_router_projection",
                                      input_info("moe_3gemm_fused_compressed"),
                                      "proxy_router_weights",
                                      proxy_projection_bias_id,
                                      3));
+        }
         MoERouterFused::Config proxy_router_config;
         proxy_router_config.num_expert = config.num_experts;
         proxy_router_config.top_k = config.top_k;
@@ -917,12 +945,11 @@ TEST_P(moe_3gemm_compressed_gpu_random, moe_accuracy_test_random) {
     std::unique_ptr<scoped_moe_env> prediction_perf_env;
     std::unique_ptr<scoped_moe_env> prediction_prefetch_env;
     if (param.proxy_router) {
+        net_config.set_property(ov::weights_path(offload_weights_path.string()));
         prediction_env = std::make_unique<scoped_moe_env>("OV_GPU_LES_PREDICT", "1");
         prediction_compare_env = std::make_unique<scoped_moe_env>("OV_GPU_LES_PREDICT_COMPARE", "1");
         prediction_perf_env = std::make_unique<scoped_moe_env>("MOE_OTD_PERF_LOG", "1");
-        if (param.proxy_prefetch) {
-            prediction_prefetch_env = std::make_unique<scoped_moe_env>("OV_GPU_LES_PREFETCH", "1");
-        }
+        prediction_prefetch_env = std::make_unique<scoped_moe_env>("OV_GPU_LES_PREFETCH", param.proxy_prefetch ? "1" : "0");
     }
     cldnn::topology baseline_topology;
     if (param.proxy_router) {
@@ -946,6 +973,16 @@ TEST_P(moe_3gemm_compressed_gpu_random, moe_accuracy_test_random) {
         EXPECT_EQ(links.back().chain.target_moe, "proxy_target");
         EXPECT_EQ(links.back().router, "proxy_router");
         EXPECT_TRUE(network.is_les_prediction_enabled());
+        if (param.proxy_runtime_kernels) {
+            auto router = network.get_primitive("proxy_router");
+            auto binaries = router->get_impl()->get_kernels();
+            cldnn::kernels_cache::compiled_kernels compiled;
+            auto& kernels = compiled[*router->get_impl_params()];
+            for (size_t index = 0; index < binaries.size(); ++index) {
+                kernels.emplace_back(binaries[index], index);
+            }
+            router->get_impl()->set_kernels(std::move(compiled));
+        }
         auto predicted_outputs = network.execute();
         const auto state = network.get_les_proxy_state("proxy_target");
         ASSERT_NE(state.hidden, nullptr);
@@ -1119,6 +1156,45 @@ INSTANTIATE_TEST_SUITE_P(smoke_les_resident,
         ::testing::Values(
             Moe3GemmTestParams{1, true, 256, 256, 4, 2, 128, false, true},
             Moe3GemmTestParams{4, true, 256, 256, 4, 2, 128, false, true})));
+
+INSTANTIATE_TEST_SUITE_P(smoke_les_p4_compressed_proxy,
+    moe_3gemm_compressed_gpu_random,
+    ::testing::Combine(
+        ::testing::Values(cldnn::MoERouterFused::RoutingType::SOFTMAX, cldnn::MoERouterFused::RoutingType::SIGMOID_BIAS),
+        ::testing::ValuesIn([] {
+            std::vector<Moe3GemmTestParams> parameters;
+            for (bool u4 : {false, true}) {
+                for (bool perfect : {false, true}) {
+                    Moe3GemmTestParams parameter{1, u4, 128, 128, 16, 8, 128};
+                    parameter.enable_les = true;
+                    parameter.lru_expert_num = 8;
+                    parameter.proxy_router = true;
+                    parameter.proxy_compressed = true;
+                    parameter.proxy_runtime_kernels = true;
+                    parameter.proxy_perfect_recall = perfect;
+                    parameters.push_back(parameter);
+                }
+            }
+            return parameters;
+        }())));
+
+INSTANTIATE_TEST_SUITE_P(smoke_les_p4_runtime_proxy,
+    moe_3gemm_compressed_gpu_random,
+    ::testing::Combine(
+        ::testing::Values(cldnn::MoERouterFused::RoutingType::SOFTMAX, cldnn::MoERouterFused::RoutingType::SIGMOID_BIAS),
+        ::testing::ValuesIn([] {
+            std::vector<Moe3GemmTestParams> parameters;
+            for (bool bias : {false, true}) {
+                Moe3GemmTestParams parameter{1, true, 128, 128, 16, 8, 128};
+                parameter.enable_les = true;
+                parameter.lru_expert_num = 8;
+                parameter.proxy_router = true;
+                parameter.proxy_fc_bias = bias;
+                parameter.proxy_runtime_kernels = true;
+                parameters.push_back(parameter);
+            }
+            return parameters;
+        }())));
 // Sub-128 weight quantization group size (e.g. trinity-mini afmoe uses group_size=64
 // with SIGMOID_BIAS routing). Limited to SIGMOID_BIAS to mirror real model usage and
 // to avoid known accuracy noise of the SOFTMAX path on some platforms.

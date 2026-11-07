@@ -52,11 +52,15 @@ void les_trace_interval(const char* kind, uint64_t start, uint64_t end) {
 }
 
 void OtdPerfCounters::dump() const {
+    const auto* enabled = std::getenv("MOE_OTD_PERF_LOG");
+    if (!enabled || std::strcmp(enabled, "1") != 0) {
+        return;
+    }
     const auto hits = gpu_hits.load(std::memory_order_relaxed);
     const auto misses = gpu_misses.load(std::memory_order_relaxed);
     const auto total = hits + misses;
     const auto loads = tensor_load_count.load(std::memory_order_relaxed);
-    GPU_DEBUG_INFO << "[OTD_PERF] gpu_hits=" << hits << ", gpu_misses=" << misses << ", gpu_hit_rate=" << (total > 0 ? 100.0 * hits / total : 0.0) << "%"
+    std::cout << "[OTD_PERF] gpu_hits=" << hits << ", gpu_misses=" << misses << ", gpu_hit_rate=" << (total > 0 ? 100.0 * hits / total : 0.0) << "%"
                    << ", tensor_loads=" << loads << ", avg_disk_io_us=" << (loads > 0 ? disk_io_ns.load(std::memory_order_relaxed) / 1000 / loads : 0)
                    << ", avg_transpose_us=" << (loads > 0 ? transpose_ns.load(std::memory_order_relaxed) / 1000 / loads : 0)
                    << ", avg_gpu_copy_us=" << (loads > 0 ? gpu_copy_ns.load(std::memory_order_relaxed) / 1000 / loads : 0)
@@ -79,7 +83,10 @@ void OtdPerfCounters::dump() const {
 }
 
 OtdPerfCounters* get_perf_counters() {
-    static bool enabled = std::getenv("MOE_OTD_PERF_LOG") != nullptr;
+    static const bool enabled = [] {
+        const auto* value = std::getenv("MOE_OTD_PERF_LOG");
+        return value && std::strcmp(value, "1") == 0;
+    }();
     if (!enabled) {
         return nullptr;
     }
