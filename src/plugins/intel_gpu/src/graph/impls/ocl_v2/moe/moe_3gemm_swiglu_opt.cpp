@@ -752,6 +752,7 @@ public:
     int _down_group_size;
     std::shared_ptr<IExpertWeightProvider> _weight_provider;
     cldnn::les_context* _les_owner = nullptr;
+    std::vector<memory::ptr> _les_decode_metadata = std::vector<memory::ptr>(3);
 
     // --- OTD helper methods (used when _weight_provider->is_offloaded()) ---
 
@@ -1481,6 +1482,7 @@ public:
         cur_moe->_down_group_size = _down_group_size;
         cur_moe->_weight_provider = _weight_provider;  // shared across clones within the same network
         cur_moe->_les_owner = nullptr;
+        cur_moe->_les_decode_metadata.assign(3, nullptr);
         cur_moe->force_gpu_mask_gen_prefill = force_gpu_mask_gen_prefill;
         cur_moe->prefill_impl = prefill_impl;
         cur_moe->decode_impl = decode_impl;
@@ -1859,7 +1861,6 @@ public:
                 std::vector<bool> done(pair_count, false);
                 size_t remaining = pair_count;
                 bool shared_pending = _has_shared_expert;
-                std::vector<memory::ptr> buffers;
                 try {
                     while (remaining > 0) {
                         std::vector<uint32_t> selected;
@@ -1905,17 +1906,20 @@ public:
                                 ready_mask[token * compute_experts + max_topk] = 1;
                             }
                         }
-                        auto upload = [&](const std::vector<int32_t>& values) {
-                            auto layout = cldnn::layout({1, 1, 1, static_cast<int64_t>(values.size())},
-                                                        ov::element::i32, cldnn::format::bfyx);
-                            auto memory = cur_net.get_engine().allocate_memory(layout, allocation_type::usm_host, false);
-                            buffers.push_back(memory);
-                            memory->copy_from(stream, values.data(), 0, 0, values.size() * sizeof(int32_t), true);
+                        auto upload = [&](const std::vector<int32_t>& values, size_t index) {
+                            auto& memory = _les_decode_metadata[index];
+                            if (!memory || memory->size() != values.size() * sizeof(int32_t)) {
+                                auto layout = cldnn::layout({1, 1, 1, static_cast<int64_t>(values.size())},
+                                                            ov::element::i32, cldnn::format::bfyx);
+                                memory = cur_net.get_engine().allocate_memory(layout, allocation_type::usm_host, false);
+                            }
+                            mem_lock<int32_t, mem_lock_type::write> metadata(memory, stream);
+                            std::copy(values.begin(), values.end(), metadata.data());
                             return memory;
                         };
-                        auto indices = upload(slots);
-                        auto ready_memory = upload(ready_mask);
-                        auto missing_memory = upload(missing_mask);
+                        auto indices = upload(slots, 0);
+                        auto ready_memory = upload(ready_mask, 1);
+                        auto missing_memory = upload(missing_mask, 2);
                         std::vector<event::ptr> dependencies = ret_event ? std::vector<event::ptr>{ret_event} : events;
                         if (!demand->ready_pairs.empty() || shared_pending) {
                             pass_a = true;
@@ -1931,7 +1935,9 @@ public:
                         OPENVINO_ASSERT(ret_event, "LES wave produced no consumer");
                         stream.flush();
                         _weight_provider->set_consumer(ret_event);
-                        ret_event->wait();
+                        if (moe_otd::les_trace_enabled() || wave_pairs.size() < remaining) {
+                            ret_event->wait();
+                        }
                         for (const auto& entry : trace_events) {
                             auto* native = dynamic_cast<cldnn::ocl::ocl_event*>(entry.second.get());
                             OPENVINO_ASSERT(native, "LES trace requires native kernel events");
@@ -1940,7 +1946,6 @@ public:
                                 native->get().getProfilingInfo<CL_PROFILING_COMMAND_END>());
                         }
                         trace_events.clear();
-                        buffers.clear();
                         shared_pending = false;
                         for (auto pair : wave_pairs) {
                             done[pair] = true;
