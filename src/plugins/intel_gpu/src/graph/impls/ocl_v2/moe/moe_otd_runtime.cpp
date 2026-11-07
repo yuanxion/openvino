@@ -78,6 +78,7 @@ void OtdPerfCounters::dump() const {
                    << ", les_shared_pairs=" << les_shared_pairs.load(std::memory_order_relaxed)
                    << ", les_prediction_matches=" << les_prediction_matches.load(std::memory_order_relaxed)
                    << ", les_prediction_pairs=" << les_prediction_pairs.load(std::memory_order_relaxed)
+                   << ", les_proxy_weight_initializations=" << les_proxy_weight_initializations.load(std::memory_order_relaxed)
                    << ", les_prefetch_experts=" << les_prefetch_experts.load(std::memory_order_relaxed)
                    << ", les_prefetch_failures=" << les_prefetch_failures.load(std::memory_order_relaxed) << std::endl;
 }
