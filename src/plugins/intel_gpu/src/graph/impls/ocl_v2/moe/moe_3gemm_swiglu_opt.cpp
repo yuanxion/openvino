@@ -770,6 +770,7 @@ public:
     int _down_group_size;
     std::shared_ptr<IExpertWeightProvider> _weight_provider;
     cldnn::les_context* _les_owner = nullptr;
+    memory::ptr _les_proxy_hidden;
     std::vector<memory::ptr> _les_decode_metadata = std::vector<memory::ptr>(3);
 
     // --- OTD helper methods (used when _weight_provider->is_offloaded()) ---
@@ -1500,6 +1501,7 @@ public:
         cur_moe->_down_group_size = _down_group_size;
         cur_moe->_weight_provider = _weight_provider;  // shared across clones within the same network
         cur_moe->_les_owner = nullptr;
+        cur_moe->_les_proxy_hidden.reset();
         cur_moe->_les_decode_metadata.assign(3, nullptr);
         cur_moe->force_gpu_mask_gen_prefill = force_gpu_mask_gen_prefill;
         cur_moe->prefill_impl = prefill_impl;
@@ -3182,7 +3184,11 @@ public:
                     hidden_layout.get_linear_size() != hidden_layout.count()) {
                     continue;
                 }
-                auto snapshot = cur_net.get_engine().allocate_memory(source_hidden->get_layout());
+                if (!_les_proxy_hidden || _les_proxy_hidden.use_count() > 1 ||
+                    _les_proxy_hidden->get_layout() != hidden_layout) {
+                    _les_proxy_hidden = cur_net.get_engine().allocate_memory(hidden_layout);
+                }
+                auto snapshot = _les_proxy_hidden;
                 stream.enqueue_barrier(events);
                 auto snapshot_ready = snapshot->copy_from(stream, *source_hidden, false);
                 cur_net.set_les_proxy_hidden(link.chain.target_moe, std::move(snapshot), std::move(snapshot_ready));
