@@ -91,6 +91,7 @@
 #include "intel_gpu/primitives/rnn.hpp"
 #include "intel_gpu/primitives/moe_3gemm_fused_compressed.hpp"
 #include "intel_gpu/primitives/moe_router_fused.hpp"
+#include "intel_gpu/primitives/dynamic_quantize.hpp"
 #include "intel_gpu/primitives/fully_connected.hpp"
 
 // TODO: Remove once we have interface for kernels cache
@@ -644,10 +645,6 @@ std::vector<program::les_router_link> program::get_les_router_links() const {
             const auto& projection = *router_dependencies.front().first;
             const auto desc = std::static_pointer_cast<const fully_connected>(projection.get_primitive());
             const auto& inputs = projection.get_dependencies();
-            if (desc->compressed_weights) {
-                link.rejection_reason = "projection_compressed_weights";
-                return les_router_status::unsupported_projection;
-            }
             if (desc->hadamard_block) {
                 link.rejection_reason = "projection_hadamard";
                 return les_router_status::unsupported_projection;
@@ -659,12 +656,19 @@ std::vector<program::les_router_link> program::get_les_router_links() const {
                 }
                 return les_router_status::unsupported_projection;
             }
-            if (inputs.size() != (desc->bias.is_valid() ? 3U : 2U)) {
+            const size_t parameter_count = (desc->bias.is_valid() ? 3U : 2U) +
+                                           (desc->compressed_weights ? 1U : 0U) +
+                                           (desc->decompression_zero_point.is_valid() ? 1U : 0U) +
+                                           (desc->activation_scale.is_valid() ? 1U : 0U) +
+                                           (desc->activation_zero_point.is_valid() ? 1U : 0U) +
+                                           (desc->activation_precomputed_reduction.is_valid() ? 1U : 0U);
+            if (inputs.size() != parameter_count) {
                 link.rejection_reason = "projection_unexpected_input_count";
                 return les_router_status::unsupported_projection;
             }
             const auto* projection_hidden = inputs.front().first;
-            while (projection_hidden->id() != chain.target_hidden && projection_hidden->is_type<reshape>() &&
+                 while (projection_hidden->id() != chain.target_hidden &&
+                     (projection_hidden->is_type<reshape>() || projection_hidden->is_type<dynamic_quantize>()) &&
                    !projection_hidden->has_fused_primitives() && !projection_hidden->get_dependencies().empty() &&
                    projection_hidden->get_dependencies().front().second == 0) {
                 projection_hidden = projection_hidden->get_dependencies().front().first;
@@ -674,9 +678,7 @@ std::vector<program::les_router_link> program::get_les_router_links() const {
                                         ";target=" + chain.target_hidden;
                 return les_router_status::unsupported_projection;
             }
-            if (inputs[1].first->id() != desc->weights.pid || inputs[1].second != desc->weights.idx ||
-                (desc->bias.is_valid() &&
-                 (inputs[2].first->id() != desc->bias.pid || inputs[2].second != desc->bias.idx))) {
+            if (inputs[1].second != 0 || (desc->bias.is_valid() && inputs[2].second != 0)) {
                 link.rejection_reason = "projection_parameter_port_mismatch";
                 return les_router_status::unsupported_projection;
             }
@@ -685,11 +687,21 @@ std::vector<program::les_router_link> program::get_les_router_links() const {
             if (desc->bias.is_valid()) {
                 link.projection_bias = inputs[2].first->id();
             }
+            const size_t scale_index = desc->bias.is_valid() ? 3U : 2U;
+            const primitive_id compression_scale = desc->compressed_weights ? inputs[scale_index].first->id() : primitive_id{};
+            const primitive_id compression_zero = desc->decompression_zero_point.is_valid()
+                                                     ? inputs[scale_index + 1].first->id() : primitive_id{};
+            if (desc->compressed_weights && (inputs[scale_index].second != 0 ||
+                (!compression_zero.empty() && inputs[scale_index + 1].second != 0))) {
+                link.rejection_reason = "projection_compression_parameter_port_mismatch";
+                return les_router_status::unsupported_projection;
+            }
             if (link.sigmoid_bias) {
                 link.routing_bias = router_dependencies[1].first->id();
                 link.routing_eps = router_dependencies[2].first->id();
             }
-            for (const auto& id : {link.weights, link.projection_bias, link.routing_bias, link.routing_eps}) {
+            for (const auto& id : {link.weights, link.projection_bias, link.routing_bias, link.routing_eps,
+                                   compression_scale, compression_zero}) {
                 if (!id.empty() && !get_node(id).is_type<data>()) {
                     return les_router_status::non_constant_parameter;
                 }
@@ -710,10 +722,14 @@ std::vector<program::les_router_link> program::get_les_router_links() const {
                     return dimension.compatible(1);
                 });
             };
-            if (weights.is_dynamic() ||
-                weights.data_type != data_types::f16 ||
-                hidden.data_type != weights.data_type || target_hidden.data_type != weights.data_type ||
+                        const bool supported_weights = desc->compressed_weights
+                                                                                             ? weights.data_type == data_types::u4 || weights.data_type == data_types::i4 ||
+                                                                                                 weights.data_type == data_types::u8 || weights.data_type == data_types::i8
+                                                                                             : weights.data_type == data_types::f16;
+                        if (weights.is_dynamic() || !supported_weights ||
+                                hidden.data_type != data_types::f16 || target_hidden.data_type != data_types::f16 ||
                 weights.format != format::bfyx || hidden.format != format::bfyx || target_hidden.format != format::bfyx ||
+                                weights.get_linear_size() != weights.count() ||
                 weights.get_partial_shape().size() != 2 ||
                 !desc->weights_transposed || weights.get_shape()[0] != link.experts ||
                 !supports_single_token(hidden, weights.get_shape()[1]) ||
@@ -722,13 +738,42 @@ std::vector<program::les_router_link> program::get_les_router_links() const {
                 link.rejection_reason = "unsupported_single_token_layout";
                 return les_router_status::unsupported_layout;
             }
+            if (desc->compressed_weights) {
+                const auto validate_compression_parameter = [&](const primitive_id& parameter, bool scale) {
+                    if (parameter.empty()) {
+                        return !scale;
+                    }
+                    const auto& value = get_node(parameter).get_output_layout();
+                    if (value.is_dynamic() || (value.format != format::bfyx && value.format != format::fbyx) ||
+                        value.get_linear_size() != value.count() ||
+                        (scale ? value.data_type != data_types::f16 :
+                         value.data_type != data_types::f16 && value.data_type != data_types::u4 &&
+                         value.data_type != data_types::i4 && value.data_type != data_types::u8 &&
+                         value.data_type != data_types::i8)) {
+                        return false;
+                    }
+                    if (value.count() == 1) {
+                        return true;
+                    }
+                    const auto shape = value.get_shape();
+                    const size_t groups = value.count() / link.experts;
+                    return value.count() % link.experts == 0 && groups > 0 && weights.get_shape()[1] % groups == 0 &&
+                           shape.front() * (shape.size() > 1 ? shape[1] : 1) == value.count() &&
+                           (shape.front() == link.experts || (shape.size() >= 2 && shape[1] == link.experts));
+                };
+                if (!validate_compression_parameter(compression_scale, true) ||
+                    !validate_compression_parameter(compression_zero, false)) {
+                    link.rejection_reason = "unsupported_compressed_projection_parameters";
+                    return les_router_status::unsupported_layout;
+                }
+            }
             const auto validate_parameter = [&](const primitive_id& id, size_t count) {
                 if (id.empty()) {
                     return true;
                 }
                 const auto& parameter = get_node(id).get_output_layout();
                 return !parameter.is_dynamic() && parameter.get_shape().size() == 1 && parameter.get_shape()[0] == count &&
-                       parameter.data_type == weights.data_type;
+                       parameter.data_type == data_types::f16;
             };
             if (!validate_parameter(link.projection_bias, link.experts) ||
                 !validate_parameter(link.routing_bias, link.experts) ||
