@@ -644,16 +644,45 @@ TEST(moe_les_reservations, speculation_cannot_evict_active_demand_and_unused_slo
     EXPECT_TRUE(reservations.release(*replacement));
 }
 
-TEST(moe_les_reservations, fixed_speculative_policy_separates_horizon_rank_and_byte_budget) {
-    using Policy = otd::LesSpeculationPolicy;
-    EXPECT_EQ(Policy::lookahead_layers, 1U);
-    EXPECT_EQ(Policy::predict_k, 4U);
-    EXPECT_EQ(Policy::expert_budget(1, 16), 0U);
-    EXPECT_EQ(Policy::expert_budget(16, 0), 0U);
-    EXPECT_EQ(Policy::expert_budget(16, 16), 4U);
-    EXPECT_EQ(Policy::expert_budget(4, 16), 1U);
-    EXPECT_EQ(Policy::expert_budget(16, Policy::max_bytes), 1U);
-    EXPECT_EQ(Policy::expert_budget(16, Policy::max_bytes + 1), 0U);
+TEST(moe_les_reservations, full_rank_prefetch_deduplicates_hits_and_preserves_miss_priority) {
+    EXPECT_EQ(otd::LesSpeculationPolicy::lookahead_layers, 1U);
+    ov::intel_gpu::ocl::moe::ExpertSlotReservations reservations(8);
+    auto demand = reservations.reserve({7, 6}, 1);
+    ASSERT_TRUE(demand);
+    ASSERT_TRUE(reservations.complete(*demand));
+    ASSERT_TRUE(reservations.release(*demand));
+    auto speculative = reservations.reserve({7, 5, 5, 6, 4, 3, 2, 1, 0}, 1, true);
+    ASSERT_TRUE(speculative);
+    EXPECT_EQ(speculative->experts, (std::vector<uint32_t>{7, 5, 6, 4, 3, 2, 1, 0}));
+    EXPECT_EQ(speculative->missing_experts, (std::vector<uint32_t>{5, 4, 3, 2, 1, 0}));
+    EXPECT_TRUE(reservations.rollback(*speculative));
+}
+
+TEST(moe_les_reservations, partial_prefetch_protects_active_and_predicted_hits) {
+    ov::intel_gpu::ocl::moe::ExpertSlotReservations reservations(4);
+    auto demand = reservations.reserve({0, 1}, 1);
+    ASSERT_TRUE(demand);
+    ASSERT_TRUE(reservations.complete(*demand));
+    auto speculative = reservations.reserve({3, 1, 3, 2, 4, 5}, 1, true);
+    ASSERT_TRUE(speculative);
+    EXPECT_EQ(speculative->experts, (std::vector<uint32_t>{3, 1, 2}));
+    EXPECT_EQ(speculative->missing_experts, (std::vector<uint32_t>{3, 2}));
+    EXPECT_FALSE(reservations.rollback(*speculative));
+    ASSERT_TRUE(reservations.release(*speculative));
+    ASSERT_TRUE(reservations.release(*demand));
+    auto original = reservations.reserve({0, 1}, 1);
+    ASSERT_TRUE(original);
+    EXPECT_TRUE(original->missing_experts.empty());
+    EXPECT_TRUE(reservations.release(*original));
+}
+
+TEST(moe_les_reservations, single_slot_prefetch_accepts_first_rank_and_skips_inflight_hits) {
+    ov::intel_gpu::ocl::moe::ExpertSlotReservations reservations(1);
+    auto speculative = reservations.reserve({4, 3, 2, 1}, 1, true);
+    ASSERT_TRUE(speculative);
+    EXPECT_EQ(speculative->missing_experts, (std::vector<uint32_t>{4}));
+    EXPECT_FALSE(reservations.reserve({4, 3}, 1, true));
+    EXPECT_TRUE(reservations.rollback(*speculative));
 }
 
 TEST(moe_les_prefill, performance_logging_requires_explicit_one) {

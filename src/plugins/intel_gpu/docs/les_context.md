@@ -729,12 +729,17 @@ ID readback still have a Host wait; weight reads/repacking/uploads run on the
 worker and no longer block the source until their completion. This enables
 overlap but is not a new measured device-overlap or speedup claim.
 
-`LesSpeculationPolicy` separates `lookahead_layers=1` from `predict_k=4`.
-Each provider keeps at most one speculative batch. Its admission limit is the
-minimum of four experts, `max(1, capacity / 4)` slots and 16 MiB divided by the
-complete per-expert W/S/ZP byte size. Capacity one, zero-byte metadata and experts
-larger than 16 MiB disable speculation. These are fixed internal limits, not new
-public properties or a cross-layer memory budget. No adaptive or trained
+`LesSpeculationPolicy` keeps `lookahead_layers=1`. The Router reads the complete
+predicted top-k, and each provider keeps at most one speculative batch. There
+is no four-expert, capacity-quarter or 16 MiB admission limit. Reservations
+deduplicate prediction IDs and protect already-ready predicted hits from eviction;
+only missing experts are uploaded, in prediction rank order. If capacity is
+insufficient, the reservation accepts the highest-ranked misses that fit in
+unpinned slots rather than rejecting the whole batch. In-flight experts are
+not uploaded again and active demand slots are never evicted. Capacity one can
+admit one missing expert; zero-byte metadata still disables uploads. This is
+capacity-bounded speculation, not a guarantee of better throughput: larger
+batches can increase DMA wait and cache pollution. No adaptive or trained
 predictor is required.
 
 Matching pending expert requests reuse the original task. A different request
@@ -752,6 +757,30 @@ Useful predicted slots remain ready for actual demand. This is bounded soft
 protection, not a guarantee of zero cache pollution. Independent demand-only
 shadow reservations track the same successful demand sequence and capacity,
 without prediction or any device allocations.
+
+### MiniCPM Six-Mode Benchmark References
+
+The workspace runner `les/run_minicpm_six_modes.py` defaults to the following
+six modes. Reference versions are validated in the inference worker, not just
+in archive filenames. OV23634 is not this comparison's reference: it has the
+known dynamic-shape `get_dims()` failure for this model.
+
+| Mode | Runtime/archive | LES | Predict | Prefetch |
+| --- | --- | --- | --- | --- |
+| LES base | `les/wheels/les-base/`, OV23745 | 0 | 0 | 0 |
+| LES proxy base | `les/wheels/proxy-base-937/`, OV23659 / commit9379271c1e | 0 | 0 | 0 |
+| Current off | Latest native build or archived current wheels | 0 | 0 | 0 |
+| Current demand | Same current runtime | 1 | 0 | 0 |
+| Current predict | Same current runtime | 1 | 1 | 0 |
+| Current prefetch | Same current runtime | 1 | 1 | 1 |
+
+Keep MiniCPM-V4.7, the original four-question81-token prompt, GPU/PA and
+`MOE_LES_DECODE_SINGLE_PASS=0`. Use one common offload ratio, starting at60;
+only an allocation/resource failure justifies a fresh full comparison at70.
+Performance uses warmup plus three512-token rounds without trace/profiling.
+Separate full-generation diagnostics collect phase/layer cache, prediction
+and device-interval evidence; their timings must not replace clean performance
+numbers. Missing intervals or inactive predictions are N/A, not zero.
 
 Counters are cumulative and require `MOE_OTD_PERF_LOG=1`:
 

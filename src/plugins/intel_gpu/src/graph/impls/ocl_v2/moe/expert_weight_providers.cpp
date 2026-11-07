@@ -464,23 +464,13 @@ void OffloadExpertWeightProvider::prefetch_les_demand(const std::vector<uint32_t
                 _prefetch_expert_bytes += tensor->get_layout().bytes_count() / _config.num_expert;
             }
         }
-        std::vector<uint32_t> selected;
-        const auto budget = moe_otd::LesSpeculationPolicy::expert_budget(_capacity, _prefetch_expert_bytes);
-        for (auto expert : experts) {
-            if (selected.size() == budget) {
-                break;
-            }
-            if (std::find(selected.begin(), selected.end(), expert) == selected.end()) {
-                selected.push_back(expert);
-            }
-        }
-        if (selected.empty()) {
+        if (experts.empty() || _prefetch_expert_bytes == 0) {
             if (perf) {
                 perf->les_prefetch_skipped.fetch_add(1, std::memory_order_relaxed);
             }
             return;
         }
-        _reservation = _reservations->reserve(selected, _les_epoch, true);
+        _reservation = _reservations->reserve(experts, _les_epoch, true);
         _speculative_reservation = _reservation.has_value();
         if (!_reservation) {
             if (perf) {
@@ -488,6 +478,7 @@ void OffloadExpertWeightProvider::prefetch_les_demand(const std::vector<uint32_t
             }
             return;
         }
+        const auto& selected = _reservation->experts;
         const auto prefetched_slots = _reservation->missing_experts.size();
         if (moe_otd::les_trace_enabled()) {
             _trace.demand = moe_otd::les_trace_next_id();

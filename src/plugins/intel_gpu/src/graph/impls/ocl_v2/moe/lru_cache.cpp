@@ -17,20 +17,25 @@ ExpertSlotReservations::ExpertSlotReservations(size_t capacity) : _slots(capacit
 std::optional<ExpertSlotReservations::Ticket> ExpertSlotReservations::reserve(const std::vector<uint32_t>& experts, uint64_t epoch, bool speculative) {
     std::lock_guard<std::mutex> lock(_mutex);
     std::unordered_set<uint32_t> unique(experts.begin(), experts.end());
-    if (unique.size() > _slots.size() || epoch < _epoch || (epoch != _epoch && !_active.empty())) {
+    if ((!speculative && unique.size() > _slots.size()) || epoch < _epoch || (epoch != _epoch && !_active.empty())) {
         return std::nullopt;
     }
     auto planned = _slots;
     std::unordered_map<uint32_t, size_t> mapping;
+    std::unordered_set<uint32_t> unavailable;
     Record record{epoch, {}, {}};
-    Ticket result{_next_id + 1, epoch, {}, {}, {}, {}, {}};
+    Ticket result{_next_id + 1, epoch, {}, {}, {}, {}, {}, {}};
     auto clock = _clock;
     for (auto expert : unique) {
         for (size_t index = 0; index < planned.size(); ++index) {
             auto& slot = planned[index];
             if (slot.expert == expert) {
                 if (!slot.ready) {
-                    return std::nullopt;
+                    if (!speculative) {
+                        return std::nullopt;
+                    }
+                    unavailable.insert(expert);
+                    break;
                 }
                 ++slot.pins;
                 if (!speculative) {
@@ -43,7 +48,7 @@ std::optional<ExpertSlotReservations::Ticket> ExpertSlotReservations::reserve(co
         }
     }
     for (auto expert : experts) {
-        if (mapping.count(expert)) {
+        if (mapping.count(expert) || unavailable.count(expert)) {
             continue;
         }
         size_t candidate = planned.size();
@@ -58,7 +63,10 @@ std::optional<ExpertSlotReservations::Ticket> ExpertSlotReservations::reserve(co
             }
         }
         if (candidate == planned.size()) {
-            return std::nullopt;
+            if (!speculative) {
+                return std::nullopt;
+            }
+            continue;
         }
         auto& slot = planned[candidate];
         if (speculative) {
@@ -74,8 +82,16 @@ std::optional<ExpertSlotReservations::Ticket> ExpertSlotReservations::reserve(co
         result.missing_experts.push_back(expert);
         result.missing_slots.push_back(candidate);
     }
-    for (size_t pair = 0; pair < experts.size(); ++pair) {
-        auto slot = mapping.at(experts[pair]);
+    if (mapping.empty() && !experts.empty()) {
+        return std::nullopt;
+    }
+    for (auto expert : experts) {
+        if (!mapping.count(expert) || (speculative && std::find(result.experts.begin(), result.experts.end(), expert) != result.experts.end())) {
+            continue;
+        }
+        auto slot = mapping.at(expert);
+        const auto pair = result.experts.size();
+        result.experts.push_back(expert);
         result.slots.push_back(slot);
         (planned[slot].ready ? result.ready_pairs : result.missing_pairs).push_back(pair);
     }
