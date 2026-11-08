@@ -163,7 +163,8 @@ public:
             }
         }
         les_proxy_weights = network.get_engine().allocate_memory(
-            cldnn::layout{weights->get_layout().get_partial_shape(), data_types::f16, format::bfyx});
+            cldnn::layout{weights->get_layout().get_partial_shape(), data_types::f16, format::bfyx},
+            network.get_engine().get_preferred_memory_allocation_type(), false);
         les_proxy_weights->copy_from(stream, decompressed.data(), true);
         les_proxy_weights_source = weights;
         if (auto* perf = moe_otd::get_perf_counters()) {
@@ -270,7 +271,8 @@ public:
                                                           cldnn::format::bfyx);
                 const auto reuse = [&network](memory::ptr& memory, const cldnn::layout& desired) {
                     if (!memory || memory.use_count() > 1 || memory->get_layout() != desired) {
-                        memory = network.get_engine().allocate_memory(desired);
+                        memory = network.get_engine().allocate_memory(
+                            desired, network.get_engine().get_preferred_memory_allocation_type(), false);
                     }
                     return memory;
                 };
