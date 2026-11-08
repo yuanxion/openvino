@@ -41,6 +41,9 @@ struct OtdPerfCounters {
     std::atomic<uint64_t> les_prediction_matches{0};
     std::atomic<uint64_t> les_prediction_pairs{0};
     std::atomic<uint64_t> les_proxy_weight_initializations{0};
+    std::atomic<uint64_t> les_proxy_fc_ns{0};
+    std::atomic<uint64_t> les_proxy_topk_ns{0};
+    std::atomic<uint64_t> les_proxy_submit_ns{0};
     std::atomic<uint64_t> les_prefetch_experts{0};
     std::atomic<uint64_t> les_prefetch_failures{0};
 

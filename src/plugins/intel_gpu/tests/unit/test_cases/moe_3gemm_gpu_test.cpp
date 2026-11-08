@@ -1195,6 +1195,7 @@ INSTANTIATE_TEST_SUITE_P(smoke_les_p4_runtime_proxy,
             }
             Moe3GemmTestParams small{1, true, 128, 128, 4, 2, 128};
             small.enable_les = true;
+            small.profiling = true;
             small.lru_expert_num = 2;
             small.proxy_router = true;
             small.proxy_runtime_kernels = true;
