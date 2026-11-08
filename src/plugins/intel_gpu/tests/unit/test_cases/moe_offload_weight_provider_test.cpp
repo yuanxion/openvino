@@ -4,6 +4,7 @@
 
 #include "test_utils/test_utils.h"
 #include "ocl_v2/moe/expert_weight_providers.hpp"
+#include "ocl_v2/moe/moe_otd_runtime.hpp"
 #include <array>
 #include <chrono>
 #include <fstream>
@@ -20,6 +21,15 @@ using ov::intel_gpu::ocl::moe::ResidentExpertWeightProvider;
 
 namespace {
 namespace otd = ov::intel_gpu::ocl::moe_otd;
+
+TEST(moe_les_statistics, csv_preserves_layer_names_and_expert_ids) {
+    ::testing::internal::CaptureStdout();
+    otd::les_layer_stats("layer,\"0\"", 1, {2, 7}, {7, 2}, 1, 1);
+    EXPECT_EQ(::testing::internal::GetCapturedStdout(), "[LES_LAYER] \"layer,\"\"0\"\"\",1,1,1,2 7 ,7 2 \n");
+    ::testing::internal::CaptureStdout();
+    otd::les_layer_stats("layer0", 81, {}, {}, 2, 6, true);
+    EXPECT_EQ(::testing::internal::GetCapturedStdout(), "[LES_CACHE] \"layer0\",81,2,6,,\n");
+}
 
 class moe_les_upload : public ::testing::Test {
 protected:

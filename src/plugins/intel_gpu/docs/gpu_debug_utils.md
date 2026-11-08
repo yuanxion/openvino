@@ -1,5 +1,16 @@
 # GPU Plugin Debug Utils
 
+## LES Layer Statistics
+
+`MOE_LES_LAYER_STATS=1` with `MOE_OTD_PERF_LOG=1` enables per-MoE CSV records in Release builds independently of debug capabilities.
+`[LES_CACHE]` reports the layer ID, routed token count, and unique resident-slot hit/miss counts per execution.
+`[LES_LAYER]` additionally reports decode ready/missing pair counts, actual Top-k IDs, and predicted Top-k IDs when available.
+Fields are `target,tokens,hits,misses,actual_ids,predicted_ids`; IDs are space-separated and layer names are CSV-quoted.
+For a single request with a multi-token prompt, token count greater than one is prefill and one is decode.
+No prediction is generated for multi-token prefill. Ordered rank matches must not be interpreted as set recall.
+This diagnostic adds prediction readback and counter/logging overhead; leave it disabled during performance measurements.
+Counter deltas assume the LES single-execution-stream contract. Cache hits after prefetch resolution do not imply a wait-free hit.
+
 This document is a list of useful debug features / tricks that might be used to find root cause of performance / functional issues. Some of them
 are available by default, but some others might require plugin recompilation.
 

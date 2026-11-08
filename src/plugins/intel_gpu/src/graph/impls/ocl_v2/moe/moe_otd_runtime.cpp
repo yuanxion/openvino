@@ -8,8 +8,10 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <iomanip>
 #include <limits>
 #include <mutex>
+#include <sstream>
 
 #include "intel_gpu/runtime/debug_configuration.hpp"
 #include "runtime/ocl/ocl_stream.hpp"
@@ -30,6 +32,36 @@ bool les_prediction_compare_enabled() {
         return value && std::strcmp(value, "1") == 0;
     }();
     return enabled;
+}
+
+bool les_layer_stats_enabled() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("MOE_LES_LAYER_STATS");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+void les_layer_stats(const std::string& target,
+                     size_t tokens,
+                     const std::vector<uint32_t>& actual,
+                     const std::vector<uint32_t>& predicted,
+                     size_t hits,
+                    size_t misses,
+                    bool cache_lookup) {
+    std::ostringstream record;
+            record << (cache_lookup ? "[LES_CACHE] " : "[LES_LAYER] ")
+                << std::quoted(target, '"', '"') << ',' << tokens << ',' << hits << ',' << misses << ',';
+    for (auto expert : actual) {
+        record << expert << ' ';
+    }
+    record << ',';
+    for (auto expert : predicted) {
+        record << expert << ' ';
+    }
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    std::cout << record.str() << std::endl;
 }
 
 uint64_t les_device_time(cldnn::stream& stream) {

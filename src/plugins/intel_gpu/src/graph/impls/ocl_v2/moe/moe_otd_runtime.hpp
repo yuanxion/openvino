@@ -76,6 +76,14 @@ struct OtdPerfCounters {
 OtdPerfCounters* get_perf_counters();
 bool les_trace_enabled();
 bool les_prediction_compare_enabled();
+bool les_layer_stats_enabled();
+void les_layer_stats(const std::string& target,
+                     size_t tokens,
+                     const std::vector<uint32_t>& actual,
+                     const std::vector<uint32_t>& predicted,
+                     size_t hits,
+                     size_t misses,
+                     bool cache_lookup = false);
 uint64_t les_device_time(cldnn::stream& stream);
 void les_trace_interval(const char* kind, uint64_t start, uint64_t end);
 

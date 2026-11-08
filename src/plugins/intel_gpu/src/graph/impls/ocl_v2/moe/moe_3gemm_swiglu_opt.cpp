@@ -1878,11 +1878,15 @@ public:
                 const size_t pair_count = token_num * static_cast<size_t>(max_topk);
                 std::vector<uint32_t> experts(pair_count);
                 scratch.topk_id->copy_to(stream, experts.data(), 0, 0, pair_count * sizeof(uint32_t), true);
-                if (cur_net.is_les_prediction_enabled() && moe_otd::les_prediction_compare_enabled()) {
+                const bool layer_stats = moe_otd::les_layer_stats_enabled();
+                std::vector<uint32_t> predicted;
+                size_t layer_hits = 0;
+                size_t layer_misses = 0;
+                if (cur_net.is_les_prediction_enabled() && (moe_otd::les_prediction_compare_enabled() || layer_stats)) {
                     auto prediction = cur_net.get_les_proxy_state(instance.id());
                     if (prediction.predicted_indices && prediction.prediction_ready) {
                         prediction.prediction_ready->wait();
-                        std::vector<uint32_t> predicted(pair_count);
+                        predicted.resize(pair_count);
                         prediction.predicted_indices->copy_to(stream,
                                                               predicted.data(),
                                                               0,
@@ -1924,6 +1928,10 @@ public:
                         }
                         auto demand = _weight_provider->begin_les_demand(wave_experts);
                         OPENVINO_ASSERT(demand && !wave_pairs.empty(), "LES wave reservation cannot progress");
+                        if (layer_stats) {
+                            layer_hits += demand->ready_pairs.size();
+                            layer_misses += demand->missing_pairs.size();
+                        }
                         if (auto* perf = moe_otd::get_perf_counters()) {
                             perf->les_waves.fetch_add(1, std::memory_order_relaxed);
                             perf->les_ready_pairs.fetch_add(demand->ready_pairs.size(), std::memory_order_relaxed);
@@ -1994,6 +2002,9 @@ public:
                             done[pair] = true;
                             --remaining;
                         }
+                    }
+                    if (layer_stats) {
+                        moe_otd::les_layer_stats(instance.id(), token_num, experts, predicted, layer_hits, layer_misses);
                     }
                 } catch (...) {
                     auto error = std::current_exception();
@@ -3144,8 +3155,23 @@ public:
             _les_owner = context;
         }
         _weight_provider->set_les_context(context, network.get_les_epoch());
+        auto* layer_perf = moe_otd::les_layer_stats_enabled() ? moe_otd::get_perf_counters() : nullptr;
+        OPENVINO_ASSERT(!moe_otd::les_layer_stats_enabled() || layer_perf,
+                        "MOE_LES_LAYER_STATS requires MOE_OTD_PERF_LOG=1");
+        const auto hits_before = layer_perf ? layer_perf->gpu_hits.load(std::memory_order_relaxed) : 0;
+        const auto misses_before = layer_perf ? layer_perf->gpu_misses.load(std::memory_order_relaxed) : 0;
         try {
             auto result = execute_impl(events, ins);
+            if (layer_perf) {
+                auto hidden_layout = ins.input_memory_ptr(0)->get_layout();
+                moe_otd::les_layer_stats(ins.id(),
+                                         get_seq_len(hidden_layout),
+                                         {},
+                                         {},
+                                         layer_perf->gpu_hits.load(std::memory_order_relaxed) - hits_before,
+                                         layer_perf->gpu_misses.load(std::memory_order_relaxed) - misses_before,
+                                         true);
+            }
             auto consumer = stream.enqueue_marker({});
             stream.flush();
             _weight_provider->set_consumer(std::move(consumer));
