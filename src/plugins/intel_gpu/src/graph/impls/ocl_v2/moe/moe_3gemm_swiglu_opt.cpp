@@ -3186,7 +3186,8 @@ public:
                 }
                 if (!_les_proxy_hidden || _les_proxy_hidden.use_count() > 1 ||
                     _les_proxy_hidden->get_layout() != hidden_layout) {
-                    _les_proxy_hidden = cur_net.get_engine().allocate_memory(hidden_layout);
+                    _les_proxy_hidden = cur_net.get_engine().allocate_memory(
+                        hidden_layout, cur_net.get_engine().get_preferred_memory_allocation_type(), false);
                 }
                 auto snapshot = _les_proxy_hidden;
                 stream.enqueue_barrier(events);
