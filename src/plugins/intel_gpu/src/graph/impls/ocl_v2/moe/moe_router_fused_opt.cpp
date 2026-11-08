@@ -10,6 +10,7 @@
 #include "../primitive_ocl_base.hpp"
 #include "../utils/kernel_generator.hpp"
 #include <cstdlib>
+#include <chrono>
 #include "intel_gpu/primitives/data.hpp"
 #include "intel_gpu/primitives/fully_connected.hpp"
 #include "intel_gpu/primitives/moe_router_fused.hpp"
@@ -256,6 +257,8 @@ public:
             auto state = network.get_les_proxy_state(proxy_link.chain.target_moe);
             if (state.hidden && state.hidden_ready &&
                 state.hidden->get_layout().count() == state.hidden->get_layout().get_shape().back()) {
+                const bool profile_proxy = moe_otd::les_trace_enabled() && network.get_config().get_enable_profiling();
+                const auto submit_start = profile_proxy ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 auto weights = get_proxy_weights(network, proxy_link);
                 auto bias = proxy_link.projection_bias.empty()
                                 ? memory::ptr{}
@@ -323,6 +326,27 @@ public:
                                                              proxy_args,
                                                              {proxy_projection},
                                                              true);
+                if (profile_proxy) {
+                    const auto submit_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - submit_start).count();
+                    const auto execution_ns = [](const cldnn::event::ptr& kernel_event) {
+                        kernel_event->wait();
+                        uint64_t duration = 0;
+                        for (const auto& interval : kernel_event->get_profiling_info()) {
+                            if (interval.stage == cldnn::instrumentation::profiling_stage::executing) {
+                                duration += interval.value->value().count();
+                            }
+                        }
+                        return duration;
+                    };
+                    const auto fc_ns = execution_ns(proxy_projection);
+                    const auto topk_ns = execution_ns(prediction_ready);
+                    if (auto* perf = moe_otd::get_perf_counters()) {
+                        perf->les_proxy_fc_ns.fetch_add(fc_ns, std::memory_order_relaxed);
+                        perf->les_proxy_topk_ns.fetch_add(topk_ns, std::memory_order_relaxed);
+                        perf->les_proxy_submit_ns.fetch_add(submit_ns, std::memory_order_relaxed);
+                    }
+                }
                 network.set_les_proxy_prediction(proxy_link.chain.target_moe,
                                                  std::move(proxy_indices),
                                                  std::move(proxy_weights),
