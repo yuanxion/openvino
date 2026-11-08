@@ -82,6 +82,7 @@ protected:
         jit.make("LES_PROXY_FC_ENABLE", 1);
         jit.make("LES_PROXY_EXPERTS", params.typed_desc<moe_router_fused>()->_config.num_expert);
         jit.make("LES_PROXY_SUBGROUP_SIZE", 16);
+        jit.make("LES_PROXY_GROUP_SIZE", 64);
         jit.make("MOE_DTYPE", params.get_input_layout(0).data_type == ov::element::f16 ? "half" : "float");
         return jit;
     }
@@ -296,8 +297,8 @@ public:
                 fc_desc.arguments.push_back({ArgumentDescriptor::Types::OUTPUT, 0});
                 fc_args.outputs.push_back(logits);
                 stream.set_arguments(*les_proxy_fc->kernel, fc_desc, fc_args);
-                fc_desc.workGroups.global = {proxy_link.experts * 16, 1, 1};
-                fc_desc.workGroups.local = {16, 1, 1};
+                fc_desc.workGroups.global = {proxy_link.experts * 64, 1, 1};
+                fc_desc.workGroups.local = {64, 1, 1};
                 auto proxy_projection = stream.enqueue_kernel(*les_proxy_fc->kernel,
                                                               fc_desc,
                                                               fc_args,
