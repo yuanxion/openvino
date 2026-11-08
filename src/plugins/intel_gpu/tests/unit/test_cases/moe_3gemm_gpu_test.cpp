@@ -989,6 +989,11 @@ TEST_P(moe_3gemm_compressed_gpu_random, moe_accuracy_test_random) {
         ASSERT_NE(state.hidden_ready, nullptr);
         ASSERT_NE(state.prediction_ready, nullptr);
         ASSERT_NE(state.predicted_indices, nullptr);
+        const auto expected_index_allocation = param.proxy_prefetch
+                               ? engine.get_lockable_preferred_memory_allocation_type()
+                               : engine.get_preferred_memory_allocation_type();
+        EXPECT_EQ(state.predicted_indices->get_allocation_type(), expected_index_allocation);
+        EXPECT_EQ(state.hidden->get_allocation_type(), engine.get_preferred_memory_allocation_type());
         EXPECT_NE(state.hidden, hidden_states_mem);
         state.prediction_ready->wait();
         auto actual_indices = network.get_primitive("proxy_router")->output_memory_ptr(1);

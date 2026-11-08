@@ -14,6 +14,7 @@
 #include "intel_gpu/primitives/data.hpp"
 #include "intel_gpu/primitives/fully_connected.hpp"
 #include "intel_gpu/primitives/moe_router_fused.hpp"
+#include "intel_gpu/runtime/memory.hpp"
 #include "moe_otd_runtime.hpp"
 #include "openvino/op/constant.hpp"
 
@@ -285,17 +286,21 @@ public:
                 const auto logits_layout = cldnn::layout({1, 1, 1, static_cast<int64_t>(proxy_link.experts)},
                                                           state.hidden->get_layout().data_type,
                                                           cldnn::format::bfyx);
-                const auto reuse = [&network](memory::ptr& memory, const cldnn::layout& desired) {
-                    if (!memory || memory.use_count() > 1 || memory->get_layout() != desired) {
+                const auto reuse = [&network](memory::ptr& memory, const cldnn::layout& desired, bool lockable = false) {
+                    const auto allocation = lockable ? network.get_engine().get_lockable_preferred_memory_allocation_type()
+                                                     : network.get_engine().get_preferred_memory_allocation_type();
+                    if (!memory || memory.use_count() > 1 || memory->get_layout() != desired ||
+                        memory->get_allocation_type() != allocation) {
                         memory = network.get_engine().allocate_memory(
-                            desired, network.get_engine().get_preferred_memory_allocation_type(), false);
+                            desired, allocation, false);
                     }
                     return memory;
                 };
                 auto logits = reuse(les_proxy_logits, logits_layout);
                 auto proxy_indices = reuse(les_proxy_indices, cldnn::layout(
                     {1, 1, 1, static_cast<int64_t>(proxy_link.top_k)},
-                    instance.get_impl_params()->get_output_layout(1).data_type, cldnn::format::bfyx));
+                    instance.get_impl_params()->get_output_layout(1).data_type, cldnn::format::bfyx),
+                    network.is_les_prefetch_enabled());
                 auto proxy_weights = reuse(les_proxy_routing_weights, cldnn::layout(
                     {1, 1, 1, static_cast<int64_t>(proxy_link.top_k)},
                     state.hidden->get_layout().data_type, cldnn::format::bfyx));
@@ -392,8 +397,8 @@ public:
                 const auto proxy = network.get_les_proxy_state(active_proxy_link->chain.target_moe);
                 std::vector<uint32_t> predicted_ids(std::min(active_proxy_link->top_k,
                                                             moe_otd::LesSpeculationPolicy::predict_k));
-                proxy.predicted_indices->copy_to(stream, predicted_ids.data(), 0, 0,
-                                                 predicted_ids.size() * sizeof(uint32_t), true);
+                cldnn::mem_lock<uint32_t, cldnn::mem_lock_type::read> indices(proxy.predicted_indices, stream);
+                std::copy_n(indices.data(), predicted_ids.size(), predicted_ids.data());
                 auto target = network.get_primitive(active_proxy_link->chain.target_moe);
                 target->get_impl()->enqueue_les_prefetch(*target, predicted_ids, proxy_prediction_ready);
             } catch (const std::exception& error) {
