@@ -27,6 +27,7 @@
 #include "moe_3gemm_test_data.h"
 #include "common_test_utils/common_utils.hpp"
 #include "primitive_inst.h"
+#include "ocl_v2/moe/moe_otd_runtime.hpp"
 #include "ocl/kernels_cache.hpp"
 #include "intel_gpu/graph/serialization/binary_buffer.hpp"
 
@@ -983,7 +984,16 @@ TEST_P(moe_3gemm_compressed_gpu_random, moe_accuracy_test_random) {
             }
             router->get_impl()->set_kernels(std::move(compiled));
         }
+        auto* prediction_counters = ov::intel_gpu::ocl::moe_otd::get_perf_counters();
+        const auto predictions_before = prediction_counters ? prediction_counters->les_early_predictions.load() : 0;
+        const auto prefetch_before = prediction_counters ? prediction_counters->les_prefetch_experts.load() : 0;
         auto predicted_outputs = network.execute();
+        if (prediction_counters) {
+            EXPECT_EQ(prediction_counters->les_early_predictions.load() - predictions_before, 1U);
+            if (param.proxy_prefetch && param.lru_expert_num > 1) {
+                EXPECT_GT(prediction_counters->les_prefetch_experts.load(), prefetch_before);
+            }
+        }
         const auto state = network.get_les_proxy_state("proxy_target");
         ASSERT_NE(state.hidden, nullptr);
         ASSERT_NE(state.hidden_ready, nullptr);

@@ -215,12 +215,12 @@ public:
         return execute_routing(events, instance, false);
     }
 
-    void enqueue_les_prediction(cldnn::primitive_inst& instance) override {
-        execute_routing({}, instance, true);
+    void enqueue_les_prediction(cldnn::primitive_inst& instance, bool defer_prefetch = false) override {
+        execute_routing({}, instance, true, defer_prefetch);
     }
 
     cldnn::event::ptr execute_routing(const std::vector<cldnn::event::ptr>& events,
-                                    cldnn::primitive_inst& instance, bool proxy_only) {
+                                    cldnn::primitive_inst& instance, bool proxy_only, bool defer_prefetch = false) {
         kernel_dump_info.clear_entries();
 
         auto& network = instance.get_network();
@@ -257,7 +257,6 @@ public:
         auto topk_weights_mem = proxy_only ? memory::ptr{} : instance.output_memory_ptr(0);
         auto topk_indices_mem = proxy_only ? memory::ptr{} : instance.output_memory_ptr(1);
         cldnn::event::ptr proxy_prediction_ready;
-        const program::les_router_link* active_proxy_link = nullptr;
 
         const auto runtime_link = std::find_if(network.get_les_router_links().begin(),
                                                network.get_les_router_links().end(),
@@ -273,7 +272,6 @@ public:
             runtime_link != network.get_les_router_links().end()) {
             OPENVINO_ASSERT(les_proxy_fc, "Qualified LES proxy Router stage was not compiled for ", instance.id());
             const auto& proxy_link = *runtime_link;
-            active_proxy_link = &proxy_link;
             auto state = network.get_les_proxy_state(proxy_link.chain.target_moe);
             if (state.hidden && state.hidden_ready &&
                 state.hidden->get_layout().count() == state.hidden->get_layout().get_shape().back()) {
@@ -390,19 +388,21 @@ public:
             }
         }
 
-        if (network.is_les_prefetch_enabled() && prediction_created && proxy_prediction_ready && active_proxy_link) {
+        if (network.is_les_prefetch_enabled() && !defer_prefetch && (prediction_created || proxy_only) &&
+            proxy_prediction_ready && runtime_link != network.get_les_router_links().end()) {
+            const auto& prefetch_link = *runtime_link;
             try {
                 stream.flush();
                 proxy_prediction_ready->wait();
-                const auto proxy = network.get_les_proxy_state(active_proxy_link->chain.target_moe);
-                std::vector<uint32_t> predicted_ids(std::min(active_proxy_link->top_k,
+                const auto proxy = network.get_les_proxy_state(prefetch_link.chain.target_moe);
+                std::vector<uint32_t> predicted_ids(std::min(prefetch_link.top_k,
                                                             moe_otd::LesSpeculationPolicy::predict_k));
                 cldnn::mem_lock<uint32_t, cldnn::mem_lock_type::read> indices(proxy.predicted_indices, stream);
                 std::copy_n(indices.data(), predicted_ids.size(), predicted_ids.data());
-                auto target = network.get_primitive(active_proxy_link->chain.target_moe);
+                auto target = network.get_primitive(prefetch_link.chain.target_moe);
                 target->get_impl()->enqueue_les_prefetch(*target, predicted_ids, proxy_prediction_ready);
             } catch (const std::exception& error) {
-                GPU_DEBUG_INFO << "[LES_PREDICT_PREFETCH] target=" << active_proxy_link->chain.target_moe
+                GPU_DEBUG_INFO << "[LES_PREDICT_PREFETCH] target=" << prefetch_link.chain.target_moe
                                << " skipped=" << error.what() << std::endl;
             }
         }

@@ -3145,8 +3145,22 @@ public:
     cldnn::event::ptr execute(const std::vector<cldnn::event::ptr>& events, cldnn::primitive_inst& ins) override {
         auto& network = ins.get_network();
         auto* context = network.get_les_context();
+        const auto complete_prediction = [&] {
+            if (!network.is_les_prefetch_enabled()) {
+                return;
+            }
+            for (const auto& link : network.get_les_router_links()) {
+                if (link.status == program::les_router_status::supported && link.chain.source_moe == ins.id() &&
+                    network.get_les_proxy_state(link.chain.target_moe).prediction_ready) {
+                    auto router = network.get_primitive(link.router);
+                    router->get_impl()->enqueue_les_prediction(*router);
+                }
+            }
+        };
         if (!context || !_weight_provider->is_offloaded()) {
-            return execute_impl(events, ins);
+            auto result = execute_impl(events, ins);
+            complete_prediction();
+            return result;
         }
         auto& stream = network.get_stream();
         if (_les_owner != context) {
@@ -3162,6 +3176,7 @@ public:
         const auto misses_before = layer_perf ? layer_perf->gpu_misses.load(std::memory_order_relaxed) : 0;
         try {
             auto result = execute_impl(events, ins);
+            complete_prediction();
             if (layer_perf) {
                 auto hidden_layout = ins.input_memory_ptr(0)->get_layout();
                 moe_otd::les_layer_stats(ins.id(),
@@ -3221,7 +3236,7 @@ public:
                 auto snapshot_ready = snapshot->copy_from(stream, *source_hidden, false);
                 cur_net.set_les_proxy_hidden(link.chain.target_moe, std::move(snapshot), std::move(snapshot_ready));
                 auto router = cur_net.get_primitive(link.router);
-                router->get_impl()->enqueue_les_prediction(*router);
+                router->get_impl()->enqueue_les_prediction(*router, true);
             }
         }
 
