@@ -66,7 +66,7 @@ void OffloadExpertWeightProvider::set_les_context(cldnn::les_context* context, u
     if (_les_context != context) {
         release();
         _reservations = context ? std::make_unique<ExpertSlotReservations>(_capacity) : nullptr;
-        _demand_shadow = context ? std::make_unique<ExpertSlotReservations>(_capacity) : nullptr;
+        _demand_shadow = context && moe_otd::get_perf_counters() ? std::make_unique<ExpertSlotReservations>(_capacity) : nullptr;
         _les_context = context;
     }
     _les_epoch = epoch;
@@ -140,8 +140,10 @@ std::optional<ExpertDemand> OffloadExpertWeightProvider::begin_les_demand(const 
         return std::nullopt;
     }
     try {
-        _shadow_reservation = _demand_shadow->reserve(experts, _les_epoch);
-        OPENVINO_ASSERT(_shadow_reservation, "LES demand shadow reservation failed");
+        if (_demand_shadow) {
+            _shadow_reservation = _demand_shadow->reserve(experts, _les_epoch);
+            OPENVINO_ASSERT(_shadow_reservation, "LES demand shadow reservation failed");
+        }
         OPENVINO_ASSERT(_resident && _les_context->get_transfer_stream(), "LES provider is not bound to a transfer lane");
         ExpertDemand demand{_reservation->slots, _reservation->ready_pairs, _reservation->missing_pairs};
         _upload_events = std::make_shared<std::vector<cldnn::event::ptr>>();
@@ -177,7 +179,9 @@ void OffloadExpertWeightProvider::finish_les_demand(cldnn::stream& stream) {
         }
         dynamic_cast<cldnn::ocl::ocl_stream&>(stream).enqueue_external_barrier(*_upload_events);
         OPENVINO_ASSERT(_reservations->complete(*_reservation), "LES reservation became stale before GPUReady");
-        OPENVINO_ASSERT(_demand_shadow->complete(*_shadow_reservation), "LES shadow reservation became stale");
+        if (_shadow_reservation) {
+            OPENVINO_ASSERT(_demand_shadow->complete(*_shadow_reservation), "LES shadow reservation became stale");
+        }
         if (auto* perf = moe_otd::get_perf_counters()) {
             auto unique_slots = _reservation->slots;
             std::sort(unique_slots.begin(), unique_slots.end());

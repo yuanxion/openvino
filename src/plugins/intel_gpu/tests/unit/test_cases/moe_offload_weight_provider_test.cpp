@@ -544,6 +544,49 @@ TEST_F(moe_les_upload, async_prefetch_deduplicates_and_real_demand_reuses_upload
     provider.release();
 }
 
+TEST_F(moe_les_upload, real_demand_cache_hits_do_not_require_diagnostics) {
+    std::vector<uint8_t> source(32, 7);
+    std::fill(source.begin() + 16, source.end(), 11);
+    write(source);
+    MOECompressed::Config config{};
+    config.num_expert = 2;
+    OffloadExpertWeightProvider provider(2, config, std::vector<size_t>(9), path);
+    moe_weights weights;
+    weights.gate_w = buffer(16, data_types::u8, 2);
+    provider.bind(weights);
+    cldnn::les_context context(2, lane());
+    provider.set_les_context(&context, context.begin_epoch());
+    auto compute = lane();
+    auto first = provider.begin_les_demand({1});
+    ASSERT_TRUE(first);
+    EXPECT_EQ(first->missing_pairs.size(), 1U);
+    provider.finish_les_demand(*compute);
+    provider.release();
+    auto second = provider.begin_les_demand({1, 1});
+    ASSERT_TRUE(second);
+    EXPECT_TRUE(second->missing_pairs.empty());
+    EXPECT_EQ(second->ready_pairs.size(), 2U);
+    EXPECT_EQ(second->slots.at(0), first->slots.at(0));
+    EXPECT_EQ(second->slots.at(1), first->slots.at(0));
+    provider.finish_les_demand(*compute);
+    std::vector<uint8_t> actual(16);
+    weights.gate_w->copy_to(*compute, actual.data(), 0, 0, actual.size(), true);
+    EXPECT_EQ(actual, std::vector<uint8_t>(16, 11));
+    provider.release();
+    auto mixed = provider.begin_les_demand({0, 1});
+    ASSERT_TRUE(mixed);
+    EXPECT_EQ(mixed->ready_pairs.size(), 1U);
+    EXPECT_EQ(mixed->missing_pairs.size(), 1U);
+    ASSERT_EQ(mixed->slots.size(), 2U);
+    EXPECT_NE(mixed->slots.at(0), mixed->slots.at(1));
+    provider.finish_les_demand(*compute);
+    weights.gate_w->copy_to(*compute, actual.data(), mixed->slots.at(0) * actual.size(), 0, actual.size(), true);
+    EXPECT_EQ(actual, std::vector<uint8_t>(16, 7));
+    weights.gate_w->copy_to(*compute, actual.data(), mixed->slots.at(1) * actual.size(), 0, actual.size(), true);
+    EXPECT_EQ(actual, std::vector<uint8_t>(16, 11));
+    provider.release();
+}
+
 TEST_F(moe_les_upload, wrong_completed_prediction_counts_useless_bytes_without_extra_miss) {
     write(std::vector<uint8_t>(32, 11));
     MOECompressed::Config config{};
