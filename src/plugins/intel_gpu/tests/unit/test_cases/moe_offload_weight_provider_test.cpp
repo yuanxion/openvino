@@ -463,16 +463,27 @@ TEST(moe_les_reservations, speculation_cannot_evict_active_demand_and_unused_slo
     EXPECT_TRUE(reservations.release(*replacement));
 }
 
-TEST(moe_les_reservations, fixed_speculative_policy_separates_horizon_rank_and_byte_budget) {
+TEST(moe_les_reservations, speculative_policy_admits_predictions_up_to_physical_capacity) {
     using Policy = otd::LesSpeculationPolicy;
     EXPECT_EQ(Policy::lookahead_layers, 1U);
-    EXPECT_EQ(Policy::predict_k, 4U);
-    EXPECT_EQ(Policy::expert_budget(1, 16), 0U);
+    EXPECT_EQ(Policy::expert_budget(0, 16), 0U);
+    EXPECT_EQ(Policy::expert_budget(1, 16), 1U);
     EXPECT_EQ(Policy::expert_budget(16, 0), 0U);
-    EXPECT_EQ(Policy::expert_budget(16, 16), 4U);
-    EXPECT_EQ(Policy::expert_budget(4, 16), 1U);
-    EXPECT_EQ(Policy::expert_budget(16, Policy::max_bytes), 1U);
-    EXPECT_EQ(Policy::expert_budget(16, Policy::max_bytes + 1), 0U);
+    EXPECT_EQ(Policy::expert_budget(16, 16), 16U);
+    EXPECT_EQ(Policy::expert_budget(4, 16), 4U);
+    EXPECT_EQ(Policy::expert_budget(64, 16 * 1024 * 1024 + 1), 64U);
+
+    ov::intel_gpu::ocl::moe::ExpertSlotReservations reservations(8);
+    auto prediction = reservations.reserve({0, 1, 2, 3, 4, 5, 6, 7}, 1, true);
+    ASSERT_TRUE(prediction);
+    EXPECT_EQ(prediction->missing_experts.size(), 8U);
+    EXPECT_FALSE(reservations.reserve({8}, 1, true));
+    ASSERT_TRUE(reservations.complete(*prediction));
+    ASSERT_TRUE(reservations.release(*prediction));
+    auto demand = reservations.reserve({0, 1, 2, 3, 4, 5, 6, 7}, 1);
+    ASSERT_TRUE(demand);
+    EXPECT_TRUE(demand->missing_experts.empty());
+    EXPECT_TRUE(reservations.release(*demand));
 }
 
 TEST(moe_les_reservations, rollback_unstarted_speculation_restores_full_cache) {

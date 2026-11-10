@@ -21,15 +21,9 @@ namespace ov::intel_gpu::ocl::moe_otd {
 
 struct LesSpeculationPolicy {
     static constexpr size_t lookahead_layers = 1;
-    static constexpr size_t predict_k = 4;
-    static constexpr size_t max_experts = 4;
-    static constexpr size_t max_bytes = 16 * 1024 * 1024;
 
     static size_t expert_budget(size_t capacity, size_t expert_bytes) {
-        if (capacity <= 1 || expert_bytes == 0) {
-            return 0;
-        }
-        return std::min({max_experts, std::max<size_t>(1, capacity / 4), max_bytes / expert_bytes});
+        return expert_bytes == 0 ? 0 : capacity;
     }
 };
 

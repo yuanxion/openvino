@@ -395,8 +395,7 @@ public:
                 stream.flush();
                 proxy_prediction_ready->wait();
                 const auto proxy = network.get_les_proxy_state(prefetch_link.chain.target_moe);
-                std::vector<uint32_t> predicted_ids(std::min(prefetch_link.top_k,
-                                                            moe_otd::LesSpeculationPolicy::predict_k));
+                std::vector<uint32_t> predicted_ids(prefetch_link.top_k);
                 cldnn::mem_lock<uint32_t, cldnn::mem_lock_type::read> indices(proxy.predicted_indices, stream);
                 std::copy_n(indices.data(), predicted_ids.size(), predicted_ids.data());
                 auto target = network.get_primitive(prefetch_link.chain.target_moe);
