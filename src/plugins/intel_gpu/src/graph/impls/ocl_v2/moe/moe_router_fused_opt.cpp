@@ -4,11 +4,13 @@
 
 #include "moe_router_fused_opt.hpp"
 
+#include <algorithm>
 #include "../common_utils/dispatch_utils.hpp"
 #include "../common_utils/jitter.hpp"
 #include "../primitive_ocl_base.hpp"
 #include "../utils/kernel_generator.hpp"
 #include "intel_gpu/primitives/moe_router_fused.hpp"
+#include "intel_gpu/runtime/memory.hpp"
 
 namespace ov::intel_gpu::ocl {
 namespace {
@@ -73,7 +75,7 @@ public:
     Stage::Ptr sigmoid_bias_topk = make_stage<MoeRouterSigmoidBiasTopK>();
 
     MoeRouterFusedImpl() : PrimitiveImplOCL(MoeRouterFusedOpt::get_type_info_static()) {}
-    MoeRouterFusedImpl(const program_node& node, const RuntimeParams& params) : MoeRouterFusedImpl() {
+    MoeRouterFusedImpl(const program_node&, const RuntimeParams& params) : MoeRouterFusedImpl() {
         auto desc = params.typed_desc<moe_router_fused>();
         if (desc->_config.routing_type == MoERouterFused::RoutingType::SOFTMAX) {
             add_stage(softmax_topk, params);
@@ -90,17 +92,21 @@ public:
     cldnn::event::ptr execute(const std::vector<cldnn::event::ptr>& events, cldnn::primitive_inst& instance) override {
         kernel_dump_info.clear_entries();
 
-        cldnn::stream& stream = instance.get_network().get_stream();
+        auto& network = instance.get_network();
+        cldnn::stream& stream = network.get_stream();
         auto desc = instance.get_typed_desc<moe_router_fused>();
         const auto& config = desc->_config;
 
         // Determine token count from input layout
         auto input_mem = instance.input_memory_ptr(0);
-        auto input_layout = instance.dependencies()[0].first->get_impl_params()->get_output_layout(instance.dependencies()[0].second);
-        auto input_shape = input_layout.get_shape();
-        size_t token_num = input_shape[0];
-        if (input_shape.size() >= 3) {
-            token_num = input_shape[0] * input_shape[1];
+        size_t token_num = 1;
+        {
+            auto input_layout = instance.dependencies()[0].first->get_impl_params()->get_output_layout(instance.dependencies()[0].second);
+            auto input_shape = input_layout.get_shape();
+            token_num = input_shape[0];
+            if (input_shape.size() >= 3) {
+                token_num = input_shape[0] * input_shape[1];
+            }
         }
         size_t lws_size = config.num_expert;
 
@@ -140,7 +146,12 @@ public:
 
         kernel_dump_info.add_entry_point(routing_stage->kernel->get_id());
 
-        return stream.enqueue_kernel(*routing_stage->kernel, kargs_desc, {}, events, instance.needs_completion_event());
+        auto actual_routing_ready = stream.enqueue_kernel(*routing_stage->kernel,
+                                                          kargs_desc,
+                                                          {},
+                                                          events,
+                                                          instance.needs_completion_event());
+        return actual_routing_ready;
     }
 };
 

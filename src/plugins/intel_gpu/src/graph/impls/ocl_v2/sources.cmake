@@ -50,6 +50,11 @@ set(GPU_OCL_V2_IMPL_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/moe/moe_mask_gen.hpp
     ${CMAKE_CURRENT_LIST_DIR}/moe/moe_otd_runtime.cpp
     ${CMAKE_CURRENT_LIST_DIR}/moe/moe_otd_runtime.hpp
+    ${CMAKE_CURRENT_LIST_DIR}/moe/residency/moe_lookahead_prefetcher.hpp
+    ${CMAKE_CURRENT_LIST_DIR}/moe/residency/moe_lookahead_prefetcher.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/moe/residency/moe_lookahead_registry.hpp
+    ${CMAKE_CURRENT_LIST_DIR}/moe/residency/moe_lookahead_registry.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/moe/residency/lookahead_router.hpp
     ${CMAKE_CURRENT_LIST_DIR}/moe/moe_router_fused_opt.cpp
     ${CMAKE_CURRENT_LIST_DIR}/moe/moe_router_fused_opt.hpp
     ${CMAKE_CURRENT_LIST_DIR}/moe/moe_scatter_reduction_base.hpp
@@ -133,6 +138,7 @@ set(GPU_OCL_V2_KERNEL_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/moe_gate_activation.cl
     ${CMAKE_CURRENT_LIST_DIR}/moe_gather_ref.cl
     ${CMAKE_CURRENT_LIST_DIR}/moe_gemm.cl
+    ${CMAKE_CURRENT_LIST_DIR}/moe_les_proxy_fc.cl
     ${CMAKE_CURRENT_LIST_DIR}/moe_mask_gen.cl
     ${CMAKE_CURRENT_LIST_DIR}/moe_router_fused.cl
     ${CMAKE_CURRENT_LIST_DIR}/moe_scatter_reduction_opt.cl
