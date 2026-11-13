@@ -9,12 +9,76 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
 
 #include "intel_gpu/runtime/debug_configuration.hpp"
+#include "runtime/ocl/ocl_stream.hpp"
 
 namespace ov::intel_gpu::ocl::moe_otd {
 
+cldnn::stream::ptr create_copy_stream(cldnn::engine& engine, const cldnn::ExecutionConfig& config) {
+    auto* native = dynamic_cast<cldnn::ocl::ocl_engine*>(&engine);
+    OPENVINO_ASSERT(native && native->extension_supported("cl_intel_command_queue_families"),
+                    "LES copy engine requires OpenCL command queue families");
+    const auto families = native->get_cl_device().getInfo<CL_DEVICE_QUEUE_FAMILY_PROPERTIES_INTEL>();
+    for (size_t family = 0; family < families.size(); ++family) {
+        if (families[family].count == 0 || std::strncmp(families[family].name, "bcs", 3) != 0) {
+            continue;
+        }
+        const cl_queue_properties properties[] = {
+            CL_QUEUE_FAMILY_INTEL, static_cast<cl_queue_properties>(family),
+            CL_QUEUE_INDEX_INTEL, 0,
+            CL_QUEUE_PROPERTIES, static_cast<cl_queue_properties>(config.get_enable_profiling() ? CL_QUEUE_PROFILING_ENABLE : 0),
+            0};
+        cl_int status = CL_SUCCESS;
+        cl::CommandQueue queue(clCreateCommandQueueWithProperties(native->get_cl_context().get(),
+                                                                 native->get_cl_device().get(), properties, &status));
+        OPENVINO_ASSERT(status == CL_SUCCESS, "LES BCS queue creation failed: ", status);
+        return engine.create_stream(config, queue.get());
+    }
+    OPENVINO_THROW("LES copy engine requires an exposed BCS queue family");
+}
+
+bool les_trace_enabled() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("MOE_LES_TRACE");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+bool les_prediction_compare_enabled() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("OV_GPU_LES_PREDICT_COMPARE");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+uint64_t les_device_time(cldnn::stream& stream) {
+    auto queue = dynamic_cast<cldnn::ocl::ocl_stream&>(stream).get_cl_queue().get();
+    cl_device_id device = nullptr;
+    OPENVINO_ASSERT(clGetCommandQueueInfo(queue, CL_QUEUE_DEVICE, sizeof(device), &device, nullptr) == CL_SUCCESS,
+                    "LES trace cannot query queue device");
+    cl_ulong device_time = 0;
+    cl_ulong host_time = 0;
+    OPENVINO_ASSERT(clGetDeviceAndHostTimer(device, &device_time, &host_time) == CL_SUCCESS,
+                    "LES trace requires device/host timer support");
+    return device_time;
+}
+
+void les_trace_interval(const char* kind, uint64_t start, uint64_t end) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    GPU_DEBUG_INFO << "[LES_TRACE] {\"kind\":\"" << kind << "\",\"start_ns\":" << start
+                   << ",\"end_ns\":" << end << "}" << std::endl;
+}
+
 void OtdPerfCounters::dump() const {
+    const auto* enabled = std::getenv("MOE_OTD_PERF_LOG");
+    if (!enabled || std::strcmp(enabled, "1") != 0) {
+        return;
+    }
     const auto hits = gpu_hits.load(std::memory_order_relaxed);
     const auto misses = gpu_misses.load(std::memory_order_relaxed);
     const auto total = hits + misses;
@@ -27,11 +91,37 @@ void OtdPerfCounters::dump() const {
                    << ", total_gpu_copy_ms=" << gpu_copy_ns.load(std::memory_order_relaxed) / 1000000
                    << ", batched_fallbacks=" << batched_fallbacks.load(std::memory_order_relaxed)
                    << ", grouped_fallbacks=" << grouped_fallbacks.load(std::memory_order_relaxed)
-                   << ", created_onednn_kernels=" << created_onednn_kernels.load(std::memory_order_relaxed) << std::endl;
+                   << ", created_onednn_kernels=" << created_onednn_kernels.load(std::memory_order_relaxed)
+                   << ", les_worker_tasks=" << les_worker_tasks.load(std::memory_order_relaxed)
+                   << ", les_upload_chunks=" << les_upload_chunks.load(std::memory_order_relaxed)
+                   << ", les_upload_bytes=" << les_upload_bytes.load(std::memory_order_relaxed)
+                   << ", les_waves=" << les_waves.load(std::memory_order_relaxed)
+                   << ", les_ready_pairs=" << les_ready_pairs.load(std::memory_order_relaxed)
+                   << ", les_missing_pairs=" << les_missing_pairs.load(std::memory_order_relaxed)
+                   << ", les_shared_pairs=" << les_shared_pairs.load(std::memory_order_relaxed)
+                   << ", les_prediction_matches=" << les_prediction_matches.load(std::memory_order_relaxed)
+                   << ", les_prediction_pairs=" << les_prediction_pairs.load(std::memory_order_relaxed)
+                   << ", les_proxy_weight_initializations=" << les_proxy_weight_initializations.load(std::memory_order_relaxed)
+                   << ", les_proxy_fc_ns=" << les_proxy_fc_ns.load(std::memory_order_relaxed)
+                   << ", les_proxy_topk_ns=" << les_proxy_topk_ns.load(std::memory_order_relaxed)
+                   << ", les_proxy_submit_ns=" << les_proxy_submit_ns.load(std::memory_order_relaxed)
+                   << ", les_prefetch_experts=" << les_prefetch_experts.load(std::memory_order_relaxed)
+                   << ", les_prefetch_failures=" << les_prefetch_failures.load(std::memory_order_relaxed)
+                   << ", les_prefetch_useful_bytes=" << les_prefetch_useful_bytes.load(std::memory_order_relaxed)
+                   << ", les_prefetch_useless_bytes=" << les_prefetch_useless_bytes.load(std::memory_order_relaxed)
+                   << ", les_prefetch_late_bytes=" << les_prefetch_late_bytes.load(std::memory_order_relaxed)
+                   << ", les_prefetch_extra_misses=" << les_prefetch_extra_misses.load(std::memory_order_relaxed)
+                   << ", les_prefetch_deduplicated=" << les_prefetch_deduplicated.load(std::memory_order_relaxed)
+                   << ", les_prefetch_promoted=" << les_prefetch_promoted.load(std::memory_order_relaxed)
+                   << ", les_prefetch_skipped=" << les_prefetch_skipped.load(std::memory_order_relaxed)
+                   << ", les_early_predictions=" << les_early_predictions.load(std::memory_order_relaxed) << std::endl;
 }
 
 OtdPerfCounters* get_perf_counters() {
-    static bool enabled = std::getenv("MOE_OTD_PERF_LOG") != nullptr;
+    static const bool enabled = [] {
+        const auto* value = std::getenv("MOE_OTD_PERF_LOG");
+        return value && std::strcmp(value, "1") == 0;
+    }();
     if (!enabled) {
         return nullptr;
     }
@@ -260,6 +350,119 @@ void fill_weights_memory(cldnn::stream& exec_stream,
 
         index++;
     }
+}
+
+std::vector<cldnn::event::ptr> fill_weights_memory_async(cldnn::stream& transfer_stream,
+                                                      const cldnn::MOECompressed::Config& config,
+                                                      const std::vector<size_t>& weight_bin_offsets,
+                                                      ParallelWeightReader& weight_reader,
+                                                      cldnn::moe_weights& weights,
+                                                      const std::vector<uint32_t>& experts,
+                                                      const std::vector<size_t>& slots,
+                                                      uint64_t* uploaded_bytes,
+                                                      LookaheadStagingPool* staging_pool) {
+    constexpr size_t chunk_bytes = LookaheadStagingPool::chunk_bytes;
+    const std::array<cldnn::memory::ptr, 9> tensors{weights.gate_w, weights.up_w, weights.down_w,
+                                                weights.gate_s, weights.up_s, weights.down_s,
+                                                weights.gate_z, weights.up_z, weights.down_z};
+    struct ReadPlan {
+        cldnn::memory::ptr memory;
+        size_t component;
+        size_t source;
+        size_t destination;
+        size_t bytes;
+    };
+    OPENVINO_ASSERT(weight_bin_offsets.size() == tensors.size() && experts.size() == slots.size(), "Invalid LES upload plan");
+    const auto expert_count = static_cast<size_t>(config.num_expert);
+    OPENVINO_ASSERT(expert_count > 0, "Invalid LES expert count");
+    const auto file_size = weight_reader.file_size();
+    std::vector<ReadPlan> plans;
+    for (size_t index = 0; index < experts.size(); ++index) {
+        OPENVINO_ASSERT(experts[index] < expert_count, "LES expert outside configured range");
+        for (size_t component = 0; component < tensors.size(); ++component) {
+            const auto& memory = tensors[component];
+            if (!memory) {
+                continue;
+            }
+            auto total = memory->get_layout().bytes_count();
+            OPENVINO_ASSERT(total % expert_count == 0, "Invalid LES per-expert tensor size");
+            auto bytes = total / expert_count;
+            if (bytes == 0) {
+                continue;
+            }
+            auto base = weight_bin_offsets[component];
+            OPENVINO_ASSERT(base <= file_size && experts[index] <= (file_size - base) / bytes, "LES source offset overflow");
+            auto source = base + experts[index] * bytes;
+            OPENVINO_ASSERT(bytes <= file_size - source, "LES tensor read outside weight file");
+            OPENVINO_ASSERT(slots[index] < memory->size() / bytes, "LES upload outside physical slot buffer");
+            OPENVINO_ASSERT(component < 3 || bytes <= chunk_bytes, "LES transposed metadata exceeds 8 MiB per expert");
+            plans.push_back({memory, component, source, slots[index] * bytes, bytes});
+        }
+    }
+    LookaheadStagingPool local_pool;
+    auto& pool = staging_pool ? *staging_pool : local_pool;
+    auto& staging = pool.chunks;
+    std::vector<cldnn::event::ptr> events;
+    auto& cursor = pool.cursor;
+    std::exception_ptr error;
+    auto* perf = get_perf_counters();
+    try {
+        for (const auto& plan : plans) {
+            for (size_t offset = 0; offset < plan.bytes;) {
+                auto& buffer = staging[cursor++ % staging.size()];
+                if (buffer.upload) {
+                    buffer.upload->wait();
+                }
+                auto bytes = std::min(chunk_bytes, plan.bytes - offset);
+                if (!buffer.memory) {
+                    buffer.memory = plan.memory->get_engine()->allocate_memory(
+                        cldnn::layout{cldnn::data_types::u8, cldnn::format::bfyx,
+                                      {1, 1, 1, static_cast<int32_t>(chunk_bytes)}},
+                        cldnn::allocation_type::usm_host, false);
+                }
+                cldnn::mem_lock<uint8_t, cldnn::mem_lock_type::write> payload(buffer.memory, transfer_stream);
+                const auto read_start = les_trace_enabled() ? les_device_time(transfer_stream) : 0;
+                weight_reader.read(reinterpret_cast<char*>(payload.data()), bytes, plan.source + offset);
+                if (les_trace_enabled()) {
+                    les_trace_interval("read", read_start, les_device_time(transfer_stream));
+                }
+                if (plan.component >= 3) {
+                    std::vector<uint8_t> metadata(payload.data(), payload.data() + bytes);
+                    maybe_transpose_scale_zp(config, plan.component, plan.memory->get_layout(), metadata, bytes);
+                    std::memcpy(payload.data(), metadata.data(), bytes);
+                }
+                buffer.upload = plan.memory->copy_from(transfer_stream, payload.data(), 0, plan.destination + offset, bytes, false);
+                OPENVINO_ASSERT(buffer.upload, "LES upload did not return a completion event");
+                events.push_back(buffer.upload);
+                if (uploaded_bytes) {
+                    *uploaded_bytes += bytes;
+                }
+                transfer_stream.flush();
+                if (perf) {
+                    perf->les_upload_chunks.fetch_add(1, std::memory_order_relaxed);
+                    perf->les_upload_bytes.fetch_add(bytes, std::memory_order_relaxed);
+                }
+                offset += bytes;
+            }
+        }
+    } catch (...) {
+        error = std::current_exception();
+    }
+    for (auto& buffer : staging) {
+        if (buffer.upload) {
+            try {
+                buffer.upload->wait();
+            } catch (...) {
+                if (!error) {
+                    error = std::current_exception();
+                }
+            }
+        }
+    }
+    if (error) {
+        std::rethrow_exception(error);
+    }
+    return events;
 }
 
 }  // namespace ov::intel_gpu::ocl::moe_otd
