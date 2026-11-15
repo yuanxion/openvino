@@ -1,5 +1,10 @@
+// Copyright (C) 2026 Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+//
+
 #include "impls/ocl_v2/primitive_ocl_base.hpp"
 #include "moe_lookahead_registry.hpp"
+#include "intel_gpu/runtime/itt.hpp"
 #include <limits>
 
 namespace ov::intel_gpu::ocl::moe {
@@ -108,6 +113,8 @@ std::shared_ptr<IExpertWeightProvider> LookaheadContext::bind(const cldnn::primi
 void LookaheadContext::predict(const LookaheadLayerDesc& next_layer,
                                const cldnn::memory::ptr& hidden,
                                const cldnn::event::ptr& ready) {
+    OV_ITT_SCOPED_TASK(ov::intel_gpu::itt::domains::intel_gpu_plugin,
+                       openvino::itt::handle("LES.registry::predict"));
     if (!next_layer.is_supported || !next_layer.moe_inst) {
         return;
     }
@@ -122,6 +129,8 @@ void LookaheadContext::predict(const LookaheadLayerDesc& next_layer,
 }
 
 void LookaheadContext::prefetch(const cldnn::primitive_inst* current_moe) {
+    OV_ITT_SCOPED_TASK(ov::intel_gpu::itt::domains::intel_gpu_plugin,
+                       openvino::itt::handle("LES.registry::prefetch"));
     const auto* next_layer = get_next_layer(current_moe);
     if (!next_layer) {
         return;

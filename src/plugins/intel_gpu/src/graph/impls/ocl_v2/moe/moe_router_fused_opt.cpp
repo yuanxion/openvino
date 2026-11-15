@@ -10,6 +10,7 @@
 #include "../primitive_ocl_base.hpp"
 #include "../utils/kernel_generator.hpp"
 #include "intel_gpu/primitives/moe_router_fused.hpp"
+#include "intel_gpu/runtime/itt.hpp"
 #include "intel_gpu/runtime/memory.hpp"
 
 namespace ov::intel_gpu::ocl {
@@ -90,6 +91,8 @@ public:
     }
 
     cldnn::event::ptr execute(const std::vector<cldnn::event::ptr>& events, cldnn::primitive_inst& instance) override {
+        OV_ITT_SCOPED_TASK(ov::intel_gpu::itt::domains::intel_gpu_plugin,
+                           openvino::itt::handle("GPU.router::execute"));
         kernel_dump_info.clear_entries();
 
         auto& network = instance.get_network();

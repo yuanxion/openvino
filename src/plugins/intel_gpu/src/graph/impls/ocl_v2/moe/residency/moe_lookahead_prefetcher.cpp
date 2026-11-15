@@ -1,3 +1,7 @@
+// Copyright (C) 2026 Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+//
+
 #include "impls/ocl_v2/primitive_ocl_base.hpp"
 #include "moe_lookahead_prefetcher.hpp"
 
@@ -7,6 +11,7 @@
 #include <unordered_map>
 
 #include "../expert_weight_providers.hpp"
+#include "intel_gpu/runtime/itt.hpp"
 #include "runtime/ocl/ocl_event.hpp"
 #include "runtime/ocl/ocl_stream.hpp"
 
@@ -325,6 +330,8 @@ struct ExpertPrefetcher::State {
                 fail_abandoned();
                 if (selected) {
                     try {
+                        OV_ITT_SCOPED_TASK(ov::intel_gpu::itt::domains::intel_gpu_plugin,
+                                           openvino::itt::handle("LES.worker::load_expert"));
                         OPENVINO_ASSERT(event_status(selected->load.last_use_event) == CL_COMPLETE,
                                         "Lookahead consumer event failed");
                         if (selected->load.last_use_event) {
@@ -340,6 +347,8 @@ struct ExpertPrefetcher::State {
                         throw;
                     }
                 } else if (prediction) {
+                    OV_ITT_SCOPED_TASK(ov::intel_gpu::itt::domains::intel_gpu_plugin,
+                                       openvino::itt::handle("LES.worker::process_prediction"));
                     std::vector<uint32_t> experts;
                     try {
                         OPENVINO_ASSERT(event_status(prediction->prediction_ready_event) == CL_COMPLETE,
@@ -445,6 +454,8 @@ cldnn::event::ptr ExpertPrefetcher::make_ready_event() {
 }
 
 void ExpertPrefetcher::submit_prefetch(PrefetchTask task) {
+    OV_ITT_SCOPED_TASK(ov::intel_gpu::itt::domains::intel_gpu_plugin,
+                       openvino::itt::handle("LES.worker::submit_prefetch"));
     rethrow_if_failed();
     m_state->watch(task.prediction_ready_event);
     {
@@ -457,6 +468,8 @@ void ExpertPrefetcher::submit_prefetch(PrefetchTask task) {
 
 cldnn::event::ptr ExpertPrefetcher::demand_async(OffloadExpertWeightProvider& provider,
                                               const std::vector<uint32_t>& missing_ids) {
+    OV_ITT_SCOPED_TASK(ov::intel_gpu::itt::domains::intel_gpu_plugin,
+                       openvino::itt::handle("LES.worker::demand_async"));
     rethrow_if_failed();
     if (missing_ids.empty()) {
         return {};

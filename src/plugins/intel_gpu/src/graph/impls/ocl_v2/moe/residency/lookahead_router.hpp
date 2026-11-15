@@ -13,6 +13,7 @@
 #include "intel_gpu/primitives/input_layout.hpp"
 #include "intel_gpu/primitives/moe_router_fused.hpp"
 #include "intel_gpu/runtime/internal_properties.hpp"
+#include "intel_gpu/runtime/itt.hpp"
 #include "primitive_inst.h"
 
 namespace ov::intel_gpu::ocl::moe {
@@ -82,6 +83,8 @@ public:
     }
 
     Result enqueue(const cldnn::memory::ptr& hidden, const cldnn::event::ptr& ready) {
+        OV_ITT_SCOPED_TASK(ov::intel_gpu::itt::domains::intel_gpu_plugin,
+                           openvino::itt::handle("LES.router::enqueue"));
         OPENVINO_ASSERT(hidden && ready && hidden->count() == m_input_layout.count() &&
                             hidden->get_layout().data_type == m_input_layout.data_type,
                         "Invalid lookahead hidden input");
