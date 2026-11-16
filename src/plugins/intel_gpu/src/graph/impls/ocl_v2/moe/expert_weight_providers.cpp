@@ -144,6 +144,12 @@ std::optional<ExpertDemand> OffloadExpertWeightProvider::begin_les_demand(const 
         OPENVINO_ASSERT(_shadow_reservation, "LES demand shadow reservation failed");
         OPENVINO_ASSERT(_resident && _les_context->get_transfer_stream(), "LES provider is not bound to a transfer lane");
         ExpertDemand demand{_reservation->slots, _reservation->ready_pairs, _reservation->missing_pairs};
+        for (auto pair : demand.ready_pairs) {
+            moe_otd::OtdLayerPerfScope::record(experts[pair], true);
+        }
+        for (auto pair : demand.missing_pairs) {
+            moe_otd::OtdLayerPerfScope::record(experts[pair], false);
+        }
         _upload_events = std::make_shared<std::vector<cldnn::event::ptr>>();
         if (!_reservation->missing_experts.empty()) {
             auto task = _les_context->submit(_les_epoch,
@@ -277,11 +283,7 @@ void OffloadExpertWeightProvider::prefetch_les_demand(const std::vector<uint32_t
             }
         }
         std::vector<uint32_t> selected;
-        const auto budget = moe_otd::LesSpeculationPolicy::expert_budget(_capacity, _prefetch_expert_bytes);
         for (auto expert : experts) {
-            if (selected.size() == budget) {
-                break;
-            }
             if (std::find(selected.begin(), selected.end(), expert) == selected.end()) {
                 selected.push_back(expert);
             }
@@ -297,6 +299,7 @@ void OffloadExpertWeightProvider::prefetch_les_demand(const std::vector<uint32_t
         if (!_reservation) {
             if (perf) {
                 perf->les_prefetch_skipped.fetch_add(1, std::memory_order_relaxed);
+                perf->les_legacy_blocked_candidates.fetch_add(selected.size(), std::memory_order_relaxed);
             }
             return;
         }
@@ -376,6 +379,9 @@ std::optional<ExpertSlotLease> OffloadExpertWeightProvider::try_acquire_simultan
     if (_les_context) {
         return acquire_les(experts, stream);
     }
+    if (std::set<uint32_t>(experts.begin(), experts.end()).size() > _capacity) {
+        return std::nullopt;
+    }
     // Deduplicate to check capacity
     std::unordered_map<uint32_t, size_t> expert_to_slot;
     expert_to_slot.reserve(experts.size());
@@ -398,6 +404,7 @@ std::optional<ExpertSlotLease> OffloadExpertWeightProvider::try_acquire_simultan
 
         const auto item = _cache->get_lru_item(expert);
         const auto slot = item.first;
+        moe_otd::OtdLayerPerfScope::record(expert, item.second);
 
         if (item.second) {
             if (perf) {
@@ -429,6 +436,7 @@ size_t OffloadExpertWeightProvider::acquire_one(uint32_t expert, cldnn::stream& 
 
     const auto item = _cache->get_lru_item(expert);
     const auto slot = item.first;
+    moe_otd::OtdLayerPerfScope::record(expert, item.second);
 
     if (item.second) {
         if (perf) {

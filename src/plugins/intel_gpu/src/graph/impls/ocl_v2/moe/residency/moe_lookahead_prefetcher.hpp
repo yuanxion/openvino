@@ -16,6 +16,10 @@ namespace cldnn {
 class engine;
 }
 
+namespace ov::intel_gpu::ocl::moe_otd {
+struct PredictionReadback;
+}
+
 namespace ov::intel_gpu::ocl::moe {
 
 class OffloadExpertWeightProvider;
@@ -27,6 +31,7 @@ struct PrefetchTask {
     cldnn::event::ptr prediction_ready_event;
     std::weak_ptr<OffloadExpertWeightProvider> target_provider;
     std::shared_ptr<std::atomic<bool>> consumed;
+    std::shared_ptr<moe_otd::PredictionReadback> readback;
 };
 
 class ExpertPrefetcher {

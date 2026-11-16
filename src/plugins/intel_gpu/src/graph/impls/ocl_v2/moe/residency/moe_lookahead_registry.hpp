@@ -33,6 +33,8 @@ public:
         cldnn::event::ptr prediction_ready;
         std::shared_ptr<std::atomic<bool>> consumed;
         bool submitted = false;
+        uint64_t generation = 0;
+        std::shared_ptr<moe_otd::PredictionReadback> readback;
     };
 
     explicit LookaheadContext(cldnn::network& network);
@@ -45,6 +47,7 @@ public:
 
     void enter(const cldnn::primitive_id& id);
     void demand_partitioned(const cldnn::primitive_id& id);
+    void compare_prediction(const cldnn::primitive_id& id, const std::vector<uint32_t>& actual);
     void pause_for_prefill();
     std::shared_ptr<IExpertWeightProvider> bind(const cldnn::primitive_id& id,
                                                std::shared_ptr<IExpertWeightProvider> provider);

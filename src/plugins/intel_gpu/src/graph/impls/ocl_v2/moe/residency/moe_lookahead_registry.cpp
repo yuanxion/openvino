@@ -4,6 +4,7 @@
 
 #include "impls/ocl_v2/primitive_ocl_base.hpp"
 #include "moe_lookahead_registry.hpp"
+#include "../moe_otd_runtime.hpp"
 #include "intel_gpu/runtime/itt.hpp"
 #include <limits>
 
@@ -96,6 +97,20 @@ void LookaheadContext::demand_partitioned(const cldnn::primitive_id& id) {
     }
 }
 
+void LookaheadContext::compare_prediction(const cldnn::primitive_id& id, const std::vector<uint32_t>& actual) {
+    if (!moe_otd::les_prediction_compare_enabled()) {
+        return;
+    }
+    const auto state = prediction(id);
+    std::vector<uint32_t> predicted;
+    const bool ready = state.readback && state.readback->snapshot(predicted);
+    const auto status = moe_otd::OtdPerfCounters::RecallCounts::classify(
+        state.prediction_ready != nullptr, state.generation, m_epoch, ready);
+    if (auto* perf = moe_otd::get_perf_counters()) {
+        perf->record_recall(id, predicted, actual, status);
+    }
+}
+
 std::shared_ptr<IExpertWeightProvider> LookaheadContext::bind(const cldnn::primitive_id& id,
                                                             std::shared_ptr<IExpertWeightProvider> provider) {
     const auto existing = m_providers.find(id);
@@ -125,7 +140,8 @@ void LookaheadContext::predict(const LookaheadLayerDesc& next_layer,
     }
     auto result = m_routers.at(target)->enqueue(hidden, ready);
     state = {hidden, ready, result.indices, result.weights, result.ready,
-             std::make_shared<std::atomic<bool>>(true), false};
+             std::make_shared<std::atomic<bool>>(true), false, m_epoch,
+             moe_otd::les_prediction_compare_enabled() ? std::make_shared<moe_otd::PredictionReadback>() : nullptr};
 }
 
 void LookaheadContext::prefetch(const cldnn::primitive_inst* current_moe) {
@@ -142,15 +158,14 @@ void LookaheadContext::prefetch(const cldnn::primitive_inst* current_moe) {
         return;
     }
     auto weights = provider->second;
-    const auto& link = m_links.at(m_source_links.at(current_moe->id()));
-    if (!weights || weights->resident_capacity() <= link.top_k) {
+    if (!weights) {
         return;
     }
     state.submitted = true;
     state.consumed->store(false, std::memory_order_release);
     m_network.get_stream().flush();
     m_prefetcher->submit_prefetch({m_layer_indices.at(target), m_epoch,
-                                  state.predicted_indices, state.prediction_ready, weights, state.consumed});
+                                  state.predicted_indices, state.prediction_ready, weights, state.consumed, state.readback});
 }
 
 std::shared_ptr<LookaheadContext> LookaheadRegistry::acquire(cldnn::network& network) {

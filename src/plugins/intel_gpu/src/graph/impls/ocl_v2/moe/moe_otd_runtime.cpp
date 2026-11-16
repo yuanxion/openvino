@@ -55,6 +55,14 @@ bool les_prediction_compare_enabled() {
     return enabled;
 }
 
+bool layer_perf_enabled() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("MOE_OTD_LAYER_PERF_LOG");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
 uint64_t les_device_time(cldnn::stream& stream) {
     auto queue = dynamic_cast<cldnn::ocl::ocl_stream&>(stream).get_cl_queue().get();
     cl_device_id device = nullptr;
@@ -75,6 +83,71 @@ void les_trace_interval(const char* kind, uint64_t start, uint64_t end) {
 }
 
 void OtdPerfCounters::dump() const {
+    {
+        std::lock_guard<std::mutex> lock(layer_mutex);
+        LayerCounts totals;
+        const auto emit = [](const std::string& layer, const LayerCounts& counts) {
+            const std::array<const char*, 3> phases{{"prefill", "decode", "unattributed"}};
+            if (layer_perf_enabled()) {
+                for (size_t phase = 0; phase < phases.size(); ++phase) {
+                    const auto& demand = counts.demand[phase];
+                    const auto total = demand.hits + demand.misses;
+                    std::cerr << "[OTD_CACHE] layer=" << layer << " phase=" << phases[phase]
+                              << " hits=" << demand.hits << " misses=" << demand.misses
+                              << " pending=" << demand.pending
+                              << " hit_pct=" << (total ? 100.0 * demand.hits / total : 0.0)
+                              << " miss_pct=" << (total ? 100.0 * demand.misses / total : 0.0) << '\n';
+                }
+            }
+            if (les_prediction_compare_enabled()) {
+                const auto& recall = counts.recall;
+                std::cerr << "[LES_RECALL] layer=" << layer << " phase=decode matched=" << recall.matched
+                          << " actual=" << recall.actual << " recall_pct="
+                          << (recall.actual ? 100.0 * recall.matched / recall.actual : 0.0)
+                          << " compared=" << recall.compared << " missing=" << recall.missing
+                          << " stale=" << recall.stale << " late=" << recall.late << '\n';
+            }
+        };
+        for (const auto& entry : layers) {
+            emit(entry.first, entry.second);
+            for (size_t phase = 0; phase < totals.demand.size(); ++phase) {
+                const auto& demand = entry.second.demand[phase];
+                totals.demand[phase].add(demand.hits, demand.misses - demand.pending, demand.pending);
+            }
+            const auto& recall = entry.second.recall;
+            totals.recall.matched += recall.matched;
+            totals.recall.actual += recall.actual;
+            totals.recall.compared += recall.compared;
+            totals.recall.missing += recall.missing;
+            totals.recall.stale += recall.stale;
+            totals.recall.late += recall.late;
+        }
+        emit("ALL", totals);
+    }
+    const auto candidate_count = [&](moe::LRUCache::SpeculativeOutcome outcome) {
+        return les_candidate_outcomes[static_cast<size_t>(outcome)].load(std::memory_order_relaxed);
+    };
+    using Outcome = moe::LRUCache::SpeculativeOutcome;
+    const auto raw_ids = les_candidate_raw_ids.load(std::memory_order_relaxed);
+    const auto duplicates = les_candidate_duplicates.load(std::memory_order_relaxed);
+    std::cerr << "[LES_PREFETCH] layer=ALL phase=decode path=worker policy=protect_prediction_set"
+              << " raw_ids=" << raw_ids << " duplicates=" << duplicates << " candidates=" << raw_ids - duplicates
+              << " reserved=" << candidate_count(Outcome::RESERVED)
+              << " resident=" << candidate_count(Outcome::RESIDENT)
+              << " loading=" << candidate_count(Outcome::LOADING)
+              << " blocked=" << candidate_count(Outcome::BLOCKED)
+              << " expired=" << candidate_count(Outcome::EXPIRED)
+              << " canceled=" << candidate_count(Outcome::CANCELED)
+              << " loads_completed=" << les_loads_completed.load(std::memory_order_relaxed)
+              << " loads_canceled=" << les_loads_canceled.load(std::memory_order_relaxed)
+              << " loads_failed=" << les_loads_failed.load(std::memory_order_relaxed)
+              << " loads_superseded=" << les_loads_superseded.load(std::memory_order_relaxed)
+              << " tasks_expired_unread=" << les_tasks_expired_unread.load(std::memory_order_relaxed)
+              << " tasks_canceled_unread=" << les_tasks_canceled_unread.load(std::memory_order_relaxed)
+              << " tasks_unbound=" << les_tasks_unbound.load(std::memory_order_relaxed)
+              << " demand_retries=" << les_demand_retries.load(std::memory_order_relaxed) << '\n';
+    std::cerr << "[LES_PREFETCH] layer=ALL path=legacy policy=atomic_full_set blocked_candidates="
+              << les_legacy_blocked_candidates.load(std::memory_order_relaxed) << '\n';
     const auto* enabled = std::getenv("MOE_OTD_PERF_LOG");
     if (!enabled || std::strcmp(enabled, "1") != 0) {
         return;
@@ -120,7 +193,7 @@ void OtdPerfCounters::dump() const {
 OtdPerfCounters* get_perf_counters() {
     static const bool enabled = [] {
         const auto* value = std::getenv("MOE_OTD_PERF_LOG");
-        return value && std::strcmp(value, "1") == 0;
+        return (value && std::strcmp(value, "1") == 0) || layer_perf_enabled() || les_prediction_compare_enabled();
     }();
     if (!enabled) {
         return nullptr;

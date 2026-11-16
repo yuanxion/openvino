@@ -103,6 +103,8 @@ struct ExpertPrefetcher::State {
         std::shared_ptr<Batch> batch;
         uint64_t generation = 0;
         uint32_t layer = 0;
+        bool speculative_origin = false;
+        bool canceled = false;
     };
 
     explicit State(cldnn::engine& engine, const cldnn::ExecutionConfig& config)
@@ -150,8 +152,16 @@ struct ExpertPrefetcher::State {
     }
 
     void finish(Job& job, cl_int status) {
+        bool completed = false;
         if (status == CL_COMPLETE) {
-            job.binding->cache->complete_load(job.load);
+            completed = job.binding->cache->complete_load(job.load);
+        }
+        if (job.speculative_origin) {
+            if (auto* perf = moe_otd::get_perf_counters()) {
+                auto& counter = status == CL_COMPLETE ? (completed ? perf->les_loads_completed : perf->les_loads_superseded) :
+                                job.canceled ? perf->les_loads_canceled : perf->les_loads_failed;
+                counter.fetch_add(1, std::memory_order_relaxed);
+            }
         }
         signal(job.load.ready_event, status);
         if (job.batch && (status != CL_COMPLETE || --job.batch->remaining == 0)) {
@@ -162,6 +172,9 @@ struct ExpertPrefetcher::State {
     void discard_locked() {
         for (auto& task : predictions) {
             consume(task);
+            if (auto* perf = moe_otd::get_perf_counters()) {
+                perf->les_tasks_canceled_unread.fetch_add(1, std::memory_order_relaxed);
+            }
         }
         predictions.clear();
         for (auto& job : demand) {
@@ -169,7 +182,7 @@ struct ExpertPrefetcher::State {
         }
         demand.clear();
         for (auto& job : speculative) {
-            job.binding->cache->cancel_load(job.load);
+            job.canceled = job.binding->cache->cancel_load(job.load);
             abandoned.push_back(std::move(job));
         }
         speculative.clear();
@@ -211,6 +224,9 @@ struct ExpertPrefetcher::State {
         for (auto task = predictions.begin(); task != predictions.end();) {
             if (task->generation != generation || task->target_layer_idx <= cursor) {
                 consume(*task);
+                if (auto* perf = moe_otd::get_perf_counters()) {
+                    perf->les_tasks_expired_unread.fetch_add(1, std::memory_order_relaxed);
+                }
                 task = predictions.erase(task);
                 changed = true;
             } else {
@@ -220,6 +236,7 @@ struct ExpertPrefetcher::State {
         for (auto job = speculative.begin(); job != speculative.end();) {
             if (job->generation != generation || job->layer <= cursor) {
                 if (job->binding->cache->cancel_load(job->load)) {
+                    job->canceled = true;
                     abandoned.push_back(*job);
                 } else {
                     demand.push_back(*job);
@@ -367,28 +384,45 @@ struct ExpertPrefetcher::State {
                                                                          count * sizeof(uint32_t), true);
                             }
                         }
+                        if (prediction->readback) {
+                            prediction->readback->publish(experts);
+                        }
                         consume(*prediction);
                     } catch (...) {
                         consume(*prediction);
                         throw;
                     }
-                    for (auto expert : experts) {
-                        OPENVINO_ASSERT(expert < static_cast<uint32_t>(binding->config.num_expert), "Invalid predicted expert ID");
-                        std::optional<LRUCache::Load> load;
-                        {
-                            std::lock_guard<std::mutex> lock(wakeup->mutex);
-                            if (stop || prediction->generation != generation || prediction->target_layer_idx <= cursor) {
-                                break;
-                            }
-                            load = binding->cache->reserve_speculative(expert, binding->config.top_k,
-                                [this] { return make_ready_event(); });
-                        }
-                        if (load) {
-                            watch(load->last_use_event);
-                            std::lock_guard<std::mutex> lock(wakeup->mutex);
-                            speculative.push_back({binding, *load, {}, prediction->generation, prediction->target_layer_idx});
+                    if (!binding) {
+                        if (auto* perf = moe_otd::get_perf_counters()) {
+                            perf->les_tasks_unbound.fetch_add(1, std::memory_order_relaxed);
                         }
                     }
+                    for (auto expert : experts) {
+                        OPENVINO_ASSERT(expert < static_cast<uint32_t>(binding->config.num_expert), "Invalid predicted expert ID");
+                    }
+                    moe_otd::visit_speculative_candidates(experts, moe_otd::get_perf_counters(),
+                        [&](uint32_t expert, const std::vector<uint32_t>& protected_experts) {
+                        using Outcome = LRUCache::SpeculativeOutcome;
+                        std::optional<LRUCache::Load> load;
+                        Outcome outcome;
+                        {
+                            std::lock_guard<std::mutex> lock(wakeup->mutex);
+                            if (stop) {
+                                return Outcome::CANCELED;
+                            }
+                            if (prediction->generation != generation || prediction->target_layer_idx <= cursor) {
+                                return Outcome::EXPIRED;
+                            }
+                            load = binding->cache->reserve_speculative(expert, binding->config.top_k,
+                                [this] { return make_ready_event(); }, &outcome, protected_experts);
+                        }
+                        if (load) {
+                            std::lock_guard<std::mutex> lock(wakeup->mutex);
+                            speculative.push_back({binding, *load, {}, prediction->generation, prediction->target_layer_idx, true});
+                            watch(load->last_use_event);
+                        }
+                        return outcome;
+                    });
                 }
                 {
                     std::lock_guard<std::mutex> lock(wakeup->mutex);

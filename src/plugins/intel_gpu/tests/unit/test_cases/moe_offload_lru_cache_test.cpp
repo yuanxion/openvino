@@ -5,16 +5,22 @@
 #include "test_utils/test_utils.h"
 #include "intel_gpu/runtime/internal_properties.hpp"
 #include "ocl_v2/moe/lru_cache.hpp"
+#include "impls/ocl_v2/primitive_ocl_base.hpp"
+#include "ocl_v2/moe/moe_otd_runtime.hpp"
 
 #include <thread>
 #include <vector>
 #include <set>
 #include <atomic>
+#include <cstdlib>
+#include <cstring>
 
 using namespace cldnn;
 using namespace tests;
 using ov::intel_gpu::ocl::moe::LRUCache;
 using ov::intel_gpu::ocl::moe::ExpertSlotReservations;
+using ov::intel_gpu::ocl::moe_otd::OtdPerfCounters;
+using ov::intel_gpu::ocl::moe_otd::OtdLayerPerfScope;
 
 namespace {
 class LookaheadTestEvent : public cldnn::event {
@@ -94,15 +100,341 @@ TEST(moe_lookahead_lru, pending_waves_reuse_slots_only_after_consumer_is_recorde
     EXPECT_TRUE(cache.complete_load(next->missing.front()));
 }
 
-TEST(moe_lookahead_lru, speculative_quota_reserves_demand_headroom) {
-    LRUCache full(4);
-    EXPECT_FALSE(full.reserve_speculative(0, 4, make_lookahead_test_event));
+TEST(moe_lookahead_lru, full_top8_has_no_speculative_quota) {
     LRUCache cache(8);
-    ASSERT_TRUE(cache.reserve_speculative(0, 7, make_lookahead_test_event));
-    EXPECT_FALSE(cache.reserve_speculative(1, 7, make_lookahead_test_event));
-    auto demand = cache.partition_3way({1, 2, 3, 4, 5, 6, 7}, make_lookahead_test_event);
+    for (uint32_t expert = 0; expert < 8; ++expert) {
+        LRUCache::SpeculativeOutcome outcome;
+        ASSERT_TRUE(cache.reserve_speculative(expert, 8, make_lookahead_test_event, &outcome));
+        EXPECT_EQ(outcome, LRUCache::SpeculativeOutcome::RESERVED);
+    }
+    LRUCache::SpeculativeOutcome outcome;
+    EXPECT_FALSE(cache.reserve_speculative(7, 8, make_lookahead_test_event, &outcome));
+    EXPECT_EQ(outcome, LRUCache::SpeculativeOutcome::LOADING);
+    EXPECT_FALSE(cache.reserve_speculative(8, 8, make_lookahead_test_event, &outcome));
+    EXPECT_EQ(outcome, LRUCache::SpeculativeOutcome::BLOCKED);
+    auto demand = cache.partition_3way({0, 1, 2, 3, 4, 5, 6, 7}, make_lookahead_test_event);
     ASSERT_TRUE(demand);
-    EXPECT_EQ(demand->missing.size(), 7U);
+    EXPECT_TRUE(demand->missing.empty());
+    EXPECT_EQ(demand->inflight_pairs.size(), 8U);
+}
+
+TEST(moe_lookahead_lru, full_top8_counts_every_unique_candidate_with_small_capacity) {
+    using namespace ov::intel_gpu::ocl::moe_otd;
+    using Outcome = LRUCache::SpeculativeOutcome;
+    LRUCache cache(4);
+    OtdPerfCounters perf;
+    cache.set_filled(cache.get_lru_item(6).first);
+    cache.set_filled(cache.get_lru_item(7).first);
+    ASSERT_TRUE(cache.reserve_speculative(0, 8, make_lookahead_test_event));
+    size_t attempts = 0;
+    size_t events_created = 0;
+    visit_speculative_candidates({0, 1, 2, 3, 4, 5, 6, 7, 0, 7}, &perf,
+        [&](uint32_t expert, const std::vector<uint32_t>& protected_experts) {
+            ++attempts;
+            Outcome outcome;
+            cache.reserve_speculative(expert, 8, [&] {
+                ++events_created;
+                return make_lookahead_test_event();
+            }, &outcome, protected_experts);
+            return outcome;
+        });
+    EXPECT_EQ(attempts, 8U);
+    EXPECT_EQ(events_created, 1U);
+    EXPECT_EQ(perf.les_candidate_raw_ids.load(), 10U);
+    EXPECT_EQ(perf.les_candidate_duplicates.load(), 2U);
+    EXPECT_EQ(perf.les_candidate_outcomes[static_cast<size_t>(Outcome::RESERVED)].load(), 1U);
+    EXPECT_EQ(perf.les_candidate_outcomes[static_cast<size_t>(Outcome::RESIDENT)].load(), 2U);
+    EXPECT_EQ(perf.les_candidate_outcomes[static_cast<size_t>(Outcome::LOADING)].load(), 1U);
+    EXPECT_EQ(perf.les_candidate_outcomes[static_cast<size_t>(Outcome::BLOCKED)].load(), 4U);
+    EXPECT_TRUE(cache.get_lru_item(6).second);
+    EXPECT_TRUE(cache.get_lru_item(7).second);
+    EXPECT_TRUE(perf.layers.empty());
+    EXPECT_EQ(perf.gpu_hits.load() + perf.gpu_misses.load(), 0U);
+}
+
+TEST(moe_lookahead_lru, completed_predictions_do_not_cascade_evict_each_other) {
+    using namespace ov::intel_gpu::ocl::moe_otd;
+    using Outcome = LRUCache::SpeculativeOutcome;
+    LRUCache cache(3);
+    OtdPerfCounters perf;
+    visit_speculative_candidates({0, 1, 2, 3, 4, 5, 6, 7}, &perf,
+        [&](uint32_t expert, const std::vector<uint32_t>& protected_experts) {
+            Outcome outcome;
+            if (auto load = cache.reserve_speculative(expert, 8, make_lookahead_test_event, &outcome, protected_experts)) {
+                EXPECT_TRUE(cache.complete_load(*load));
+            }
+            return outcome;
+        });
+    EXPECT_EQ(perf.les_candidate_outcomes[static_cast<size_t>(Outcome::RESERVED)].load(), 3U);
+    EXPECT_EQ(perf.les_candidate_outcomes[static_cast<size_t>(Outcome::BLOCKED)].load(), 5U);
+    for (uint32_t expert = 0; expert < 3; ++expert) {
+        EXPECT_TRUE(cache.get_lru_item(expert).second);
+    }
+}
+
+TEST(moe_lookahead_lru, mismatched_pending_predictions_allow_retry_without_inflating_hits) {
+    LRUCache cache(4);
+    std::vector<LRUCache::Load> predicted;
+    for (uint32_t expert = 0; expert < 4; ++expert) {
+        auto load = cache.reserve_speculative(expert, 8, make_lookahead_test_event);
+        ASSERT_TRUE(load);
+        predicted.push_back(*load);
+    }
+    const std::vector<uint32_t> actual{0, 4, 5, 6};
+    LRUCache::Partition observation;
+    EXPECT_FALSE(cache.partition_3way(actual, make_lookahead_test_event, false, &observation));
+    EXPECT_TRUE(observation.ready_pairs.empty());
+    EXPECT_EQ(observation.inflight_pairs, (std::vector<size_t>{0}));
+    EXPECT_EQ(observation.missing_pairs, (std::vector<size_t>{1, 2, 3}));
+    for (const auto& load : predicted) {
+        ASSERT_TRUE(cache.complete_load(load));
+    }
+    const auto retry = cache.partition_3way(actual, make_lookahead_test_event);
+    ASSERT_TRUE(retry);
+    EXPECT_EQ(retry->ready_pairs, (std::vector<size_t>{0}));
+    EXPECT_EQ(retry->missing_pairs.size(), 3U);
+    EXPECT_EQ(retry->slots[0], predicted.front().slot);
+    OtdPerfCounters perf;
+    {
+        OtdLayerPerfScope scope("layer0", 1, &perf);
+        for (auto pair : observation.ready_pairs) {
+            OtdLayerPerfScope::record(actual[pair], true);
+        }
+        for (auto pair : observation.inflight_pairs) {
+            OtdLayerPerfScope::record(actual[pair], false, true);
+        }
+        for (auto pair : observation.missing_pairs) {
+            OtdLayerPerfScope::record(actual[pair], false);
+        }
+    }
+    const auto& counts = perf.layers.at("layer0").demand[1];
+    EXPECT_EQ(counts.hits, 0U);
+    EXPECT_EQ(counts.misses, 4U);
+    EXPECT_EQ(counts.pending, 1U);
+}
+
+TEST(moe_lookahead_lru, full_top8_reports_pinned_slots_as_blocked_without_overwrite) {
+    using namespace ov::intel_gpu::ocl::moe_otd;
+    using Outcome = LRUCache::SpeculativeOutcome;
+    LRUCache cache(2);
+    OtdPerfCounters perf;
+    auto demand = cache.partition_3way({90, 91}, make_lookahead_test_event);
+    ASSERT_TRUE(demand);
+    for (const auto& load : demand->missing) {
+        ASSERT_TRUE(cache.complete_load(load));
+    }
+    visit_speculative_candidates({0, 1, 2, 3, 4, 5, 6, 7}, &perf,
+        [&](uint32_t expert, const std::vector<uint32_t>& protected_experts) {
+            Outcome outcome;
+            EXPECT_FALSE(cache.reserve_speculative(expert, 8, make_lookahead_test_event, &outcome, protected_experts));
+            return outcome;
+        });
+    EXPECT_EQ(perf.les_candidate_outcomes[static_cast<size_t>(Outcome::BLOCKED)].load(), 8U);
+    const auto still_pinned = cache.partition_3way({90, 91}, make_lookahead_test_event);
+    ASSERT_TRUE(still_pinned);
+    EXPECT_EQ(still_pinned->ready_pairs.size(), 2U);
+    EXPECT_EQ(still_pinned->slots, demand->slots);
+}
+
+TEST(moe_lookahead_lru, expired_and_canceled_predictions_account_for_remaining_unique_candidates) {
+    using namespace ov::intel_gpu::ocl::moe_otd;
+    using Outcome = LRUCache::SpeculativeOutcome;
+    for (auto terminal : {Outcome::EXPIRED, Outcome::CANCELED}) {
+        LRUCache cache(8);
+        OtdPerfCounters perf;
+        size_t attempts = 0;
+        visit_speculative_candidates({0, 1, 2, 3, 4, 5, 6, 7, 1}, &perf,
+            [&](uint32_t expert, const std::vector<uint32_t>& protected_experts) {
+                if (++attempts > 2) {
+                    return terminal;
+                }
+                Outcome outcome;
+                cache.reserve_speculative(expert, 8, make_lookahead_test_event, &outcome, protected_experts);
+                return outcome;
+            });
+        EXPECT_EQ(attempts, 8U);
+        EXPECT_EQ(perf.les_candidate_outcomes[static_cast<size_t>(Outcome::RESERVED)].load(), 2U);
+        EXPECT_EQ(perf.les_candidate_outcomes[static_cast<size_t>(terminal)].load(), 6U);
+        EXPECT_EQ(cache.size(), 2U);
+    }
+}
+
+TEST(moe_les_statistics, prefetch_summary_distinguishes_candidates_from_loads_and_unread_tasks) {
+    OtdPerfCounters perf;
+    using Outcome = LRUCache::SpeculativeOutcome;
+    ov::intel_gpu::ocl::moe_otd::visit_speculative_candidates({0, 1, 2, 3, 4, 5, 5}, &perf,
+        [](uint32_t expert, const std::vector<uint32_t>&) { return static_cast<Outcome>(expert); });
+    perf.les_loads_completed = 1;
+    perf.les_loads_canceled = 2;
+    perf.les_loads_failed = 3;
+    perf.les_loads_superseded = 4;
+    perf.les_tasks_expired_unread = 5;
+    perf.les_tasks_canceled_unread = 6;
+    perf.les_tasks_unbound = 7;
+    perf.les_legacy_blocked_candidates = 8;
+    testing::internal::CaptureStderr();
+    perf.dump();
+    const auto output = testing::internal::GetCapturedStderr();
+    EXPECT_NE(output.find("[LES_PREFETCH] layer=ALL phase=decode path=worker policy=protect_prediction_set"
+                          " raw_ids=7 duplicates=1 candidates=6 reserved=1 resident=1 loading=1 blocked=1 expired=1 canceled=1"
+                          " loads_completed=1 loads_canceled=2 loads_failed=3 loads_superseded=4"
+                          " tasks_expired_unread=5 tasks_canceled_unread=6 tasks_unbound=7"), std::string::npos);
+    EXPECT_NE(output.find("[LES_PREFETCH] layer=ALL path=legacy policy=atomic_full_set blocked_candidates=8"), std::string::npos);
+}
+
+TEST(moe_les_statistics, interleaved_phases_keep_local_denominators_and_deduplicate) {
+    OtdPerfCounters perf;
+    {
+        OtdLayerPerfScope prefill("layer0", 1024, &perf);
+        OtdLayerPerfScope::record(1, true);
+        {
+            OtdLayerPerfScope decode("layer0", 1, &perf);
+            OtdLayerPerfScope::record(1, false, true);
+            OtdLayerPerfScope::record(1, true);
+            OtdLayerPerfScope::record(2, false);
+            OtdLayerPerfScope::record(3, true);
+        }
+        OtdLayerPerfScope::record(2, true);
+        OtdLayerPerfScope::record(3, false);
+    }
+    {
+        OtdLayerPerfScope decode("layer0", 1, &perf);
+        OtdLayerPerfScope::record(1, true);
+    }
+    const auto& phases = perf.layers.at("layer0").demand;
+    EXPECT_EQ(phases[0].hits, 2U);
+    EXPECT_EQ(phases[0].misses, 1U);
+    EXPECT_EQ(phases[0].pending, 0U);
+    EXPECT_DOUBLE_EQ(100.0 * phases[0].hits / (phases[0].hits + phases[0].misses), 200.0 / 3);
+    EXPECT_EQ(phases[1].hits, 2U);
+    EXPECT_EQ(phases[1].misses, 2U);
+    EXPECT_EQ(phases[1].pending, 1U);
+    EXPECT_DOUBLE_EQ(100.0 * phases[1].hits / (phases[1].hits + phases[1].misses), 50.0);
+    EXPECT_EQ(phases[2].hits + phases[2].misses, 0U);
+}
+
+TEST(moe_les_statistics, environment_gates_require_exact_one) {
+    using namespace ov::intel_gpu::ocl::moe_otd;
+    const auto enabled = [](const char* name) {
+        const auto* value = std::getenv(name);
+        return value && std::strcmp(value, "1") == 0;
+    };
+    EXPECT_EQ(layer_perf_enabled(), enabled("MOE_OTD_LAYER_PERF_LOG"));
+    EXPECT_EQ(les_prediction_compare_enabled(), enabled("OV_GPU_LES_PREDICT_COMPARE"));
+    EXPECT_EQ(get_perf_counters() != nullptr,
+              enabled("MOE_OTD_LAYER_PERF_LOG") || enabled("OV_GPU_LES_PREDICT_COMPARE") || enabled("MOE_OTD_PERF_LOG"));
+}
+
+TEST(moe_les_statistics, speculative_probes_and_worker_threads_are_not_demand) {
+    OtdPerfCounters perf;
+    LRUCache cache(8);
+    {
+        OtdLayerPerfScope scope("layer0", 1, &perf);
+        ASSERT_TRUE(cache.reserve_speculative(0, 8, make_lookahead_test_event));
+        std::thread worker([] { OtdLayerPerfScope::record(1, true); });
+        worker.join();
+        OtdLayerPerfScope disabled("disabled", 1, nullptr);
+        OtdLayerPerfScope::record(2, false);
+    }
+    EXPECT_TRUE(perf.layers.empty());
+    {
+        OtdLayerPerfScope unknown("layer0", 0, &perf);
+        OtdLayerPerfScope::record(1, false);
+    }
+    EXPECT_EQ(perf.layers.at("layer0").demand[2].misses, 1U);
+}
+
+TEST(moe_les_statistics, ready_pending_and_missing_use_first_demand_observation) {
+    OtdPerfCounters perf;
+    LRUCache cache(8);
+    cache.set_filled(cache.get_lru_item(1).first);
+    ASSERT_TRUE(cache.reserve_speculative(2, 8, make_lookahead_test_event));
+    const std::vector<uint32_t> experts{1, 2, 3, 2};
+    const auto partition = cache.partition_3way(experts, make_lookahead_test_event);
+    ASSERT_TRUE(partition);
+    OtdLayerPerfScope scope("layer0", 1, &perf);
+    for (auto pair : partition->ready_pairs) {
+        OtdLayerPerfScope::record(experts[pair], true);
+    }
+    for (auto pair : partition->inflight_pairs) {
+        OtdLayerPerfScope::record(experts[pair], false, true);
+    }
+    for (auto pair : partition->missing_pairs) {
+        OtdLayerPerfScope::record(experts[pair], false);
+    }
+    const auto& counts = perf.layers.at("layer0").demand[1];
+    EXPECT_EQ(counts.hits, 1U);
+    EXPECT_EQ(counts.misses, 2U);
+    EXPECT_EQ(counts.pending, 1U);
+}
+
+TEST(moe_les_statistics, recall_is_set_intersection_not_rank_or_duplicate_credit) {
+    using Status = OtdPerfCounters::PredictionStatus;
+    OtdPerfCounters::RecallCounts complete, partial, zero;
+    complete.add({3, 2, 1, 1}, {1, 2, 3, 3}, Status::MATCHED);
+    EXPECT_EQ(complete.matched, 3U);
+    EXPECT_EQ(complete.actual, 3U);
+    partial.add({1, 1, 8, 9}, {1, 2, 3, 3}, Status::MATCHED);
+    EXPECT_EQ(partial.matched, 1U);
+    EXPECT_EQ(partial.actual, 3U);
+    zero.add({7, 8}, {1, 2, 3}, Status::MATCHED);
+    EXPECT_EQ(zero.matched, 0U);
+    EXPECT_EQ(zero.actual, 3U);
+    EXPECT_EQ(zero.compared, 1U);
+}
+
+TEST(moe_les_statistics, recall_rejects_missing_stale_and_late_generations) {
+    using Status = OtdPerfCounters::PredictionStatus;
+    using Recall = OtdPerfCounters::RecallCounts;
+    ov::intel_gpu::ocl::moe_otd::PredictionReadback readback;
+    std::vector<uint32_t> prediction;
+    EXPECT_FALSE(readback.snapshot(prediction));
+    EXPECT_EQ(Recall::classify(false, 0, 2, false), Status::MISSING);
+    EXPECT_EQ(Recall::classify(true, 1, 2, false), Status::STALE);
+    EXPECT_EQ(Recall::classify(true, 2, 2, false), Status::LATE);
+    readback.publish({0, 1, 2, 3, 4, 5, 6, 7});
+    ASSERT_TRUE(readback.snapshot(prediction));
+    EXPECT_EQ(prediction.size(), 8U);
+    EXPECT_EQ(Recall::classify(true, 2, 2, true), Status::MATCHED);
+    EXPECT_EQ(Recall::classify(true, 2, 3, true), Status::STALE);
+    Recall counts;
+    counts.add(prediction, {0, 1}, Status::MISSING);
+    counts.add(prediction, {0, 1}, Status::STALE);
+    counts.add(prediction, {0, 1}, Status::LATE);
+    EXPECT_EQ(counts.actual, 0U);
+    EXPECT_EQ(counts.matched, 0U);
+    EXPECT_EQ(counts.compared, 0U);
+    EXPECT_EQ(counts.missing, 1U);
+    EXPECT_EQ(counts.stale, 1U);
+    EXPECT_EQ(counts.late, 1U);
+}
+
+TEST(moe_les_statistics, phase_and_recall_logs_have_independent_all_summaries) {
+    using namespace ov::intel_gpu::ocl::moe_otd;
+    if (!layer_perf_enabled() || !les_prediction_compare_enabled()) {
+        GTEST_SKIP() << "Requires MOE_OTD_LAYER_PERF_LOG=1 OV_GPU_LES_PREDICT_COMPARE=1";
+    }
+    OtdPerfCounters perf;
+    perf.record_demand("layer0", 1024, 3, 1, 0);
+    perf.record_demand("layer0", 1, 1, 1, 2);
+    perf.record_demand("layer1", 1, 2, 0, 0);
+    perf.record_demand("layer1", 1024, 1, 1, 0);
+    perf.record_recall("layer0", {1, 2}, {2, 3}, OtdPerfCounters::PredictionStatus::MATCHED);
+    perf.record_recall("layer1", {}, {2, 3}, OtdPerfCounters::PredictionStatus::LATE);
+    testing::internal::CaptureStderr();
+    perf.dump();
+    const auto output = testing::internal::GetCapturedStderr();
+    EXPECT_NE(output.find("[OTD_CACHE] layer=layer0 phase=prefill hits=3 misses=1 pending=0 hit_pct=75 miss_pct=25"),
+              std::string::npos);
+    EXPECT_NE(output.find("[OTD_CACHE] layer=layer0 phase=decode hits=1 misses=3 pending=2 hit_pct=25 miss_pct=75"),
+              std::string::npos);
+    EXPECT_NE(output.find("[OTD_CACHE] layer=ALL phase=prefill hits=4 misses=2 pending=0 hit_pct=66.6667 miss_pct=33.3333"),
+              std::string::npos);
+    EXPECT_NE(output.find("[OTD_CACHE] layer=ALL phase=decode hits=3 misses=3 pending=2 hit_pct=50 miss_pct=50"),
+              std::string::npos);
+    EXPECT_NE(output.find("[LES_RECALL] layer=ALL phase=decode matched=1 actual=2 recall_pct=50 compared=1 missing=0 stale=0 late=1"),
+              std::string::npos);
+    EXPECT_EQ(output.find("phase=all"), std::string::npos);
 }
 
 TEST(moe_lookahead_lru, cancelled_replacement_retains_physical_slot_war) {
@@ -150,6 +482,22 @@ TEST(moe_les_reservations, deduplicates_and_rejects_capacity_without_mutation) {
     auto hits = cache.reserve({1, 2}, 2);
     ASSERT_TRUE(hits);
     EXPECT_TRUE(hits->missing_experts.empty());
+}
+
+TEST(moe_les_reservations, full_top8_uses_safe_atomic_reservation_without_legacy_budget) {
+    ExpertSlotReservations reservations(8);
+    const std::vector<uint32_t> prediction{0, 1, 2, 3, 4, 5, 6, 7, 7};
+    const auto full = reservations.reserve(prediction, 1, true);
+    ASSERT_TRUE(full);
+    EXPECT_EQ(full->missing_experts.size(), 8U);
+    EXPECT_EQ(full->slots[7], full->slots[8]);
+    EXPECT_FALSE(reservations.reserve({8}, 1, true));
+    ASSERT_TRUE(reservations.rollback(*full));
+    ExpertSlotReservations small(4);
+    EXPECT_FALSE(small.reserve(prediction, 1, true));
+    const auto demand = small.reserve({90, 91, 92, 93}, 1);
+    ASSERT_TRUE(demand);
+    EXPECT_EQ(demand->missing_experts.size(), 4U);
 }
 
 TEST(moe_les_reservations, protects_hits_before_assigning_misses) {

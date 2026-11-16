@@ -175,11 +175,25 @@ void LRUCache::move_to_end(std::list<Node>::iterator it) {
 
 std::optional<LRUCache::Partition> LRUCache::partition_3way(const std::vector<uint32_t>& topk_ids,
                                                         const EventFactory& make_event,
-                                                        bool allow_pending_reuse) {
+                                                        bool allow_pending_reuse,
+                                                        Partition* observation) {
     std::lock_guard<std::mutex> lock(m_mutex);
     const std::unordered_set<uint32_t> requested(topk_ids.begin(), topk_ids.end());
     if (requested.size() > m_max_total_experts) {
         return std::nullopt;
+    }
+    if (observation) {
+        *observation = {};
+        for (size_t pair = 0; pair < topk_ids.size(); ++pair) {
+            const auto found = m_map.find(Key{topk_ids[pair]});
+            if (found == m_map.end()) {
+                observation->missing_pairs.push_back(pair);
+            } else if (found->second->state.loading) {
+                observation->inflight_pairs.push_back(pair);
+            } else {
+                observation->ready_pairs.push_back(pair);
+            }
+        }
     }
     for (auto expert : requested) {
         auto found = m_map.find(Key{expert});
@@ -265,17 +279,19 @@ std::optional<LRUCache::Partition> LRUCache::partition_3way(const std::vector<ui
 }
 
 std::optional<LRUCache::Load> LRUCache::reserve_speculative(uint32_t expert_id,
-                                                         size_t top_k,
-                                                         const EventFactory& make_event) {
+                                                         size_t,
+                                                         const EventFactory& make_event,
+                                                         SpeculativeOutcome* outcome,
+                                                         const std::vector<uint32_t>& protected_experts) {
     std::lock_guard<std::mutex> lock(m_mutex);
-    if (top_k >= m_max_total_experts || m_map.count(Key{expert_id})) {
-        return std::nullopt;
+    if (outcome) {
+        *outcome = SpeculativeOutcome::BLOCKED;
     }
-    const auto quota = std::min({top_k, m_max_total_experts / 4, m_max_total_experts - top_k});
-    const auto pending = static_cast<size_t>(std::count_if(m_list.begin(), m_list.end(), [](const Node& node) {
-        return node.state.loading;
-    }));
-    if (pending >= quota) {
+    auto existing = m_map.find(Key{expert_id});
+    if (existing != m_map.end()) {
+        if (outcome) {
+            *outcome = existing->second->state.loading ? SpeculativeOutcome::LOADING : SpeculativeOutcome::RESIDENT;
+        }
         return std::nullopt;
     }
     std::vector<bool> occupied(m_max_total_experts, false);
@@ -287,8 +303,9 @@ std::optional<LRUCache::Load> LRUCache::reserve_speculative(uint32_t expert_id,
     auto victim = m_list.end();
     cldnn::event::ptr last_use;
     if (free_slot == occupied.end()) {
-        victim = std::find_if(m_list.begin(), m_list.end(), [](const Node& node) {
-            return node.state.status == SlotStatus::READY && !node.state.loading;
+        victim = std::find_if(m_list.begin(), m_list.end(), [&](const Node& node) {
+            return node.state.status == SlotStatus::READY && !node.state.loading &&
+                   std::find(protected_experts.begin(), protected_experts.end(), node.expert) == protected_experts.end();
         });
         if (victim == m_list.end()) {
             return std::nullopt;
@@ -311,6 +328,9 @@ std::optional<LRUCache::Load> LRUCache::reserve_speculative(uint32_t expert_id,
     m_map.emplace(Key{expert_id}, std::prev(m_list.end()));
     m_filled_list[slot] = false;
     ++m_total_experts;
+    if (outcome) {
+        *outcome = SpeculativeOutcome::RESERVED;
+    }
     return load;
 }
 

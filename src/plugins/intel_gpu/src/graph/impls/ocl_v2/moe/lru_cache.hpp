@@ -91,10 +91,14 @@ public:
     };
 
     using EventFactory = std::function<cldnn::event::ptr()>;
+    enum class SpeculativeOutcome { RESERVED, RESIDENT, LOADING, BLOCKED, EXPIRED, CANCELED };
     std::optional<Partition> partition_3way(const std::vector<uint32_t>& topk_ids,
                                           const EventFactory& make_event,
-                                          bool allow_pending_reuse = false);
-    std::optional<Load> reserve_speculative(uint32_t expert_id, size_t top_k, const EventFactory& make_event);
+                                          bool allow_pending_reuse = false,
+                                          Partition* observation = nullptr);
+    std::optional<Load> reserve_speculative(uint32_t expert_id, size_t top_k, const EventFactory& make_event,
+                                          SpeculativeOutcome* outcome = nullptr,
+                                          const std::vector<uint32_t>& protected_experts = {});
     bool complete_load(const Load& load);
     bool cancel_load(const Load& load);
     std::optional<Load> get_pending_load(uint32_t expert_id) const;

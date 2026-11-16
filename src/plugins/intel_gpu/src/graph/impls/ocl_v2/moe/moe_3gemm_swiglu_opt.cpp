@@ -843,6 +843,9 @@ public:
         std::vector<uint32_t> expert_ids(topk_count);
         scratch.topk_id->copy_to(stream, expert_ids.data(), 0, 0, topk_count * sizeof(uint32_t), true);
 
+        if (_lookahead && topk_count == instance.get_typed_desc<moe_3gemm_fused_compressed>()->_config.top_k) {
+            _lookahead->compare_prediction(instance.id(), expert_ids);
+        }
         auto lease = _weight_provider->try_acquire_simultaneous(expert_ids, stream);
         if (!lease) {
             if (auto* perf = moe_otd::get_perf_counters()) {
@@ -967,6 +970,9 @@ public:
         std::vector<uint32_t> raw_topk_ids(topk_count);
         batch_mem_ptr->copy_to(stream, raw_topk_ids.data(), 0, 0, topk_count * sizeof(uint32_t), true);
 
+        if (_lookahead && token_num == 1) {
+            _lookahead->compare_prediction(instance.id(), raw_topk_ids);
+        }
         // Use lease API for capacity-safe simultaneous acquisition.
         // If unique experts exceed resident capacity, returns nullopt → caller falls back.
         auto lease = _weight_provider->try_acquire_simultaneous(raw_topk_ids, stream);
@@ -1763,6 +1769,7 @@ public:
                                 ", expert=", expert, ", count=", cur_moe->_config.num_expert,
                                 ", layout=", scratch.topk_id->get_layout().to_short_string());
             }
+            _lookahead->compare_prediction(instance.id(), experts);
         }
         auto batch_mem_ptr = scratch.topk_id;
         if (!split_les) {
@@ -1898,13 +1905,32 @@ public:
                     const size_t first_pair = wave * wave_capacity;
                     const size_t last_pair = std::min(pair_count, first_pair + wave_capacity);
                     std::vector<uint32_t> wave_experts(experts.begin() + first_pair, experts.begin() + last_pair);
+                    moe::LRUCache::Partition observation;
                     auto partition = [&] {
                         OV_ITT_SCOPED_TASK(ov::intel_gpu::itt::domains::intel_gpu_plugin,
                                            openvino::itt::handle("LES[a]::partition_3way"));
                         return provider->cache().partition_3way(wave_experts,
-                            [&] { return prefetcher.make_ready_event(); }, wave > 0);
+                            [&] { return prefetcher.make_ready_event(); }, wave > 0, &observation);
                     }();
-                    OPENVINO_ASSERT(partition, "Lookahead demand cannot reserve its wave slots");
+                    for (auto pair : observation.ready_pairs) {
+                        moe_otd::OtdLayerPerfScope::record(wave_experts[pair], true);
+                    }
+                    for (auto pair : observation.inflight_pairs) {
+                        moe_otd::OtdLayerPerfScope::record(wave_experts[pair], false, true);
+                    }
+                    for (auto pair : observation.missing_pairs) {
+                        moe_otd::OtdLayerPerfScope::record(wave_experts[pair], false);
+                    }
+                    if (!partition) {
+                        if (auto* perf = moe_otd::get_perf_counters()) {
+                            perf->les_demand_retries.fetch_add(1, std::memory_order_relaxed);
+                        }
+                        stream.flush();
+                        prefetcher.drain();
+                        partition = provider->cache().partition_3way(wave_experts,
+                            [&] { return prefetcher.make_ready_event(); }, wave > 0);
+                    }
+                    OPENVINO_ASSERT(partition, "Lookahead demand cannot reserve its wave slots after draining pending loads");
                     if (wave == 0) {
                         OV_ITT_SCOPED_TASK(ov::intel_gpu::itt::domains::intel_gpu_plugin,
                                            openvino::itt::handle("LES[b]::demand_partitioned"));
@@ -3203,6 +3229,7 @@ public:
         auto [hidden_states_mem_ptr, hidden_states_layout] = get_input_info(instance, static_cast<size_t>(MOE3GemmInputIndex::HIDDEN_STATES));
         size_t token_num = get_seq_len(hidden_states_layout);
 
+        moe_otd::OtdLayerPerfScope demand_scope(instance.id(), token_num);
         bind_weights_on_first_exec(instance);
 
         scratch_buffers scratch;

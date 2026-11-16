@@ -879,18 +879,6 @@ TEST(moe_les_reservations, speculation_cannot_evict_active_demand_and_unused_slo
     EXPECT_TRUE(reservations.release(*replacement));
 }
 
-TEST(moe_les_reservations, fixed_speculative_policy_separates_horizon_rank_and_byte_budget) {
-    using Policy = otd::LesSpeculationPolicy;
-    EXPECT_EQ(Policy::lookahead_layers, 1U);
-    EXPECT_EQ(Policy::predict_k, 4U);
-    EXPECT_EQ(Policy::expert_budget(1, 16), 0U);
-    EXPECT_EQ(Policy::expert_budget(16, 0), 0U);
-    EXPECT_EQ(Policy::expert_budget(16, 16), 4U);
-    EXPECT_EQ(Policy::expert_budget(4, 16), 1U);
-    EXPECT_EQ(Policy::expert_budget(16, Policy::max_bytes), 1U);
-    EXPECT_EQ(Policy::expert_budget(16, Policy::max_bytes + 1), 0U);
-}
-
 TEST(moe_les_reservations, rollback_unstarted_speculation_restores_full_cache) {
     ov::intel_gpu::ocl::moe::ExpertSlotReservations reservations(2);
     auto demand = reservations.reserve({0, 1}, 1);
