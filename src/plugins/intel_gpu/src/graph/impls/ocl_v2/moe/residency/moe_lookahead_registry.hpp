@@ -35,6 +35,8 @@ public:
         bool submitted = false;
         uint64_t generation = 0;
         std::shared_ptr<moe_otd::PredictionReadback> readback;
+        std::shared_ptr<timeline::Step> trace;
+        timeline::Key trace_origin;
     };
 
     explicit LookaheadContext(cldnn::network& network);
@@ -48,7 +50,9 @@ public:
     void enter(const cldnn::primitive_id& id);
     void demand_partitioned(const cldnn::primitive_id& id);
     void compare_prediction(const cldnn::primitive_id& id, const std::vector<uint32_t>& actual);
-    void pause_for_prefill();
+    void pause_for_prefill(const cldnn::primitive_id& id);
+    std::shared_ptr<timeline::Step> trace_step(const cldnn::primitive_id& id);
+    timeline::Key trace_key(const cldnn::primitive_id& id) const;
     std::shared_ptr<IExpertWeightProvider> bind(const cldnn::primitive_id& id,
                                                std::shared_ptr<IExpertWeightProvider> provider);
 
@@ -72,6 +76,9 @@ private:
     std::vector<LookaheadLayerDesc> m_layers;
     std::unordered_map<const cldnn::primitive_inst*, size_t> m_moe_to_next_index;
     uint64_t m_epoch = 0;
+    uint64_t m_native_request = 0;
+    uint64_t m_decode_token = 0;
+    std::unordered_map<cldnn::primitive_id, std::shared_ptr<timeline::Step>> m_trace_steps;
     std::optional<uint32_t> m_cursor;
     std::unordered_map<cldnn::primitive_id, std::shared_ptr<OffloadExpertWeightProvider>> m_providers;
     std::unordered_map<cldnn::primitive_id, std::unique_ptr<LookaheadRouter>> m_routers;

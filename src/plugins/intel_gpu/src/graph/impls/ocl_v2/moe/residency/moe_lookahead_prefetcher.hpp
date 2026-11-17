@@ -11,6 +11,7 @@
 #include "intel_gpu/runtime/event.hpp"
 #include "intel_gpu/runtime/execution_config.hpp"
 #include "intel_gpu/runtime/memory.hpp"
+#include "../les_timeline.hpp"
 
 namespace cldnn {
 class engine;
@@ -32,6 +33,8 @@ struct PrefetchTask {
     std::weak_ptr<OffloadExpertWeightProvider> target_provider;
     std::shared_ptr<std::atomic<bool>> consumed;
     std::shared_ptr<moe_otd::PredictionReadback> readback;
+    std::shared_ptr<timeline::Step> trace;
+    timeline::Key trace_origin;
 };
 
 class ExpertPrefetcher {
@@ -44,8 +47,11 @@ public:
     void bind(const std::shared_ptr<OffloadExpertWeightProvider>& provider);
     cldnn::event::ptr make_ready_event();
     void submit_prefetch(PrefetchTask task);
-    cldnn::event::ptr demand_async(OffloadExpertWeightProvider& provider, const std::vector<uint32_t>& missing_ids);
-    void promote(OffloadExpertWeightProvider& provider, const std::vector<uint32_t>& topk_ids);
+    cldnn::event::ptr demand_async(OffloadExpertWeightProvider& provider, const std::vector<uint32_t>& missing_ids,
+                                 const std::shared_ptr<timeline::Step>& trace = {},
+                                 const timeline::Key& trace_origin = {});
+    void promote(OffloadExpertWeightProvider& provider, const std::vector<uint32_t>& topk_ids,
+                 const std::shared_ptr<timeline::Step>& trace = {});
     void advance(uint64_t generation, uint32_t layer_idx);
     void rethrow_if_failed() const;
     void drain();

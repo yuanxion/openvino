@@ -14,6 +14,7 @@
 #include <functional>
 
 #include "intel_gpu/runtime/event.hpp"
+#include "les_timeline.hpp"
 
 namespace ov::intel_gpu::ocl::moe {
 
@@ -66,6 +67,7 @@ struct CacheItemExtended {
     uint64_t generation = 0;
     bool loading = false;
     bool demanded = false;
+    std::shared_ptr<timeline::Load> trace;
 };
 
 class LRUCache {
@@ -78,6 +80,7 @@ public:
         uint64_t generation;
         cldnn::event::ptr ready_event;
         cldnn::event::ptr last_use_event;
+        std::shared_ptr<timeline::Load> trace;
     };
 
     struct Partition {
@@ -92,16 +95,25 @@ public:
 
     using EventFactory = std::function<cldnn::event::ptr()>;
     enum class SpeculativeOutcome { RESERVED, RESIDENT, LOADING, BLOCKED, EXPIRED, CANCELED };
+    struct SpeculativeObservation {
+        uint64_t stamp_ns = 0;
+        uintptr_t cache = 0;
+        std::optional<timeline::Entry> entry;
+    };
     std::optional<Partition> partition_3way(const std::vector<uint32_t>& topk_ids,
                                           const EventFactory& make_event,
                                           bool allow_pending_reuse = false,
-                                          Partition* observation = nullptr);
+                                          Partition* observation = nullptr,
+                                          timeline::Snapshot* snapshot = nullptr);
     std::optional<Load> reserve_speculative(uint32_t expert_id, size_t top_k, const EventFactory& make_event,
                                           SpeculativeOutcome* outcome = nullptr,
-                                          const std::vector<uint32_t>& protected_experts = {});
+                                          const std::vector<uint32_t>& protected_experts = {},
+                                          SpeculativeObservation* observation = nullptr);
     bool complete_load(const Load& load);
     bool cancel_load(const Load& load);
     std::optional<Load> get_pending_load(uint32_t expert_id) const;
+    timeline::Snapshot snapshot() const;
+    void fail_load_trace(const Load& load);
     void unpin_all(const cldnn::event::ptr& complete_event);
 
     std::pair<size_t, bool> get_lru_item(size_t expert);
@@ -162,6 +174,7 @@ private:
 
     void move_to_end(std::list<Node>::iterator it);
     void evict_one_unlocked();
+    timeline::Snapshot snapshot_unlocked() const;
 };
 
 }  // namespace ov::intel_gpu::ocl::moe

@@ -34,6 +34,281 @@ cldnn::event::ptr make_lookahead_test_event() {
 }
 }
 
+TEST(moe_les_timeline, snapshots_cover_resident_ready_loading_and_generations) {
+    using namespace ov::intel_gpu::ocl::moe::timeline;
+    const Selection sample("measured:2:1,128,255");
+    Key key{1, 2, 1, 4, 0, "layer", "measured", "2"};
+    testing::internal::CaptureStderr();
+    for (const auto token : {1U, 128U, 255U}) {
+        key.token = token;
+        for (uint32_t layer = 0; layer < 40; ++layer) {
+            key.layer = layer;
+            auto selected = make_step(key, sample);
+            ASSERT_TRUE(selected);
+            Snapshot ready;
+            ready.stamp_ns = 100;
+            for (uint32_t expert = 0; expert < 8; ++expert)
+                ready.entries.push_back({expert, expert, 0, false, true, {}});
+            selected->observe("first_demand", ready, {0, 1, 2, 3, 4, 5, 6, 7}, 0, 0, true);
+            EXPECT_EQ(selected->demands.size(), 8U);
+        }
+    }
+    const auto grid = testing::internal::GetCapturedStderr();
+    std::istringstream grid_lines(grid);
+    std::string grid_line;
+    size_t steps = 0, demand_results = 0;
+    uint64_t previous_sequence = 0;
+    while (std::getline(grid_lines, grid_line)) {
+        steps += grid_line.find("\tstage=first_demand\t") != std::string::npos;
+        demand_results += grid_line.find("\tstage=demand_result\t") != std::string::npos;
+        const auto sequence = std::stoull(grid_line.substr(grid_line.find("\tseq=") + 5));
+        EXPECT_GT(sequence, previous_sequence);
+        previous_sequence = sequence;
+    }
+    EXPECT_EQ(steps, 120U);
+    EXPECT_EQ(demand_results, 960U);
+    testing::internal::CaptureStderr();
+    key.token = 2;
+    EXPECT_FALSE(make_step(key, sample));
+    key.token = 1;
+    key.iteration = "1";
+    EXPECT_FALSE(make_step(key, sample));
+    key.iteration = "2";
+    key.request_phase = "warmup";
+    EXPECT_FALSE(make_step(key, sample));
+    EXPECT_FALSE(make_step(Key{}, sample));
+    EXPECT_TRUE(testing::internal::GetCapturedStderr().empty());
+    EXPECT_TRUE(make_step(Key{}, Selection(nullptr)));
+    for (const auto* bad : {"", "measured", "measured:2", "other:2:1", "measured:NA:1",
+                            "measured:-1:1", "measured:02:1", "measured:2:0", "measured:2:01",
+                            "measured:2:1,", "measured:2:,1", "measured:2:1,1", "measured:2:1:2",
+                            "measured:2: 1", "measured:2:18446744073709551616"})
+        EXPECT_THROW(Selection{bad}, std::invalid_argument) << bad;
+    LRUCache cache(3);
+    cache.set_filled(cache.get_lru_item(1).first);
+    const auto first = cache.snapshot();
+    auto pending = cache.reserve_speculative(2, 1, make_lookahead_test_event);
+    ASSERT_TRUE(pending);
+    EXPECT_EQ(static_cast<bool>(pending->trace), ov::intel_gpu::ocl::moe::timeline::enabled());
+    LRUCache::SpeculativeObservation observation;
+    LRUCache::SpeculativeOutcome outcome;
+    size_t extra_reservations = 0;
+    const auto make_extra_event = [&] {
+        ++extra_reservations;
+        return make_lookahead_test_event();
+    };
+    EXPECT_FALSE(cache.reserve_speculative(2, 1, make_extra_event, &outcome, {}, &observation));
+    EXPECT_EQ(outcome, LRUCache::SpeculativeOutcome::LOADING);
+    ASSERT_TRUE(observation.entry);
+    EXPECT_EQ(observation.cache, reinterpret_cast<uintptr_t>(&cache));
+    EXPECT_EQ(observation.entry->expert, 2U);
+    EXPECT_EQ(observation.entry->slot, pending->slot);
+    EXPECT_EQ(observation.entry->generation, pending->generation);
+    EXPECT_TRUE(observation.entry->loading);
+    EXPECT_LE(first.stamp_ns, observation.stamp_ns);
+    const auto loading_observation = observation;
+    const auto second = cache.snapshot();
+    EXPECT_LE(observation.stamp_ns, second.stamp_ns);
+    ASSERT_EQ(first.entries.size(), 1U);
+    ASSERT_EQ(second.entries.size(), 2U);
+    EXPECT_LE(first.stamp_ns, second.stamp_ns);
+    EXPECT_EQ(second.cache, reinterpret_cast<uintptr_t>(&cache));
+    EXPECT_EQ(second.fields(), "\tcache=" + std::to_string(second.cache) +
+        "\tresident=1,2\tready=1\tloading=2\tslots=1:0:0,2:1:" + std::to_string(pending->generation));
+    EXPECT_TRUE(cache.cancel_load(*pending));
+    if (pending->trace) {
+        EXPECT_EQ(pending->trace->status, "canceled");
+        EXPECT_GE(pending->trace->terminal_ns, second.stamp_ns);
+    }
+    auto replacement = cache.reserve_speculative(2, 1, make_lookahead_test_event);
+    ASSERT_TRUE(replacement);
+    EXPECT_EQ(replacement->slot, pending->slot);
+    EXPECT_GT(replacement->generation, pending->generation);
+    EXPECT_FALSE(cache.complete_load(*pending));
+    EXPECT_TRUE(cache.snapshot().entries.back().loading);
+    EXPECT_TRUE(cache.complete_load(*replacement));
+    EXPECT_TRUE(cache.snapshot().entries.back().ready);
+    EXPECT_FALSE(cache.reserve_speculative(2, 1, make_extra_event, &outcome, {}, &observation));
+    EXPECT_EQ(outcome, LRUCache::SpeculativeOutcome::RESIDENT);
+    ASSERT_TRUE(observation.entry);
+    EXPECT_EQ(observation.entry->slot, replacement->slot);
+    EXPECT_EQ(observation.entry->generation, replacement->generation);
+    EXPECT_TRUE(observation.entry->ready);
+    EXPECT_FALSE(observation.entry->loading);
+    EXPECT_EQ(loading_observation.entry->generation, pending->generation);
+    EXPECT_EQ(extra_reservations, 0U);
+    EXPECT_FALSE(cache.reserve_speculative(1, 1, make_extra_event, &outcome, {}, &observation));
+    ASSERT_TRUE(observation.entry);
+    EXPECT_EQ(observation.entry->generation, 0U);
+    EXPECT_TRUE(observation.entry->ready);
+    if (replacement->trace) {
+        EXPECT_EQ(replacement->trace->status, "ready");
+        EXPECT_GE(replacement->trace->terminal_ns, second.stamp_ns);
+    }
+}
+
+TEST(moe_les_timeline, ready_zero_pending_new_load_promotion_and_terminal_once) {
+    using namespace ov::intel_gpu::ocl::moe::timeline;
+    auto load = std::make_shared<Load>();
+    load->identity = "\tcache=1\tslot=1\tload_gen=1";
+    load->origin = Key{1, 2, 3, 4, 5, "layer\t%=\n"}.fields();
+    Step step({1, 2, 3, 4, 5, "layer\t%=\n"});
+    EXPECT_NE(step.context.find("layer_id=layer%09%25%3D%0A"), std::string::npos);
+    testing::internal::CaptureStderr();
+    step.observe("first_demand", {100, {{1, 0, 0, false, true, {}}, {2, 1, 1, true, false, load}}, 1},
+                 {1, 2, 3}, 0, 0, true);
+    ASSERT_EQ(step.demands.size(), 3U);
+    EXPECT_TRUE(step.demands[0]->reported);
+    EXPECT_FALSE(step.demands[1]->reported);
+    EXPECT_FALSE(step.demands[2]->reported);
+    step.link(2, load);
+    step.link(2, load);
+    EXPECT_EQ(load->demands.size(), 1U);
+    auto new_load = std::make_shared<Load>();
+    new_load->identity = "\tcache=1\tslot=2\tload_gen=2";
+    new_load->origin = step.context;
+    step.link(3, new_load);
+    load->terminal("ready", 120);
+    load->flush();
+    load->terminal("failed", 130);
+    load->flush();
+    new_load->terminal("failed", 140);
+    new_load->flush();
+    step.prediction({2, 3}, true);
+    step.prediction({2, 4}, false);
+    const auto output = testing::internal::GetCapturedStderr();
+    EXPECT_NE(output.find("demand_mark_ns=100\tweights_ready_ns=100\tlatency_ns=0"), std::string::npos);
+    EXPECT_NE(output.find("demand_mark_ns=100\tweights_ready_ns=120\tlatency_ns=20"), std::string::npos);
+    EXPECT_NE(output.find("status=failed\tdemand_mark_ns=100\tweights_ready_ns=NA\tlatency_ns=NA"), std::string::npos);
+    EXPECT_NE(output.find("matched=1\tactual_count=2"), std::string::npos);
+    EXPECT_EQ(load->status, "ready");
+    EXPECT_TRUE(load->demands.empty());
+    EXPECT_TRUE(step.demands[1]->reported);
+    EXPECT_TRUE(step.demands[2]->reported);
+
+    auto foreign = std::make_shared<Load>();
+    foreign->identity = "\tcache=9\tslot=2\tload_gen=7";
+    foreign->visible = false;
+    const Key origin{1, 1, 256, 9, 5, "foreign", "measured", "1"};
+    testing::internal::CaptureStderr();
+    foreign->set_origin(origin, 8, "speculative");
+    foreign->start(40);
+    foreign->terminal("ready", 60);
+    foreign->flush();
+    EXPECT_TRUE(testing::internal::GetCapturedStderr().empty());
+    Step selected({1, 2, 1, 10, 5, "selected", "measured", "2"});
+    testing::internal::CaptureStderr();
+    selected.observe("first_demand", {100, {{8, 2, 7, false, true, foreign}}, 9}, {8}, 0, 0, true);
+    foreign->set_origin(selected.key, 8, "demand");
+    auto late = std::make_shared<Demand>();
+    late->context = selected.context;
+    late->expert = 8;
+    late->mark_ns = 50;
+    foreign->watch(late);
+    std::vector<std::thread> exposing;
+    for (size_t worker = 0; worker < 4; ++worker)
+        exposing.emplace_back([foreign] { foreign->expose(); });
+    for (auto& worker : exposing)
+        worker.join();
+    const auto dependency = testing::internal::GetCapturedStderr();
+    const auto start = dependency.find("\tstage=load_start");
+    const auto result = dependency.find("\tstage=load_result");
+    ASSERT_NE(start, std::string::npos);
+    ASSERT_NE(result, std::string::npos);
+    EXPECT_EQ(dependency.find("\tstage=load_start", start + 1), std::string::npos);
+    EXPECT_EQ(dependency.find("\tstage=load_result", result + 1), std::string::npos);
+    EXPECT_NE(dependency.find("\tobs_ns=40\t" + origin.fields()), std::string::npos);
+    EXPECT_NE(dependency.find("\tobs_ns=60\t" + origin.fields()), std::string::npos);
+    EXPECT_NE(dependency.find("demand_mark_ns=50\tweights_ready_ns=60\tlatency_ns=10"), std::string::npos);
+    EXPECT_NE(dependency.find("demand_mark_ns=100\tweights_ready_ns=100\tlatency_ns=0"), std::string::npos);
+    EXPECT_EQ(foreign->origin, origin.fields() + "\texpert=8\torigin=speculative");
+
+    auto baseline = std::make_shared<Load>();
+    baseline->identity = "\tcache=9\tslot=3\tload_gen=8";
+    baseline->visible = false;
+    baseline->set_origin(origin, 9, "speculative");
+    baseline->start(70);
+    baseline->terminal("ready", 80);
+    auto candidate = std::make_shared<Load>();
+    candidate->identity = "\tcache=9\tslot=4\tload_gen=9";
+    candidate->visible = false;
+    candidate->set_origin(origin, 10, "speculative");
+    candidate->start(90);
+    testing::internal::CaptureStderr();
+    Snapshot snapshot{100, {{9, 3, 8, false, true, baseline}}, 9};
+    selected.event("pre_prefetch", snapshot.fields(), snapshot.stamp_ns);
+    selected.link(10, candidate);
+    candidate->terminal("ready", 110);
+    candidate->flush();
+    const auto additional = testing::internal::GetCapturedStderr();
+    EXPECT_NE(additional.find("\tstage=load_result" + baseline->identity), std::string::npos);
+    EXPECT_NE(additional.find("\tstage=load_result" + candidate->identity), std::string::npos);
+    EXPECT_TRUE(candidate->demands.empty());
+    EXPECT_EQ(selected.demands.size(), 1U);
+}
+
+TEST(moe_les_timeline, cancellation_and_stale_results_never_become_ready) {
+    using namespace ov::intel_gpu::ocl::moe::timeline;
+    auto load = std::make_shared<Load>();
+    load->origin = Key{}.fields();
+    auto demand = std::make_shared<Demand>();
+    demand->mark_ns = 100;
+    load->watch(demand);
+    testing::internal::CaptureStderr();
+    load->terminal("canceled", 110);
+    load->terminal("ready", 120);
+    load->flush();
+    auto stale = std::make_shared<Load>();
+    stale->origin = Key{}.fields();
+    stale->terminal("superseded", 130);
+    auto late = std::make_shared<Demand>();
+    late->mark_ns = 100;
+    stale->watch(late);
+    const auto output = testing::internal::GetCapturedStderr();
+    EXPECT_EQ(load->status, "canceled");
+    EXPECT_NE(output.find("status=canceled\tdemand_mark_ns=100\tweights_ready_ns=NA"), std::string::npos);
+    EXPECT_NE(output.find("status=superseded\tdemand_mark_ns=100\tweights_ready_ns=NA"), std::string::npos);
+    EXPECT_EQ(output.find("status=ready"), std::string::npos);
+    EXPECT_TRUE(late->reported);
+}
+
+TEST(moe_les_timeline, concurrent_lines_have_unique_sequence_and_monotonic_worker_observations) {
+    using namespace ov::intel_gpu::ocl::moe::timeline;
+    testing::internal::CaptureStderr();
+    std::vector<std::thread> workers;
+    for (size_t worker = 0; worker < 4; ++worker) {
+        workers.emplace_back([worker] {
+            Step step({1, 1, 1, 1, static_cast<uint32_t>(worker), "layer\n\t%="});
+            for (size_t observation = 0; observation < 16; ++observation)
+                step.event("test", "\tworker=" + std::to_string(worker));
+        });
+    }
+    for (auto& worker : workers)
+        worker.join();
+    const auto output = testing::internal::GetCapturedStderr();
+    std::istringstream lines(output);
+    std::string line;
+    uint64_t previous_sequence = 0;
+    std::array<uint64_t, 4> previous_stamp{};
+    size_t count = 0;
+    while (std::getline(lines, line)) {
+        EXPECT_EQ(line.find("LES_TIMELINE\tv=1\tseq="), 0U);
+        EXPECT_NE(line.find("\tlayer_id=layer%0A%09%25%3D\t"), std::string::npos);
+        EXPECT_NE(line.find("\trequest_phase=unlabeled\titer=NA\t"), std::string::npos);
+        EXPECT_NE(line.find("\tstage=test\t"), std::string::npos);
+        const auto sequence = std::stoull(line.substr(line.find("\tseq=") + 5));
+        const auto stamp = std::stoull(line.substr(line.find("\tobs_ns=") + 8));
+        const auto worker = std::stoull(line.substr(line.find("\tworker=") + 8));
+        EXPECT_GT(sequence, previous_sequence);
+        ASSERT_LT(worker, previous_stamp.size());
+        EXPECT_GE(stamp, previous_stamp[worker]);
+        previous_sequence = sequence;
+        previous_stamp[worker] = stamp;
+        ++count;
+    }
+    EXPECT_EQ(count, 64U);
+}
+
 TEST(moe_lookahead_lru, partitions_and_pins_ready_inflight_missing_atomically) {
     LRUCache cache(8);
     const auto resident = cache.get_lru_item(1);
@@ -41,8 +316,34 @@ TEST(moe_lookahead_lru, partitions_and_pins_ready_inflight_missing_atomically) {
     const auto speculative = cache.reserve_speculative(2, 3, make_lookahead_test_event);
     ASSERT_TRUE(speculative);
     EXPECT_FALSE(cache.reserve_speculative(2, 3, make_lookahead_test_event));
-    const auto demand = cache.partition_3way({1, 2, 3, 2}, make_lookahead_test_event);
+    LRUCache::Partition observation;
+    ov::intel_gpu::ocl::moe::timeline::Snapshot snapshot;
+    const std::vector<uint32_t> actual{1, 2, 3, 2};
+    const auto demand = cache.partition_3way(actual, make_lookahead_test_event, false, &observation, &snapshot);
     ASSERT_TRUE(demand);
+    EXPECT_EQ(observation.ready_pairs, demand->ready_pairs);
+    EXPECT_EQ(observation.inflight_pairs, demand->inflight_pairs);
+    EXPECT_EQ(observation.missing_pairs, demand->missing_pairs);
+    ASSERT_EQ(snapshot.entries.size(), 2U);
+    EXPECT_TRUE(snapshot.entries[0].ready);
+    EXPECT_TRUE(snapshot.entries[1].loading);
+    EXPECT_EQ(cache.snapshot().entries.size(), 3U);
+    ov::intel_gpu::ocl::moe::timeline::Step step({1, 2, 3, 4, 5, "partition"});
+    testing::internal::CaptureStderr();
+    step.observe("first_demand", snapshot, actual, 0, 0, true);
+    step.observe("before_wave_partition", snapshot, actual);
+    const auto output = testing::internal::GetCapturedStderr();
+    EXPECT_NE(output.find("\tstage=first_demand\twave=0\tpass=0\tactual=1,2,3,2\tdemand_ready=1\tdemand_pending=2,2\tdemand_missing=3\t"),
+              std::string::npos);
+    EXPECT_NE(output.find("\tstage=before_wave_partition\twave=0\tpass=0\tactual=1,2,3,2\tdemand_ready=1\tdemand_pending=2,2\tdemand_missing=3\t"),
+              std::string::npos);
+    const auto captured_observation = "\tobs_ns=" + std::to_string(snapshot.stamp_ns) + '\t';
+    const auto first_observation = output.find(captured_observation);
+    ASSERT_NE(first_observation, std::string::npos);
+    EXPECT_NE(output.find(captured_observation, first_observation + captured_observation.size()), std::string::npos);
+    ASSERT_EQ(step.demands.size(), 3U);
+    for (const auto& marked : step.demands)
+        EXPECT_EQ(marked->mark_ns, snapshot.stamp_ns);
     EXPECT_EQ(demand->ready_pairs, (std::vector<size_t>{0}));
     EXPECT_EQ(demand->inflight_pairs, (std::vector<size_t>{1, 3}));
     EXPECT_EQ(demand->missing_pairs, (std::vector<size_t>{2}));
@@ -182,7 +483,16 @@ TEST(moe_lookahead_lru, mismatched_pending_predictions_allow_retry_without_infla
     }
     const std::vector<uint32_t> actual{0, 4, 5, 6};
     LRUCache::Partition observation;
-    EXPECT_FALSE(cache.partition_3way(actual, make_lookahead_test_event, false, &observation));
+    ov::intel_gpu::ocl::moe::timeline::Snapshot snapshot;
+    EXPECT_FALSE(cache.partition_3way(actual, make_lookahead_test_event, false, &observation, &snapshot));
+    ASSERT_EQ(snapshot.entries.size(), 4U);
+    EXPECT_EQ(snapshot.cache, reinterpret_cast<uintptr_t>(&cache));
+    const auto captured_stamp = snapshot.stamp_ns;
+    EXPECT_GT(captured_stamp, 0U);
+    for (const auto& entry : snapshot.entries) {
+        EXPECT_TRUE(entry.loading);
+        EXPECT_FALSE(entry.ready);
+    }
     EXPECT_TRUE(observation.ready_pairs.empty());
     EXPECT_EQ(observation.inflight_pairs, (std::vector<size_t>{0}));
     EXPECT_EQ(observation.missing_pairs, (std::vector<size_t>{1, 2, 3}));
@@ -191,6 +501,9 @@ TEST(moe_lookahead_lru, mismatched_pending_predictions_allow_retry_without_infla
     }
     const auto retry = cache.partition_3way(actual, make_lookahead_test_event);
     ASSERT_TRUE(retry);
+    EXPECT_EQ(snapshot.stamp_ns, captured_stamp);
+    EXPECT_TRUE(snapshot.entries.front().loading);
+    EXPECT_FALSE(snapshot.entries.front().ready);
     EXPECT_EQ(retry->ready_pairs, (std::vector<size_t>{0}));
     EXPECT_EQ(retry->missing_pairs.size(), 3U);
     EXPECT_EQ(retry->slots[0], predicted.front().slot);

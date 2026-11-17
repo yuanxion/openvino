@@ -176,8 +176,11 @@ void LRUCache::move_to_end(std::list<Node>::iterator it) {
 std::optional<LRUCache::Partition> LRUCache::partition_3way(const std::vector<uint32_t>& topk_ids,
                                                         const EventFactory& make_event,
                                                         bool allow_pending_reuse,
-                                                        Partition* observation) {
+                                                        Partition* observation,
+                                                        timeline::Snapshot* snapshot) {
     std::lock_guard<std::mutex> lock(m_mutex);
+    if (snapshot)
+        *snapshot = snapshot_unlocked();
     const std::unordered_set<uint32_t> requested(topk_ids.begin(), topk_ids.end());
     if (requested.size() > m_max_total_experts) {
         return std::nullopt;
@@ -246,8 +249,10 @@ std::optional<LRUCache::Partition> LRUCache::partition_3way(const std::vector<ui
     }
     for (auto& load : result.missing) {
         load.generation = ++m_generation;
+        load.trace = timeline::make_load(this, load.slot, load.generation);
         m_list.push_back(Node{load.expert_id, load.slot,
-                             {SlotStatus::PENDING_LOAD, load.ready_event, load.last_use_event, load.generation, true}});
+                             {SlotStatus::PENDING_LOAD, load.ready_event, load.last_use_event, load.generation, true,
+                              false, load.trace}});
         m_map.emplace(Key{load.expert_id}, std::prev(m_list.end()));
         m_filled_list[load.slot] = false;
         ++m_total_experts;
@@ -282,13 +287,22 @@ std::optional<LRUCache::Load> LRUCache::reserve_speculative(uint32_t expert_id,
                                                          size_t,
                                                          const EventFactory& make_event,
                                                          SpeculativeOutcome* outcome,
-                                                         const std::vector<uint32_t>& protected_experts) {
+                                                         const std::vector<uint32_t>& protected_experts,
+                                                         SpeculativeObservation* observation) {
     std::lock_guard<std::mutex> lock(m_mutex);
+    if (observation)
+        *observation = {timeline::now_ns(), reinterpret_cast<uintptr_t>(this), std::nullopt};
     if (outcome) {
         *outcome = SpeculativeOutcome::BLOCKED;
     }
     auto existing = m_map.find(Key{expert_id});
     if (existing != m_map.end()) {
+        if (observation) {
+            const auto& node = *existing->second;
+            observation->entry = {expert_id, node.lru_expert_no, node.state.generation,
+                                  node.state.loading, !node.state.loading && m_filled_list[node.lru_expert_no],
+                                  node.state.trace};
+        }
         if (outcome) {
             *outcome = existing->second->state.loading ? SpeculativeOutcome::LOADING : SpeculativeOutcome::RESIDENT;
         }
@@ -324,12 +338,18 @@ std::optional<LRUCache::Load> LRUCache::reserve_speculative(uint32_t expert_id,
         --m_total_experts;
     }
     Load load{expert_id, slot, ++m_generation, ready, last_use};
-    m_list.push_back(Node{expert_id, slot, {SlotStatus::PENDING_LOAD, ready, last_use, load.generation, true}});
+    load.trace = timeline::make_load(this, slot, load.generation);
+    m_list.push_back(Node{expert_id, slot, {SlotStatus::PENDING_LOAD, ready, last_use, load.generation, true,
+                                         false, load.trace}});
     m_map.emplace(Key{expert_id}, std::prev(m_list.end()));
     m_filled_list[slot] = false;
     ++m_total_experts;
     if (outcome) {
         *outcome = SpeculativeOutcome::RESERVED;
+    }
+    if (observation) {
+        observation->stamp_ns = timeline::now_ns();
+        observation->entry = {expert_id, slot, load.generation, true, false, load.trace};
     }
     return load;
 }
@@ -341,13 +361,40 @@ std::optional<LRUCache::Load> LRUCache::get_pending_load(uint32_t expert_id) con
         return std::nullopt;
     }
     const auto& node = *found->second;
-    return Load{expert_id, node.lru_expert_no, node.state.generation, node.state.ready_event, node.state.last_use_event};
+    return Load{expert_id, node.lru_expert_no, node.state.generation, node.state.ready_event, node.state.last_use_event,
+                node.state.trace};
+}
+
+timeline::Snapshot LRUCache::snapshot() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return snapshot_unlocked();
+}
+
+timeline::Snapshot LRUCache::snapshot_unlocked() const {
+    timeline::Snapshot result;
+    result.stamp_ns = timeline::now_ns();
+    result.cache = reinterpret_cast<uintptr_t>(this);
+    for (const auto& node : m_list) {
+        result.entries.push_back({static_cast<uint32_t>(node.expert), node.lru_expert_no, node.state.generation,
+                                  node.state.loading, !node.state.loading && m_filled_list[node.lru_expert_no],
+                                  node.state.trace});
+    }
+    return result;
+}
+
+void LRUCache::fail_load_trace(const Load& load) {
+    if (load.trace) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        load.trace->terminal("failed", timeline::now_ns());
+    }
 }
 
 bool LRUCache::complete_load(const Load& load) {
     std::lock_guard<std::mutex> lock(m_mutex);
     auto found = m_map.find(Key{load.expert_id});
     if (found == m_map.end() || found->second->state.generation != load.generation) {
+        if (load.trace)
+            load.trace->terminal("superseded", timeline::now_ns());
         return false;
     }
     auto& node = *found->second;
@@ -356,6 +403,8 @@ bool LRUCache::complete_load(const Load& load) {
         node.state.status = SlotStatus::READY;
     }
     m_filled_list[node.lru_expert_no] = true;
+    if (load.trace)
+        load.trace->terminal("ready", timeline::now_ns());
     return true;
 }
 
@@ -370,6 +419,8 @@ bool LRUCache::cancel_load(const Load& load) {
     m_list.erase(found->second);
     m_map.erase(found);
     --m_total_experts;
+    if (load.trace)
+        load.trace->terminal("canceled", timeline::now_ns());
     return true;
 }
 

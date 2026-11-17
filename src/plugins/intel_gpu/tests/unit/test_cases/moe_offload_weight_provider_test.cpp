@@ -305,7 +305,9 @@ TEST_F(moe_les_upload, native_lookahead_router_keeps_actual_outputs_independent)
     EXPECT_EQ(actual_id, 2U);
     prefetcher.advance(1, 0);
     auto consumed = std::make_shared<std::atomic<bool>>(false);
-    prefetcher.submit_prefetch({1, 1, prediction.indices, prediction.ready, provider, consumed});
+    ov::intel_gpu::ocl::moe::PrefetchTask task{1, 1, prediction.indices, prediction.ready, provider, consumed};
+    ASSERT_FALSE(task.trace);
+    prefetcher.submit_prefetch(task);
     prefetcher.drain();
     EXPECT_TRUE(consumed->load(std::memory_order_acquire));
     auto predicted = provider->cache().partition_3way({5}, [&] { return prefetcher.make_ready_event(); });

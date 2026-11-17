@@ -1894,6 +1894,7 @@ public:
                 }();
                 const size_t wave_capacity = provider->resident_capacity();
                 const size_t wave_count = (pair_count + wave_capacity - 1) / wave_capacity;
+                auto timeline = _lookahead->trace_step(instance.id());
                 if (_les_decode_metadata.size() < wave_count * 3) {
                     _les_decode_metadata.resize(wave_count * 3);
                 }
@@ -1905,13 +1906,30 @@ public:
                     const size_t first_pair = wave * wave_capacity;
                     const size_t last_pair = std::min(pair_count, first_pair + wave_capacity);
                     std::vector<uint32_t> wave_experts(experts.begin() + first_pair, experts.begin() + last_pair);
+                    auto observe_pass = [&](size_t pass, const std::vector<size_t>& pairs) {
+                        if (!timeline)
+                            return;
+                        std::vector<uint32_t> submitted;
+                        for (auto pair : pairs)
+                            submitted.push_back(wave_experts[pair]);
+                        timeline->observe("before_pass_submit", provider->cache().snapshot(), wave_experts, wave, pass,
+                            false, "\tsubmit=" + moe::timeline::ids(submitted) + "\tshared=" +
+                            std::to_string(pass == 1 && _has_shared_expert && wave == 0));
+                    };
+                    moe::timeline::Snapshot partition_snapshot;
                     moe::LRUCache::Partition observation;
                     auto partition = [&] {
                         OV_ITT_SCOPED_TASK(ov::intel_gpu::itt::domains::intel_gpu_plugin,
                                            openvino::itt::handle("LES[a]::partition_3way"));
                         return provider->cache().partition_3way(wave_experts,
-                            [&] { return prefetcher.make_ready_event(); }, wave > 0, &observation);
+                            [&] { return prefetcher.make_ready_event(); }, wave > 0, &observation,
+                            timeline ? &partition_snapshot : nullptr);
                     }();
+                    if (timeline) {
+                        if (wave == 0)
+                            timeline->observe("first_demand", partition_snapshot, experts, 0, 0, true);
+                        timeline->observe("before_wave_partition", partition_snapshot, wave_experts, wave);
+                    }
                     for (auto pair : observation.ready_pairs) {
                         moe_otd::OtdLayerPerfScope::record(wave_experts[pair], true);
                     }
@@ -1927,6 +1945,8 @@ public:
                         }
                         stream.flush();
                         prefetcher.drain();
+                        if (timeline)
+                            timeline->observe("after_retry_wait", provider->cache().snapshot(), wave_experts, wave);
                         partition = provider->cache().partition_3way(wave_experts,
                             [&] { return prefetcher.make_ready_event(); }, wave > 0);
                     }
@@ -1943,12 +1963,13 @@ public:
                     auto demand_event = [&] {
                         OV_ITT_SCOPED_TASK(ov::intel_gpu::itt::domains::intel_gpu_plugin,
                                            openvino::itt::handle("LES[c]::demand_async"));
-                        return prefetcher.demand_async(*provider, missing_ids);
+                        return prefetcher.demand_async(*provider, missing_ids, timeline,
+                                                      _lookahead->trace_key(instance.id()));
                     }();
                     {
                         OV_ITT_SCOPED_TASK(ov::intel_gpu::itt::domains::intel_gpu_plugin,
                                            openvino::itt::handle("LES[d]::promote"));
-                        prefetcher.promote(*provider, wave_experts);
+                        prefetcher.promote(*provider, wave_experts, timeline);
                     }
                     if (wave == 0) {
                         OV_ITT_SCOPED_TASK(ov::intel_gpu::itt::domains::intel_gpu_plugin,
@@ -1996,6 +2017,7 @@ public:
                             dynamic_cast<cldnn::ocl::ocl_stream&>(stream).enqueue_external_barrier(partition->ready_events);
                         }
                         pass_a = true;
+                        observe_pass(1, partition->ready_pairs);
                         {
                             OV_ITT_SCOPED_TASK(ov::intel_gpu::itt::domains::intel_gpu_plugin,
                                                    openvino::itt::handle("LES[g.1]::enqueue_ready_pairs"));
@@ -2015,6 +2037,9 @@ public:
                             dynamic_cast<cldnn::ocl::ocl_stream&>(stream).enqueue_external_barrier(copy_events);
                         }
                         pass_a = false;
+                        auto pending_pairs = partition->inflight_pairs;
+                        pending_pairs.insert(pending_pairs.end(), partition->missing_pairs.begin(), partition->missing_pairs.end());
+                        observe_pass(2, pending_pairs);
                         {
                             OV_ITT_SCOPED_TASK(ov::intel_gpu::itt::domains::intel_gpu_plugin,
                                                openvino::itt::handle("LES[i]::enqueue_pending_pairs"));
@@ -3240,7 +3265,7 @@ public:
         // use optimized GEMV kernels with batch dimension. Avoids gather/scatter overhead.
         const MoeGemmImpl impl = select_impl(token_num);
         if (_lookahead && (token_num != 1 || impl != MoeGemmImpl::batched_gemv)) {
-            _lookahead->pause_for_prefill();
+            _lookahead->pause_for_prefill(instance.id());
         }
         if (impl == MoeGemmImpl::batched_gemv) {
             return exec_batched_gemv(events, instance, scratch, token_num);

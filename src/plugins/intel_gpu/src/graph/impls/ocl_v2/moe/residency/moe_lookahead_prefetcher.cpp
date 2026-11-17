@@ -155,7 +155,11 @@ struct ExpertPrefetcher::State {
         bool completed = false;
         if (status == CL_COMPLETE) {
             completed = job.binding->cache->complete_load(job.load);
+        } else {
+            job.binding->cache->fail_load_trace(job.load);
         }
+        if (job.load.trace)
+            job.load.trace->flush();
         if (job.speculative_origin) {
             if (auto* perf = moe_otd::get_perf_counters()) {
                 auto& counter = status == CL_COMPLETE ? (completed ? perf->les_loads_completed : perf->les_loads_superseded) :
@@ -171,6 +175,8 @@ struct ExpertPrefetcher::State {
 
     void discard_locked() {
         for (auto& task : predictions) {
+            if (task.trace)
+                task.trace->event("prediction_result", "\tstatus=canceled\tpredicted=NA");
             consume(task);
             if (auto* perf = moe_otd::get_perf_counters()) {
                 perf->les_tasks_canceled_unread.fetch_add(1, std::memory_order_relaxed);
@@ -223,6 +229,8 @@ struct ExpertPrefetcher::State {
         bool changed = false;
         for (auto task = predictions.begin(); task != predictions.end();) {
             if (task->generation != generation || task->target_layer_idx <= cursor) {
+                if (task->trace)
+                    task->trace->event("prediction_result", "\tstatus=expired\tpredicted=NA");
                 consume(*task);
                 if (auto* perf = moe_otd::get_perf_counters()) {
                     perf->les_tasks_expired_unread.fetch_add(1, std::memory_order_relaxed);
@@ -355,6 +363,8 @@ struct ExpertPrefetcher::State {
                             dynamic_cast<cldnn::ocl::ocl_stream&>(*dma).enqueue_external_barrier({selected->load.last_use_event});
                         }
                         auto& source = *selected->binding;
+                        if (selected->load.trace)
+                            selected->load.trace->start(timeline::now_ns());
                         moe_otd::fill_weights_memory_async(*dma, source.config, source.offsets, *source.reader,
                                                            source.weights, {selected->load.expert_id}, {selected->load.slot},
                                                            nullptr, &staging);
@@ -387,8 +397,16 @@ struct ExpertPrefetcher::State {
                         if (prediction->readback) {
                             prediction->readback->publish(experts);
                         }
+                        if (prediction->trace) {
+                            prediction->trace->event("prediction_result", "\tstatus=" +
+                                std::string(binding ? "available" : "unbound") + "\tpredicted=" + timeline::ids(experts));
+                            if (binding)
+                                prediction->trace->prediction(experts, false);
+                        }
                         consume(*prediction);
                     } catch (...) {
+                        if (prediction->trace)
+                            prediction->trace->event("prediction_result", "\tstatus=failed\tpredicted=NA");
                         consume(*prediction);
                         throw;
                     }
@@ -404,17 +422,33 @@ struct ExpertPrefetcher::State {
                         [&](uint32_t expert, const std::vector<uint32_t>& protected_experts) {
                         using Outcome = LRUCache::SpeculativeOutcome;
                         std::optional<LRUCache::Load> load;
-                        Outcome outcome;
+                        LRUCache::SpeculativeObservation observation;
+                        Outcome outcome = Outcome::BLOCKED;
                         {
                             std::lock_guard<std::mutex> lock(wakeup->mutex);
                             if (stop) {
-                                return Outcome::CANCELED;
+                                outcome = Outcome::CANCELED;
+                            } else if (prediction->generation != generation || prediction->target_layer_idx <= cursor) {
+                                outcome = Outcome::EXPIRED;
+                            } else {
+                                load = binding->cache->reserve_speculative(expert, binding->config.top_k,
+                                    [this] { return make_ready_event(); }, &outcome, protected_experts,
+                                    prediction->trace ? &observation : nullptr);
                             }
-                            if (prediction->generation != generation || prediction->target_layer_idx <= cursor) {
-                                return Outcome::EXPIRED;
-                            }
-                            load = binding->cache->reserve_speculative(expert, binding->config.top_k,
-                                [this] { return make_ready_event(); }, &outcome, protected_experts);
+                        }
+                        if (load && load->trace)
+                            load->trace->set_origin(prediction->trace ? prediction->trace->key : prediction->trace_origin,
+                                                    expert, "speculative");
+                        if (prediction->trace) {
+                            if (observation.entry && observation.entry->load)
+                                observation.entry->load->expose();
+                            static constexpr const char* names[] = {"reserved", "resident", "loading", "blocked", "expired", "canceled"};
+                            prediction->trace->event("candidate", "\texpert=" + std::to_string(expert) +
+                                "\tstatus=" + names[static_cast<size_t>(outcome)] +
+                                (observation.entry ? "\tcache=" + std::to_string(observation.cache) +
+                                    "\tslot=" + std::to_string(observation.entry->slot) +
+                                    "\tload_gen=" + std::to_string(observation.entry->generation) : ""),
+                                observation.stamp_ns ? observation.stamp_ns : timeline::now_ns());
                         }
                         if (load) {
                             std::lock_guard<std::mutex> lock(wakeup->mutex);
@@ -501,7 +535,9 @@ void ExpertPrefetcher::submit_prefetch(PrefetchTask task) {
 }
 
 cldnn::event::ptr ExpertPrefetcher::demand_async(OffloadExpertWeightProvider& provider,
-                                              const std::vector<uint32_t>& missing_ids) {
+                                              const std::vector<uint32_t>& missing_ids,
+                                              const std::shared_ptr<timeline::Step>& trace,
+                                              const timeline::Key& trace_origin) {
     OV_ITT_SCOPED_TASK(ov::intel_gpu::itt::domains::intel_gpu_plugin,
                        openvino::itt::handle("LES.worker::demand_async"));
     rethrow_if_failed();
@@ -513,6 +549,12 @@ cldnn::event::ptr ExpertPrefetcher::demand_async(OffloadExpertWeightProvider& pr
     for (auto expert : missing_ids) {
         auto load = provider.cache().get_pending_load(expert);
         OPENVINO_ASSERT(load, "Demand expert was not reserved atomically");
+        if (load->trace)
+            load->trace->set_origin(trace ? trace->key : trace_origin, expert, "demand");
+        if (trace && load->trace) {
+            trace->link(expert, load->trace);
+            trace->event("demand_load", "\texpert=" + std::to_string(expert) + load->trace->identity);
+        }
         m_state->watch(load->last_use_event);
         loads.push_back(*load);
     }
@@ -528,11 +570,16 @@ cldnn::event::ptr ExpertPrefetcher::demand_async(OffloadExpertWeightProvider& pr
     return batch->ready;
 }
 
-void ExpertPrefetcher::promote(OffloadExpertWeightProvider& provider, const std::vector<uint32_t>& topk_ids) {
+void ExpertPrefetcher::promote(OffloadExpertWeightProvider& provider, const std::vector<uint32_t>& topk_ids,
+                              const std::shared_ptr<timeline::Step>& trace) {
     std::lock_guard<std::mutex> lock(m_state->wakeup->mutex);
     const auto binding = m_state->bindings.at(&provider);
     for (auto job = m_state->speculative.begin(); job != m_state->speculative.end();) {
         if (job->binding == binding && std::find(topk_ids.begin(), topk_ids.end(), job->load.expert_id) != topk_ids.end()) {
+            if (trace && job->load.trace) {
+                trace->link(job->load.expert_id, job->load.trace);
+                trace->event("promotion", "\texpert=" + std::to_string(job->load.expert_id) + job->load.trace->identity);
+            }
             m_state->demand.push_back(*job);
             job = m_state->speculative.erase(job);
         } else {

@@ -25,7 +25,13 @@ LookaheadContext::~LookaheadContext() {
     }
 }
 
-void LookaheadContext::pause_for_prefill() {
+void LookaheadContext::pause_for_prefill(const cldnn::primitive_id& id) {
+    const auto layer = m_layer_indices.find(id);
+    if (timeline::enabled() && layer != m_layer_indices.end() && layer->second == 0) {
+        ++m_native_request;
+        m_decode_token = 0;
+        m_trace_steps.clear();
+    }
     m_compute_stream->flush();
     m_prefetcher->advance(++m_epoch, std::numeric_limits<uint32_t>::max());
     m_prefetcher->drain();
@@ -85,9 +91,46 @@ void LookaheadContext::enter(const cldnn::primitive_id& id) {
     }
     if (!m_cursor || found->second <= *m_cursor) {
         ++m_epoch;
+        if (timeline::enabled()) {
+            ++m_decode_token;
+            m_trace_steps.clear();
+        }
         m_prefetcher->advance(m_epoch, 0);
     }
     m_cursor = found->second;
+    if (auto trace = trace_step(id)) {
+        if (!trace->baseline_observed) {
+            const auto provider = m_providers.find(id);
+            if (provider != m_providers.end()) {
+                const auto baseline = provider->second->cache().snapshot();
+                trace->baseline_observed = true;
+                trace->event("pre_prefetch", std::string("\tstatus=") +
+                    (found->second == 0 ? "no_predecessor" : "not_submitted") + baseline.fields(), baseline.stamp_ns);
+            }
+        }
+    }
+}
+
+timeline::Key LookaheadContext::trace_key(const cldnn::primitive_id& id) const {
+    if (!timeline::enabled())
+        return {};
+    const auto* phase = std::getenv("OV_GPU_LES_TIMELINE_PHASE");
+    const auto* iteration = std::getenv("OV_GPU_LES_TIMELINE_ITER");
+    return {m_network.get_id(), m_native_request, m_decode_token, m_epoch, m_layer_indices.at(id), id,
+            phase ? phase : "unlabeled", iteration ? iteration : "NA"};
+}
+
+std::shared_ptr<timeline::Step> LookaheadContext::trace_step(const cldnn::primitive_id& id) {
+    if (!timeline::enabled())
+        return {};
+    auto key = trace_key(id);
+    if (!timeline::selection().matches(key))
+        return {};
+    auto& trace = m_trace_steps[id];
+    if (!trace || trace->key.epoch != m_epoch) {
+        trace = timeline::make_step(std::move(key));
+    }
+    return trace;
 }
 
 void LookaheadContext::demand_partitioned(const cldnn::primitive_id& id) {
@@ -98,7 +141,7 @@ void LookaheadContext::demand_partitioned(const cldnn::primitive_id& id) {
 }
 
 void LookaheadContext::compare_prediction(const cldnn::primitive_id& id, const std::vector<uint32_t>& actual) {
-    if (!moe_otd::les_prediction_compare_enabled()) {
+    if (!moe_otd::les_prediction_compare_enabled() && !timeline::enabled()) {
         return;
     }
     const auto state = prediction(id);
@@ -106,8 +149,18 @@ void LookaheadContext::compare_prediction(const cldnn::primitive_id& id, const s
     const bool ready = state.readback && state.readback->snapshot(predicted);
     const auto status = moe_otd::OtdPerfCounters::RecallCounts::classify(
         state.prediction_ready != nullptr, state.generation, m_epoch, ready);
-    if (auto* perf = moe_otd::get_perf_counters()) {
-        perf->record_recall(id, predicted, actual, status);
+    if (moe_otd::les_prediction_compare_enabled()) {
+        if (auto* perf = moe_otd::get_perf_counters())
+            perf->record_recall(id, predicted, actual, status);
+    }
+    if (auto trace = trace_step(id)) {
+        using Status = moe_otd::OtdPerfCounters::PredictionStatus;
+        const char* name = trace->key.layer == 0 ? "no_predecessor" : status == Status::MISSING ? "missing" :
+                           status == Status::STALE ? "stale" : status == Status::LATE ? "late" : "matched";
+        trace->event("prediction_at_demand", "\tstatus=" + std::string(name) + "\tactual=" + timeline::ids(actual) +
+                     "\tpredicted=" + (ready ? timeline::ids(predicted) : "NA") +
+                     "\tprediction_epoch=" + std::to_string(state.generation) + "\trecall=NA");
+        trace->prediction(actual, true);
     }
 }
 
@@ -141,7 +194,11 @@ void LookaheadContext::predict(const LookaheadLayerDesc& next_layer,
     auto result = m_routers.at(target)->enqueue(hidden, ready);
     state = {hidden, ready, result.indices, result.weights, result.ready,
              std::make_shared<std::atomic<bool>>(true), false, m_epoch,
-             moe_otd::les_prediction_compare_enabled() ? std::make_shared<moe_otd::PredictionReadback>() : nullptr};
+             (moe_otd::les_prediction_compare_enabled() || timeline::enabled()) ?
+                 std::make_shared<moe_otd::PredictionReadback>() : nullptr,
+             trace_step(target), trace_key(target)};
+    if (state.trace)
+        state.trace->event("prediction_submitted");
 }
 
 void LookaheadContext::prefetch(const cldnn::primitive_inst* current_moe) {
@@ -162,10 +219,16 @@ void LookaheadContext::prefetch(const cldnn::primitive_inst* current_moe) {
         return;
     }
     state.submitted = true;
+    if (state.trace && !state.trace->baseline_observed) {
+        const auto baseline = weights->cache().snapshot();
+        state.trace->baseline_observed = true;
+        state.trace->event("pre_prefetch", "\tstatus=before_submit" + baseline.fields(), baseline.stamp_ns);
+    }
     state.consumed->store(false, std::memory_order_release);
     m_network.get_stream().flush();
     m_prefetcher->submit_prefetch({m_layer_indices.at(target), m_epoch,
-                                  state.predicted_indices, state.prediction_ready, weights, state.consumed, state.readback});
+                                  state.predicted_indices, state.prediction_ready, weights, state.consumed, state.readback,
+                                  state.trace, state.trace_origin});
 }
 
 std::shared_ptr<LookaheadContext> LookaheadRegistry::acquire(cldnn::network& network) {
