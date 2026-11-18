@@ -438,7 +438,7 @@ struct ExpertPrefetcher::State {
                         }
                         if (load && load->trace)
                             load->trace->set_origin(prediction->trace ? prediction->trace->key : prediction->trace_origin,
-                                                    expert, "speculative");
+                                                    expert, "speculative", prediction->prefetch_source);
                         if (prediction->trace) {
                             if (observation.entry && observation.entry->load)
                                 observation.entry->load->expose();

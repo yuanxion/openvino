@@ -9,6 +9,7 @@
 #include <memory>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -28,6 +29,14 @@ inline bool enabled() {
 inline uint64_t now_ns() {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+inline bool completion_enabled() {
+    static const bool value = [] {
+        const auto* setting = std::getenv("OV_GPU_LES_TIMELINE_COMPLETION");
+        return setting && std::string(setting) == "1";
+    }();
+    return enabled() && value;
 }
 
 inline std::string escape(const std::string& value) {
@@ -173,11 +182,14 @@ struct Load {
     uint64_t start_ns = 0;
     std::vector<std::shared_ptr<Demand>> demands;
 
-    void set_origin(const Key& key, uint32_t expert, const char* kind) {
+    void set_origin(const Key& key, uint32_t expert, const char* kind,
+                    const std::optional<Key>& prefetch_source = {}) {
         {
             std::lock_guard<std::mutex> lock(mutex);
             if (origin.empty())
-                origin = key.fields() + "\texpert=" + std::to_string(expert) + "\torigin=" + kind;
+                origin = key.fields() + "\texpert=" + std::to_string(expert) + "\torigin=" + kind +
+                         "\tprefetch_source_layer=" + (prefetch_source ? std::to_string(prefetch_source->layer) : "NA") +
+                         "\tprefetch_source_layer_id=" + (prefetch_source ? escape(prefetch_source->name) : "NA");
         }
         flush();
     }
@@ -349,7 +361,7 @@ struct Step {
                 else if (inflight && found->load)
                     found->load->watch(demand);
             }
-            if (!first && found != snapshot.entries.end() && found->load)
+            if (!first && std::string(stage) != "after_pass_complete" && found != snapshot.entries.end() && found->load)
                 link(expert, found->load);
         }
         event(stage, "\twave=" + std::to_string(wave) + "\tpass=" + std::to_string(pass) +

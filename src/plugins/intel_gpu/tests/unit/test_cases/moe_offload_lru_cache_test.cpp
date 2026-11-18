@@ -36,10 +36,10 @@ cldnn::event::ptr make_lookahead_test_event() {
 
 TEST(moe_les_timeline, snapshots_cover_resident_ready_loading_and_generations) {
     using namespace ov::intel_gpu::ocl::moe::timeline;
-    const Selection sample("measured:2:1,128,255");
+    const Selection sample("measured:2:1,2,3,4,5,10,20,30,50,100,200,250,254,255");
     Key key{1, 2, 1, 4, 0, "layer", "measured", "2"};
     testing::internal::CaptureStderr();
-    for (const auto token : {1U, 128U, 255U}) {
+    for (const auto token : {1U, 2U, 3U, 4U, 5U, 10U, 20U, 30U, 50U, 100U, 200U, 250U, 254U, 255U}) {
         key.token = token;
         for (uint32_t layer = 0; layer < 40; ++layer) {
             key.layer = layer;
@@ -65,10 +65,10 @@ TEST(moe_les_timeline, snapshots_cover_resident_ready_loading_and_generations) {
         EXPECT_GT(sequence, previous_sequence);
         previous_sequence = sequence;
     }
-    EXPECT_EQ(steps, 120U);
-    EXPECT_EQ(demand_results, 960U);
+    EXPECT_EQ(steps, 560U);
+    EXPECT_EQ(demand_results, 4480U);
     testing::internal::CaptureStderr();
-    key.token = 2;
+    key.token = 128;
     EXPECT_FALSE(make_step(key, sample));
     key.token = 1;
     key.iteration = "1";
@@ -190,8 +190,10 @@ TEST(moe_les_timeline, ready_zero_pending_new_load_promotion_and_terminal_once) 
     foreign->identity = "\tcache=9\tslot=2\tload_gen=7";
     foreign->visible = false;
     const Key origin{1, 1, 256, 9, 5, "foreign", "measured", "1"};
+    const Key source{1, 1, 256, 9, 2, "actual-source\tmoe", "measured", "1"};
+    const std::string source_fields = "\tprefetch_source_layer=2\tprefetch_source_layer_id=actual-source%09moe";
     testing::internal::CaptureStderr();
-    foreign->set_origin(origin, 8, "speculative");
+    foreign->set_origin(origin, 8, "speculative", source);
     foreign->start(40);
     foreign->terminal("ready", 60);
     foreign->flush();
@@ -199,7 +201,7 @@ TEST(moe_les_timeline, ready_zero_pending_new_load_promotion_and_terminal_once) 
     Step selected({1, 2, 1, 10, 5, "selected", "measured", "2"});
     testing::internal::CaptureStderr();
     selected.observe("first_demand", {100, {{8, 2, 7, false, true, foreign}}, 9}, {8}, 0, 0, true);
-    foreign->set_origin(selected.key, 8, "demand");
+    foreign->set_origin(selected.key, 8, "demand", selected.key);
     auto late = std::make_shared<Demand>();
     late->context = selected.context;
     late->expert = 8;
@@ -221,7 +223,9 @@ TEST(moe_les_timeline, ready_zero_pending_new_load_promotion_and_terminal_once) 
     EXPECT_NE(dependency.find("\tobs_ns=60\t" + origin.fields()), std::string::npos);
     EXPECT_NE(dependency.find("demand_mark_ns=50\tweights_ready_ns=60\tlatency_ns=10"), std::string::npos);
     EXPECT_NE(dependency.find("demand_mark_ns=100\tweights_ready_ns=100\tlatency_ns=0"), std::string::npos);
-    EXPECT_EQ(foreign->origin, origin.fields() + "\texpert=8\torigin=speculative");
+    EXPECT_EQ(foreign->origin, origin.fields() + "\texpert=8\torigin=speculative" + source_fields);
+    EXPECT_NE(dependency.find(source_fields + "\tstage=load_start"), std::string::npos);
+    EXPECT_NE(dependency.find(source_fields + "\tstage=load_result"), std::string::npos);
 
     auto baseline = std::make_shared<Load>();
     baseline->identity = "\tcache=9\tslot=3\tload_gen=8";
@@ -243,6 +247,8 @@ TEST(moe_les_timeline, ready_zero_pending_new_load_promotion_and_terminal_once) 
     const auto additional = testing::internal::GetCapturedStderr();
     EXPECT_NE(additional.find("\tstage=load_result" + baseline->identity), std::string::npos);
     EXPECT_NE(additional.find("\tstage=load_result" + candidate->identity), std::string::npos);
+    EXPECT_NE(baseline->origin.find("\tprefetch_source_layer=NA\tprefetch_source_layer_id=NA"), std::string::npos);
+    EXPECT_NE(candidate->origin.find("\tprefetch_source_layer=NA\tprefetch_source_layer_id=NA"), std::string::npos);
     EXPECT_TRUE(candidate->demands.empty());
     EXPECT_EQ(selected.demands.size(), 1U);
 }

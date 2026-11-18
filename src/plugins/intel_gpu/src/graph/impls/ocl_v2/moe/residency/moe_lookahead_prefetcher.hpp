@@ -35,6 +35,7 @@ struct PrefetchTask {
     std::shared_ptr<moe_otd::PredictionReadback> readback;
     std::shared_ptr<timeline::Step> trace;
     timeline::Key trace_origin;
+    std::optional<timeline::Key> prefetch_source;
 };
 
 class ExpertPrefetcher {

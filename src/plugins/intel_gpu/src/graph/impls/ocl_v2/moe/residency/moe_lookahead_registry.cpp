@@ -228,7 +228,8 @@ void LookaheadContext::prefetch(const cldnn::primitive_inst* current_moe) {
     m_network.get_stream().flush();
     m_prefetcher->submit_prefetch({m_layer_indices.at(target), m_epoch,
                                   state.predicted_indices, state.prediction_ready, weights, state.consumed, state.readback,
-                                  state.trace, state.trace_origin});
+                                  state.trace, state.trace_origin,
+                                  timeline::enabled() ? std::make_optional(trace_key(current_moe->id())) : std::nullopt});
 }
 
 std::shared_ptr<LookaheadContext> LookaheadRegistry::acquire(cldnn::network& network) {

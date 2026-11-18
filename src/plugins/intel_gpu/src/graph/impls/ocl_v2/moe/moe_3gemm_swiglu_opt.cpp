@@ -1906,6 +1906,18 @@ public:
                     const size_t first_pair = wave * wave_capacity;
                     const size_t last_pair = std::min(pair_count, first_pair + wave_capacity);
                     std::vector<uint32_t> wave_experts(experts.begin() + first_pair, experts.begin() + last_pair);
+                    auto observe_complete = [&](size_t pass, const std::vector<size_t>& pairs, bool submitted) {
+                        if (!timeline || !moe::timeline::completion_enabled())
+                            return;
+                        std::vector<uint32_t> mask;
+                        for (auto pair : pairs)
+                            mask.push_back(wave_experts[pair]);
+                        const bool shared = pass == 1 && _has_shared_expert && wave == 0;
+                        if (submitted)
+                            provider->observe_pass_completion(ret_event, timeline, wave_experts, wave, pass, mask, shared);
+                        else
+                            moe::PassCompletionTracker::not_submitted(timeline, wave, pass);
+                    };
                     auto observe_pass = [&](size_t pass, const std::vector<size_t>& pairs) {
                         if (!timeline)
                             return;
@@ -2022,9 +2034,12 @@ public:
                             OV_ITT_SCOPED_TASK(ov::intel_gpu::itt::domains::intel_gpu_plugin,
                                                    openvino::itt::handle("LES[g.1]::enqueue_ready_pairs"));
                             ret_event = enqueue_pairs(dependencies, indices, ready_memory);
+                            observe_complete(1, partition->ready_pairs, true);
                         }
                         dependencies = {ret_event};
                         stream.flush();
+                    } else {
+                        observe_complete(1, {}, false);
                     }
                     auto copy_events = partition->wait_events;
                     if (demand_event) {
@@ -2044,7 +2059,10 @@ public:
                             OV_ITT_SCOPED_TASK(ov::intel_gpu::itt::domains::intel_gpu_plugin,
                                                openvino::itt::handle("LES[i]::enqueue_pending_pairs"));
                             ret_event = enqueue_pairs(dependencies, indices, pending_memory);
+                            observe_complete(2, pending_pairs, true);
                         }
+                    } else {
+                        observe_complete(2, {}, false);
                     }
                     {
                         OV_ITT_SCOPED_TASK(ov::intel_gpu::itt::domains::intel_gpu_plugin,

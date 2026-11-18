@@ -4,9 +4,11 @@
 
 #include "expert_weight_providers.hpp"
 
+#include <algorithm>
 #include <unordered_map>
 #include <utility>
 #include <chrono>
+#include <condition_variable>
 
 // moe_otd_runtime.hpp is not self-contained: it relies on cldnn graph/runtime
 // types (typed_primitive_inst, data_type_traits) being visible at include time.
@@ -15,8 +17,136 @@
 #include "moe_otd_runtime.hpp"
 #include "intel_gpu/runtime/les_context.hpp"
 #include "runtime/ocl/ocl_stream.hpp"
+#include "runtime/ocl/ocl_event.hpp"
 
 namespace ov::intel_gpu::ocl::moe {
+
+struct PassCompletionTracker::State {
+    struct Observation {
+        std::shared_ptr<timeline::Step> step;
+        std::string fields;
+        std::atomic<bool> terminal{false};
+
+        void error(int status, const char* reason, uint64_t entered) noexcept {
+            try {
+                step->event("pass_completion_error", fields + "\tcompletion_status=error\tcl_status=" +
+                    std::to_string(status) + "\treason=" + reason + "\tcallback_enter_ns=" +
+                    std::to_string(entered) + "\tevent_completion_ns=NA");
+            } catch (...) {
+                std::fputs("LES_TIMELINE_ERROR pass_completion_error emission_failed\n", stderr);
+            }
+        }
+    };
+    std::mutex mutex;
+    std::condition_variable cv;
+    size_t pending = 0;
+    std::vector<std::shared_ptr<Observation>> observations;
+};
+
+PassCompletionTracker::PassCompletionTracker() : _state(std::make_shared<State>()) {}
+
+void PassCompletionTracker::not_submitted(const std::shared_ptr<timeline::Step>& step, size_t wave, size_t pass) {
+    if (step && timeline::completion_enabled())
+        step->event("pass_not_submitted", "\twave=" + std::to_string(wave) +
+                    "\tpass=" + std::to_string(pass) + "\tsubmit=-\tshared=0");
+}
+
+PassCompletionTracker::~PassCompletionTracker() {
+    std::unique_lock<std::mutex> lock(_state->mutex);
+    if (!_state->cv.wait_for(lock, std::chrono::seconds(2), [&] { return _state->pending == 0; })) {
+        for (const auto& observation : _state->observations) {
+            if (!observation->terminal.exchange(true))
+                observation->error(CL_INVALID_OPERATION, "teardown_timeout", 0);
+        }
+    }
+}
+
+void PassCompletionTracker::observe(const std::shared_ptr<timeline::Step>& step, Snapshot snapshot,
+                                    std::vector<uint32_t> actual, size_t wave, size_t pass,
+                                    std::vector<uint32_t> submitted, bool shared, Subscribe subscribe) {
+    if (!step || !timeline::completion_enabled())
+        return;
+    auto observation = std::make_shared<State::Observation>();
+    observation->step = step;
+    observation->fields = "\twave=" + std::to_string(wave) + "\tpass=" + std::to_string(pass) +
+        "\tsubmit=" + timeline::ids(submitted) + "\tshared=" + std::to_string(shared);
+    auto state = _state;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->observations.push_back(observation);
+        ++state->pending;
+    }
+    auto callback = [state, observation, snapshot = std::move(snapshot), actual = std::move(actual), wave, pass]
+                    (int status) noexcept {
+        const auto entered = timeline::now_ns();
+        if (observation->terminal.exchange(true))
+            return;
+        try {
+            if (status != CL_COMPLETE) {
+                observation->error(status, "event_failed", entered);
+            } else {
+                auto observed = snapshot();
+                observation->step->observe("after_pass_complete", observed, actual, wave, pass, false,
+                    observation->fields.substr(observation->fields.find("\tsubmit=")) +
+                    "\tcompletion_status=complete\tcl_status=0\tcallback_enter_ns=" + std::to_string(entered) +
+                    "\tobservation_kind=completion_callback\tevent_completion_ns=NA");
+            }
+        } catch (...) {
+            observation->error(CL_INVALID_OPERATION, "callback_exception", entered);
+        }
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            --state->pending;
+            state->observations.erase(std::remove(state->observations.begin(), state->observations.end(), observation),
+                                      state->observations.end());
+        }
+        state->cv.notify_all();
+    };
+    int status = CL_SUCCESS;
+    const char* reason = "subscription_failed";
+    try {
+        status = subscribe(std::move(callback));
+    } catch (...) {
+        status = CL_INVALID_OPERATION;
+        reason = "subscription_exception";
+    }
+    if (status != CL_SUCCESS && !observation->terminal.exchange(true)) {
+        observation->error(status, reason, 0);
+        std::lock_guard<std::mutex> lock(state->mutex);
+        --state->pending;
+        state->observations.erase(std::remove(state->observations.begin(), state->observations.end(), observation),
+                      state->observations.end());
+        state->cv.notify_all();
+    }
+}
+
+void OffloadExpertWeightProvider::observe_pass_completion(
+        const cldnn::event::ptr& event, const std::shared_ptr<timeline::Step>& step,
+        const std::vector<uint32_t>& actual, size_t wave, size_t pass,
+        const std::vector<uint32_t>& submitted, bool shared) {
+    if (!step || !timeline::completion_enabled())
+        return;
+    _completion_tracker.observe(step, [cache = _cache] { return cache->snapshot(); }, actual, wave, pass,
+        submitted, shared, [event](PassCompletionTracker::Callback callback) {
+            auto native = std::dynamic_pointer_cast<cldnn::ocl::ocl_base_event>(event);
+            if (!native || !native->get().get())
+                return static_cast<int>(CL_INVALID_EVENT);
+            struct Payload {
+                cldnn::event::ptr event;
+                PassCompletionTracker::Callback callback;
+            };
+            auto payload = std::make_unique<Payload>(Payload{event, std::move(callback)});
+            auto* pointer = payload.release();
+            const auto result = clSetEventCallback(native->get().get(), CL_COMPLETE,
+                [](cl_event, cl_int status, void* data) noexcept {
+                    std::unique_ptr<Payload> owned(static_cast<Payload*>(data));
+                    owned->callback(status);
+                }, pointer);
+            if (result != CL_SUCCESS)
+                delete pointer;
+            return static_cast<int>(result);
+        });
+}
 
 std::optional<ExpertSlotLease> ResidentExpertWeightProvider::try_acquire_simultaneous(const std::vector<uint32_t>& experts, cldnn::stream& /*stream*/) {
     // Resident: identity mapping, always succeeds.

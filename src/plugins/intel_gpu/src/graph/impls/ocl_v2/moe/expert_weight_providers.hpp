@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <future>
 #include <memory>
 #include <string>
@@ -19,6 +20,22 @@
 #include "moe_otd_runtime.hpp"
 
 namespace ov::intel_gpu::ocl::moe {
+
+class PassCompletionTracker {
+public:
+    using Snapshot = std::function<timeline::Snapshot()>;
+    using Callback = std::function<void(int)>;
+    using Subscribe = std::function<int(Callback)>;
+    PassCompletionTracker();
+    ~PassCompletionTracker();
+    void observe(const std::shared_ptr<timeline::Step>& step, Snapshot snapshot,
+                 std::vector<uint32_t> actual, size_t wave, size_t pass,
+                 std::vector<uint32_t> submitted, bool shared, Subscribe subscribe);
+    static void not_submitted(const std::shared_ptr<timeline::Step>& step, size_t wave, size_t pass);
+private:
+    struct State;
+    std::shared_ptr<State> _state;
+};
 
 // Identity provider: every expert's weights are already resident in device memory
 // for the network lifetime. This is the behaviour of the non-offloaded (ratio=0) path.
@@ -96,6 +113,10 @@ public:
         return *_cache;
     }
 
+    void observe_pass_completion(const cldnn::event::ptr& event, const std::shared_ptr<timeline::Step>& step,
+                                 const std::vector<uint32_t>& actual, size_t wave, size_t pass,
+                                 const std::vector<uint32_t>& submitted, bool shared);
+
     moe_otd::ParallelWeightReader& weight_reader() {
         return _weight_reader;
     }
@@ -106,6 +127,7 @@ private:
     std::vector<size_t> _weight_bin_offsets;
     std::filesystem::path _weights_path;
     std::shared_ptr<LRUCache> _cache;
+    PassCompletionTracker _completion_tracker;
     moe_otd::ParallelWeightReader _weight_reader;
     cldnn::moe_weights* _resident = nullptr;
     bool _bound = false;

@@ -11,6 +11,7 @@
 #include <chrono>
 #include <fstream>
 #include <future>
+#include <thread>
 #include "intel_gpu/runtime/les_context.hpp"
 #include "runtime/ocl/ocl_engine.hpp"
 #include "runtime/ocl/ocl_stream.hpp"
@@ -23,6 +24,90 @@ using ov::intel_gpu::ocl::moe::ResidentExpertWeightProvider;
 
 namespace {
 namespace otd = ov::intel_gpu::ocl::moe_otd;
+
+TEST(moe_les_completion, once_lifetime_errors_and_no_wait) {
+    using namespace ov::intel_gpu::ocl::moe;
+    auto step = std::make_shared<timeline::Step>(timeline::Key{1, 2, 1, 4, 0, "completion", "measured", "2"});
+    std::weak_ptr<timeline::Step> lifetime = step;
+    auto cache = std::make_shared<LRUCache>(2);
+    cache->set_filled(cache->get_lru_item(1).first);
+    PassCompletionTracker::Callback complete;
+    size_t snapshots = 0;
+    testing::internal::CaptureStderr();
+    {
+        PassCompletionTracker tracker;
+        tracker.observe(step, [cache, &snapshots] { ++snapshots; return cache->snapshot(); },
+            {1, 2}, 0, 1, {1}, false, [&](auto callback) { complete = std::move(callback); return CL_SUCCESS; });
+        if (timeline::completion_enabled()) {
+            EXPECT_TRUE(complete);
+            EXPECT_EQ(snapshots, 0U);
+            step.reset();
+            EXPECT_FALSE(lifetime.expired());
+            complete(CL_COMPLETE);
+            complete(CL_COMPLETE);
+            EXPECT_EQ(snapshots, 1U);
+            auto selected = lifetime.lock();
+            tracker.observe(selected, []() -> timeline::Snapshot { throw std::runtime_error("snapshot"); },
+                {1}, 0, 2, {1}, false, [](auto callback) { callback(CL_COMPLETE); return CL_SUCCESS; });
+            tracker.observe(selected, [&] { ++snapshots; return cache->snapshot(); },
+                {1}, 1, 1, {1}, false, [](auto callback) { callback(-14); return CL_SUCCESS; });
+            tracker.observe(selected, [] { return timeline::Snapshot{}; },
+                {1}, 1, 2, {1}, false, [](auto) { return CL_INVALID_EVENT; });
+            tracker.observe(selected, [] { return timeline::Snapshot{}; }, {1}, 2, 1, {1}, false,
+                [](auto) -> int { throw std::runtime_error("subscription"); });
+            PassCompletionTracker::not_submitted(selected, 2, 2);
+            EXPECT_EQ(snapshots, 1U);
+            complete = {};
+            selected.reset();
+            ASSERT_TRUE(lifetime.expired());
+        } else {
+            EXPECT_FALSE(complete);
+            EXPECT_EQ(snapshots, 0U);
+            PassCompletionTracker::not_submitted(step, 0, 1);
+        }
+    }
+    complete = {};
+    const auto output = testing::internal::GetCapturedStderr();
+    if (timeline::completion_enabled()) {
+        EXPECT_TRUE(lifetime.expired());
+        EXPECT_NE(output.find("\tstage=after_pass_complete\t"), std::string::npos);
+        EXPECT_NE(output.find("\tsubmit=1\tshared=0\tcompletion_status=complete\tcl_status=0"), std::string::npos);
+        EXPECT_NE(output.find("\tobservation_kind=completion_callback\tevent_completion_ns=NA"), std::string::npos);
+        for (const auto* reason : {"callback_exception", "event_failed", "subscription_failed", "subscription_exception"})
+            EXPECT_NE(output.find(std::string("\treason=") + reason), std::string::npos);
+        EXPECT_NE(output.find("\tstage=pass_not_submitted\twave=2\tpass=2\tsubmit=-\tshared=0"), std::string::npos);
+        const auto snapshot_time = std::stoull(output.substr(output.find("\tobs_ns=") + 8));
+        const auto callback_time = std::stoull(output.substr(output.find("\tcallback_enter_ns=") + 19));
+        EXPECT_GE(snapshot_time, callback_time);
+        EXPECT_EQ(output.find("\tstage=after_pass_complete\t", output.find("\tstage=after_pass_complete\t") + 1), std::string::npos);
+    } else {
+        EXPECT_TRUE(output.empty());
+    }
+}
+
+TEST(moe_les_completion, sample_gate_all_labels) {
+    using namespace ov::intel_gpu::ocl::moe;
+    const timeline::Selection sample("measured:2:1,2,3,4,5,10,20,30,50,100,200,250,254,255");
+    size_t subscribed = 0;
+    testing::internal::CaptureStderr();
+    {
+        PassCompletionTracker tracker;
+        for (const auto* phase : {"unlabeled", "warmup", "measured"}) {
+            for (const auto* iteration : {"NA", "0", "1", "2"}) {
+                for (uint64_t token = 1; token <= 256; ++token) {
+                    for (uint32_t layer = 0; layer < 40; ++layer) {
+                        auto step = timeline::make_step({1, 2, token, 4, layer, "sample", phase, iteration}, sample);
+                        tracker.observe(step, [] { timeline::Snapshot value; value.stamp_ns = timeline::now_ns(); return value; },
+                            {}, 0, 1, {}, true, [&](auto callback) { ++subscribed; callback(CL_COMPLETE); return CL_SUCCESS; });
+                    }
+                }
+            }
+        }
+    }
+    const auto output = testing::internal::GetCapturedStderr();
+    EXPECT_EQ(subscribed, timeline::completion_enabled() ? 560U : 0U);
+    EXPECT_EQ(output.empty(), !timeline::completion_enabled());
+}
 
 class moe_les_upload : public ::testing::Test {
 protected:
@@ -56,6 +141,52 @@ protected:
             {static_cast<int>(experts), 1, 1, static_cast<int>(count)}});
     }
 };
+
+TEST_F(moe_les_upload, completion_native_ready_late_and_failed_events) {
+    using namespace ov::intel_gpu::ocl::moe;
+    MOECompressed::Config config{};
+    auto provider = std::make_unique<OffloadExpertWeightProvider>(2, config, std::vector<size_t>{}, path);
+    provider->cache().set_filled(provider->cache().get_lru_item(1).first);
+    auto step = std::make_shared<timeline::Step>(timeline::Key{1, 2, 1, 4, 0, "native", "measured", "2"});
+    auto& context = dynamic_cast<cldnn::ocl::ocl_engine&>(get_test_engine()).get_cl_context();
+    cl::UserEvent controlled(context);
+    cl::UserEvent late(context);
+    cl::UserEvent failed(context);
+    auto ready = std::make_shared<cldnn::ocl::ocl_event>(controlled);
+    testing::internal::CaptureStderr();
+    if (timeline::completion_enabled())
+        step->observe("before_pass_submit", provider->cache().snapshot(), {1, 2}, 0, 1, false,
+                      "\tsubmit=1\tshared=0");
+    provider->observe_pass_completion(ready, step, {1, 2}, 0, 1, {1}, false);
+    auto pending = provider->cache().reserve_speculative(2, 1, [&] { return ready; });
+    EXPECT_TRUE(pending);
+    if (pending) {
+        EXPECT_TRUE(provider->cache().complete_load(*pending));
+    }
+    if (timeline::completion_enabled())
+        step->observe("before_pass_submit", provider->cache().snapshot(), {1, 2}, 0, 2, false,
+                      "\tsubmit=2\tshared=0");
+    EXPECT_EQ(clSetUserEventStatus(controlled.get(), CL_COMPLETE), CL_SUCCESS);
+    EXPECT_EQ(clSetUserEventStatus(late.get(), CL_COMPLETE), CL_SUCCESS);
+    provider->observe_pass_completion(std::make_shared<cldnn::ocl::ocl_event>(late), step, {1, 2}, 0, 2, {2}, false);
+    provider->observe_pass_completion(std::make_shared<cldnn::ocl::ocl_event>(failed), step, {1, 2}, 1, 1, {1}, false);
+    EXPECT_EQ(clSetUserEventStatus(failed.get(), -14), CL_SUCCESS);
+    provider->observe_pass_completion({}, step, {1}, 1, 2, {1}, false);
+    provider.reset();
+    const auto output = testing::internal::GetCapturedStderr();
+    if (timeline::completion_enabled()) {
+        EXPECT_LT(output.find("\tstage=before_pass_submit\twave=0\tpass=2"),
+                  output.find("\tstage=after_pass_complete\twave=0\tpass=1"));
+        EXPECT_NE(output.find("\tstage=after_pass_complete\twave=0\tpass=1\tactual=1,2\tdemand_ready=1,2"), std::string::npos);
+        EXPECT_NE(output.find("\tstage=after_pass_complete\twave=0\tpass=2"), std::string::npos);
+        EXPECT_NE(output.find("\tcl_status=-14\treason=event_failed"), std::string::npos);
+        EXPECT_NE(output.find("\tcl_status=-58\treason=subscription_failed"), std::string::npos);
+        EXPECT_EQ(output.find("teardown_timeout"), std::string::npos);
+        std::fwrite(output.data(), 1, output.size(), stderr);
+    } else {
+        EXPECT_EQ(output.find("after_pass_complete"), std::string::npos);
+    }
+}
 
 TEST_F(moe_les_upload, packed_zero_point_transpose_handles_odd_dimensions) {
     MOECompressed::Config config{};
@@ -307,9 +438,27 @@ TEST_F(moe_les_upload, native_lookahead_router_keeps_actual_outputs_independent)
     auto consumed = std::make_shared<std::atomic<bool>>(false);
     ov::intel_gpu::ocl::moe::PrefetchTask task{1, 1, prediction.indices, prediction.ready, provider, consumed};
     ASSERT_FALSE(task.trace);
+    task.trace_origin = {17, 18, 1, 1, 1, "target-moe", "measured", "2"};
+    task.prefetch_source = ov::intel_gpu::ocl::moe::timeline::Key{17, 18, 1, 1, 0, "current-moe", "measured", "2"};
+    const auto expected_origin = task.trace_origin.fields() + "\texpert=5\torigin=speculative" +
+        "\tprefetch_source_layer=0\tprefetch_source_layer_id=current-moe";
     prefetcher.submit_prefetch(task);
+    task.prefetch_source->layer = 99;
+    task.prefetch_source->name = "changed-after-submit";
     prefetcher.drain();
     EXPECT_TRUE(consumed->load(std::memory_order_acquire));
+    if (ov::intel_gpu::ocl::moe::timeline::enabled()) {
+        const auto snapshot = provider->cache().snapshot();
+        const auto entry = std::find_if(snapshot.entries.begin(), snapshot.entries.end(),
+            [](const auto& value) { return value.expert == 5; });
+        ASSERT_NE(entry, snapshot.entries.end());
+        ASSERT_TRUE(entry->load);
+        EXPECT_EQ(entry->load->origin, expected_origin);
+        prefetcher.promote(*provider, {5});
+        entry->load->set_origin({17, 19, 2, 2, 1, "later-target", "measured", "3"}, 5, "demand");
+        EXPECT_EQ(entry->load->origin, expected_origin);
+        entry->load->expose();
+    }
     auto predicted = provider->cache().partition_3way({5}, [&] { return prefetcher.make_ready_event(); });
     ASSERT_TRUE(predicted);
     EXPECT_EQ(predicted->ready_pairs, std::vector<size_t>{0});
@@ -319,6 +468,78 @@ TEST_F(moe_les_upload, native_lookahead_router_keeps_actual_outputs_independent)
     EXPECT_EQ(uploaded, std::vector<uint8_t>(16, 11));
     actual.get_primitive("router")->output_memory_ptr(1)->copy_to(compute, &actual_id, true);
     EXPECT_EQ(actual_id, 2U);
+}
+
+TEST_F(moe_les_upload, promoted_pending_job_preserves_caller_source_and_target) {
+    using namespace ov::intel_gpu::ocl::moe;
+    write(std::vector<uint8_t>(32, 11));
+    MOECompressed::Config config{};
+    config.num_expert = 2;
+    config.top_k = 1;
+    auto provider = std::make_shared<OffloadExpertWeightProvider>(1, config, std::vector<size_t>(9), path);
+    moe_weights weights;
+    weights.gate_w = buffer(16, data_types::u8, 2);
+    provider->bind(weights);
+    auto compute = lane();
+    ASSERT_TRUE(provider->try_acquire_simultaneous({0}, *compute));
+    provider->release();
+    ExpertPrefetcher prefetcher(get_test_engine(), get_test_default_config(get_test_engine()));
+    prefetcher.bind(provider);
+    prefetcher.advance(1, 0);
+    ASSERT_TRUE(provider->cache().partition_3way({0}, [&] { return prefetcher.make_ready_event(); }));
+    cl::UserEvent gate(dynamic_cast<cldnn::ocl::ocl_engine&>(get_test_engine()).get_cl_context());
+    provider->cache().unpin_all(std::make_shared<cldnn::ocl::ocl_event>(gate));
+    auto indices = get_test_engine().allocate_memory(
+        layout{data_types::i32, format::bfyx, {1, 1, 1, 1}}, allocation_type::usm_host, false);
+    const uint32_t expert = 1;
+    indices->copy_from(*compute, &expert, true);
+    auto ready = compute->enqueue_marker({}, true);
+    compute->flush();
+    const timeline::Key target{21, 22, 1, 1, 1, "promotion-target", "measured", "2"};
+    const timeline::Key source{21, 22, 1, 1, 0, "promotion-source", "measured", "2"};
+    PrefetchTask task{1, 1, indices, ready, provider, std::make_shared<std::atomic<bool>>(false)};
+    task.trace_origin = target;
+    task.prefetch_source = source;
+    prefetcher.submit_prefetch(task);
+    task.prefetch_source = target;
+    auto later = std::make_shared<timeline::Step>(timeline::Key{21, 23, 2, 2, 1, "later", "measured", "3"});
+    auto demand = std::make_shared<timeline::Demand>();
+    demand->context = later->context;
+    demand->expert = expert;
+    demand->mark_ns = timeline::now_ns();
+    later->demands.push_back(demand);
+    std::shared_ptr<timeline::Load> observed;
+    bool promoted = false;
+    if (timeline::enabled()) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!promoted && std::chrono::steady_clock::now() < deadline) {
+            prefetcher.promote(*provider, {expert}, later);
+            const auto snapshot = provider->cache().snapshot();
+            for (const auto& entry : snapshot.entries) {
+                if (entry.expert == expert && entry.loading && entry.load) {
+                    std::lock_guard<std::mutex> lock(entry.load->mutex);
+                    if (!entry.load->demands.empty()) {
+                        observed = entry.load;
+                        promoted = true;
+                    }
+                }
+            }
+            std::this_thread::yield();
+        }
+    } else {
+        prefetcher.promote(*provider, {expert});
+    }
+    gate.setStatus(CL_COMPLETE);
+    EXPECT_NO_THROW(prefetcher.drain());
+    if (timeline::enabled()) {
+        ASSERT_TRUE(promoted);
+        ASSERT_TRUE(observed);
+        EXPECT_EQ(observed->origin, target.fields() + "\texpert=1\torigin=speculative" +
+            "\tprefetch_source_layer=0\tprefetch_source_layer_id=promotion-source");
+        EXPECT_EQ(observed->status, "ready");
+    } else {
+        demand->reported = true;
+    }
 }
 
 TEST_F(moe_les_upload, lookahead_registry_shares_without_owning_context) {
