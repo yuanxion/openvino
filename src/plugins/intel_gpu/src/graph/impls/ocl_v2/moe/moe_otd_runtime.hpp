@@ -159,6 +159,7 @@ std::vector<cldnn::event::ptr> fill_weights_memory_async(cldnn::stream& transfer
                                                       const std::vector<uint32_t>& experts,
                                                       const std::vector<size_t>& slots,
                                                       uint64_t* uploaded_bytes = nullptr,
-                                                      LookaheadStagingPool* staging_pool = nullptr);
+                                                      LookaheadStagingPool* staging_pool = nullptr,
+                                                      const std::string& log_layer = "unbound");
 
 }  // namespace ov::intel_gpu::ocl::moe_otd

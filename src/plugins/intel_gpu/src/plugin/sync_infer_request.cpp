@@ -35,6 +35,8 @@
 #include "openvino/core/preprocess/input_tensor_info.hpp"
 #include "openvino/core/validation_util.hpp"
 #include "openvino/runtime/make_tensor.hpp"
+#include "../graph/impls/ocl_v2/moe/residency/moe_lookahead_registry.hpp"
+#include <cstdlib>
 
 namespace {
 
@@ -695,6 +697,11 @@ void SyncInferRequest::wait() {
     }
 
     network.reset_output_remote_memory_ptrs();
+
+    if (std::getenv("LOG_BASELINE_CSV_PATH") && !network.get_program()->get_les_router_links().empty()) {
+        if (auto context = ov::intel_gpu::ocl::moe::LookaheadRegistry::acquire(network))
+            context->capture_cache_baseline();
+    }
 
     // finally collect profiling info
     if (m_enable_profiling) {

@@ -1,6 +1,11 @@
 #include "impls/ocl_v2/primitive_ocl_base.hpp"
 #include "moe_lookahead_registry.hpp"
+#include <chrono>
+#include <cstdlib>
+#include <fstream>
 #include <limits>
+#include <set>
+#include <sstream>
 
 namespace ov::intel_gpu::ocl::moe {
 
@@ -20,10 +25,276 @@ LookaheadContext::~LookaheadContext() {
 }
 
 void LookaheadContext::pause_for_prefill() {
+    // MOE_LES_LOG("network:" + std::to_string(m_network.get_id()), "event=prefill_pause_begin epoch=" << m_epoch);
     m_compute_stream->flush();
     m_prefetcher->advance(++m_epoch, std::numeric_limits<uint32_t>::max());
     m_prefetcher->drain();
     m_cursor.reset();
+    // MOE_LES_LOG("network:" + std::to_string(m_network.get_id()), "event=prefill_pause_end epoch=" << m_epoch);
+}
+
+void LookaheadContext::capture_cache_baseline() {
+    const char* path = std::getenv("LOG_BASELINE_CSV_PATH");
+    if (!path || !*path || m_providers.empty())
+        return;
+    const char* context = std::getenv("LOG_REQUEST_CONTEXT");
+    const char* selection = std::getenv("LOG_REQUEST");
+    OPENVINO_ASSERT(context && *context, "LES baseline requires request labels");
+    if (selection && *selection && std::string(selection) != context)
+        return;
+    const char* run = std::getenv("LOG_RUN_ID");
+    OPENVINO_ASSERT(run && *run && std::getenv("LOG_TOKEN_ID"), "LES baseline requires LOG_RUN_ID and LOG_TOKEN_ID");
+    OPENVINO_ASSERT(m_providers.size() == m_layers.size(), "LES baseline requires all layer providers");
+    if (m_baseline_request != context) {
+        m_baseline_request = context;
+        m_baseline_completed = 0;
+        m_cache_baselines.clear();
+        m_prefill_baselines.clear();
+    } else {
+        ++m_baseline_completed;
+    }
+    for (const auto& layer : m_layers) {
+        const auto& id = layer.moe_inst->id();
+        auto ready = m_providers.at(id)->cache().resident_experts();
+        const auto now = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        m_cache_baselines[id] = {m_baseline_completed, now, std::move(ready)};
+    }
+    if (m_baseline_completed == 0)
+        m_prefill_baselines = m_cache_baselines;
+    static std::mutex csv_mutex;
+    std::lock_guard<std::mutex> lock(csv_mutex);
+    static std::ofstream csv(path);
+    OPENVINO_ASSERT(csv.is_open(), "Cannot open LOG_BASELINE_CSV_PATH");
+    if (csv.tellp() == std::streampos(0)) {
+        csv << "\xEF\xBB\xBF"
+            << "运行标识,请求标识,完成decode编号,阶段,层ID,快照时间戳(微秒),ready专家ids,ready专家个数\n";
+    }
+    const auto text = [&](const std::string& value) {
+        csv << '"';
+        for (const char character : value) {
+            if (character == '"')
+                csv << '"';
+            csv << character;
+        }
+        csv << '"';
+    };
+    for (const auto& layer : m_layers) {
+        const auto& id = layer.moe_inst->id();
+        const auto& snapshot = m_cache_baselines.at(id);
+        text(run); csv << ',';
+        text(m_baseline_request); csv << ',' << snapshot.completed_token << ',';
+        csv << (snapshot.completed_token == 0 ? "prefill" : "decode") << ',';
+        text(id); csv << ',' << snapshot.time_us << ",\"[";
+        for (size_t index = 0; index < snapshot.ready.size(); ++index) {
+            if (index)
+                csv << ',';
+            csv << snapshot.ready[index];
+        }
+        csv << "]\"," << snapshot.ready.size() << '\n';
+    }
+    csv.flush();
+    OPENVINO_ASSERT(csv.good(), "Cannot write LOG_BASELINE_CSV_PATH");
+}
+
+LookaheadContext::CacheSnapshot LookaheadContext::cache_baseline(const cldnn::primitive_id& id,
+                                                               const std::string& request,
+                                                               size_t decode_token,
+                                                               bool prefill) const {
+    OPENVINO_ASSERT(request == m_baseline_request && m_baseline_completed + 1 == decode_token,
+                    "LES baseline request/token mismatch");
+    const auto& snapshots = prefill ? m_prefill_baselines : m_cache_baselines;
+    OPENVINO_ASSERT(snapshots.count(id), "Missing LES cache baseline for ", id);
+    return snapshots.at(id);
+}
+
+void LookaheadContext::begin_handoff(const cldnn::primitive_id& source, size_t token, bool selected) {
+    // MOE_LES_LOG(source, "event=handoff_begin decode=" << token << " selected=" << selected);
+    const char* path = std::getenv("LOG_HANDOFF_CSV_PATH");
+    if (!path || !*path || !selected)
+        return;
+    OPENVINO_ASSERT(token > 0 && std::getenv("LOG_RUN_ID"), "LES handoff requires token selection and LOG_RUN_ID");
+    const auto index = m_layer_indices.at(source);
+    if (index == 0)
+        OPENVINO_ASSERT(m_handoffs.empty(), "Unfinished LES handoff from previous token");
+    if (index + 1 == m_layers.size())
+        return;
+    const auto& target = m_layers[index + 1].moe_inst->id();
+    OPENVINO_ASSERT(!m_handoffs.count(target), "Duplicate LES handoff");
+    m_providers.at(target)->cache().begin_trace();
+    m_handoffs.emplace(target, Handoff{source, token});
+}
+
+void LookaheadContext::checkpoint_handoff(const cldnn::primitive_id& source) {
+    const auto index = m_layer_indices.at(source);
+    if (index + 1 == m_layers.size())
+        return;
+    const auto& target = m_layers[index + 1].moe_inst->id();
+    auto found = m_handoffs.find(target);
+    if (found != m_handoffs.end()) {
+        const auto checkpoint = m_providers.at(target)->cache().trace_checkpoint();
+        found->second.checkpoint_events = checkpoint.first;
+        found->second.checkpoint_us = checkpoint.second;
+    }
+}
+
+void LookaheadContext::finish_handoff(const cldnn::primitive_id& target,
+                                    size_t token,
+                                    const std::vector<uint32_t>& actual) {
+    MOE_LES_LOG(target, "event=handoff_finish decode=" << token << " actual=" << les_ids(actual));
+    const char* path = std::getenv("LOG_HANDOFF_CSV_PATH");
+    if (!path || !*path)
+        return;
+    const auto index = m_layer_indices.at(target);
+    LRUCache::Trace trace;
+    Handoff handoff;
+    if (index == 0) {
+        trace = m_providers.at(target)->cache().snapshot();
+    } else {
+        auto found = m_handoffs.find(target);
+        OPENVINO_ASSERT(found != m_handoffs.end() && found->second.token == token, "LES handoff token mismatch");
+        handoff = found->second;
+        OPENVINO_ASSERT(handoff.checkpoint_us != 0, "LES handoff source checkpoint missing");
+        trace = m_providers.at(target)->cache().end_trace();
+        m_handoffs.erase(found);
+        std::set<size_t> reconstructed(trace.original.begin(), trace.original.end());
+        for (const auto& event : trace.events) {
+            if (event.kind == 'P' || event.kind == 'I' || event.kind == 'D')
+                reconstructed.insert(event.expert);
+            else if (event.kind == 'E' || event.kind == 'X')
+                reconstructed.erase(event.expert);
+        }
+        OPENVINO_ASSERT(reconstructed == std::set<size_t>(trace.current.begin(), trace.current.end()),
+                        "LES handoff event replay differs from actual ready cache");
+    }
+    const auto collect = [&](char kind, size_t limit) {
+        std::vector<size_t> result;
+        for (size_t event_index = 0; event_index < limit; ++event_index) {
+            const auto& event = trace.events[event_index];
+            if (event.kind == kind && std::find(result.begin(), result.end(), event.expert) == result.end())
+                result.push_back(event.expert);
+        }
+        return result;
+    };
+    OPENVINO_ASSERT(handoff.checkpoint_events <= trace.events.size(), "Invalid handoff checkpoint");
+    std::vector<size_t> hits;
+    for (const auto expert : actual) {
+        if (std::find(trace.current.begin(), trace.current.end(), expert) != trace.current.end())
+            hits.push_back(expert);
+    }
+    std::vector<size_t> predicted;
+    size_t recall = 0;
+    const bool prediction_observed = handoff.predicted_indices != nullptr;
+    if (prediction_observed) {
+        OPENVINO_ASSERT(handoff.predicted_indices->get_allocation_type() == cldnn::allocation_type::usm_host &&
+                            handoff.predicted_indices->count() == actual.size(),
+                        "Invalid handoff prediction buffer");
+        cldnn::mem_lock<uint32_t, cldnn::mem_lock_type::read> indices(handoff.predicted_indices, *m_compute_stream);
+        predicted.assign(indices.data(), indices.data() + actual.size());
+        for (const auto expert : actual) {
+            if (std::find(predicted.begin(), predicted.end(), expert) != predicted.end())
+                ++recall;
+        }
+    }
+    static std::mutex csv_mutex;
+    std::lock_guard<std::mutex> lock(csv_mutex);
+    static std::ofstream csv(path);
+    OPENVINO_ASSERT(csv.is_open(), "Cannot open LOG_HANDOFF_CSV_PATH");
+    if (csv.tellp() == std::streampos(0)) {
+        csv << "\xEF\xBB\xBF"
+            << "运行标识,请求标识,Token编号,源层ID,目标层ID,边界,跟踪开始时间戳(微秒),"
+            << "预取提交时间戳(微秒),源层CPU提交结束时间戳(微秒),目标层readback时间戳(微秒),"
+            << "1-原始ready专家ids,1-原始ready专家个数,"
+            << "2-源层结束前prefetched专家ids,2-源层结束前prefetched专家个数,"
+            << "3-源层结束前驱逐的专家ids,3-源层结束前驱逐的专家个数,"
+            << "4-到层已完成prefetched专家ids,4-到层已完成prefetched专家个数,"
+            << "5-到层累计驱逐的专家ids,5-到层累计驱逐的专家个数,"
+            << "6-到层直接查询ready专家ids,6-到层直接查询ready专家个数,"
+            << "7-到层hit专家ids,7-到层hit专家个数,"
+            << "继承在途完成的专家ids,继承在途完成的专家个数,"
+            << "需求加载完成的专家ids,需求加载完成的专家个数,"
+            << "取消的专家ids,取消的专家个数,真实topk专家ids,有序缓存事件,事件重放一致,"
+            << "源层预测专家ids,源层预测专家个数,预测recall个数,"
+            << "起点pending专家ids,起点pending专家个数,起点搬运中专家ids,起点搬运中专家个数,"
+            << "到层pending专家ids,到层pending专家个数,到层搬运中专家ids,到层搬运中专家个数\n";
+    }
+    const auto text = [&](const std::string& value) {
+        csv << '"';
+        for (const char character : value) {
+            if (character == '"')
+                csv << '"';
+            csv << character;
+        }
+        csv << '"';
+    };
+    const auto ids = [&](const std::vector<size_t>& experts, bool observed = true) {
+        if (!observed) {
+            csv << "NA,NA";
+            return;
+        }
+        csv << "\"[";
+        for (size_t expert_index = 0; expert_index < experts.size(); ++expert_index) {
+            if (expert_index)
+                csv << ',';
+            csv << experts[expert_index];
+        }
+        csv << "]\"," << experts.size();
+    };
+    const char* request = std::getenv("LOG_REQUEST_CONTEXT");
+    const char* run = std::getenv("LOG_RUN_ID");
+    OPENVINO_ASSERT(request && run, "LES handoff requires request/run labels");
+    text(run); csv << ','; text(request); csv << ',' << token << ',';
+    text(index == 0 ? "NA" : handoff.source); csv << ','; text(target); csv << ',';
+    csv << (index == 0 ? "first_no_source" : (index + 1 == m_layers.size() ? "last_no_next" : "normal")) << ',';
+    if (index == 0)
+        csv << "NA,NA,NA,";
+    else {
+        csv << trace.start_us << ',';
+        if (handoff.prefetch_us)
+            csv << handoff.prefetch_us;
+        else
+            csv << "NA";
+        csv << ',' << handoff.checkpoint_us << ',';
+    }
+    csv << trace.end_us << ',';
+    ids(trace.original, index != 0); csv << ',';
+    ids(collect('P', handoff.checkpoint_events), index != 0); csv << ',';
+    ids(collect('E', handoff.checkpoint_events), index != 0); csv << ',';
+    ids(collect('P', trace.events.size()), index != 0); csv << ',';
+    ids(collect('E', trace.events.size()), index != 0); csv << ',';
+    ids(trace.current); csv << ','; ids(hits); csv << ',';
+    ids(collect('I', trace.events.size()), index != 0); csv << ',';
+    ids(collect('D', trace.events.size()), index != 0); csv << ',';
+    ids(collect('X', trace.events.size()), index != 0); csv << ',';
+    std::ostringstream actual_text;
+    actual_text << '[';
+    for (size_t expert_index = 0; expert_index < actual.size(); ++expert_index) {
+        if (expert_index)
+            actual_text << ',';
+        actual_text << actual[expert_index];
+    }
+    actual_text << ']'; text(actual_text.str()); csv << ',';
+    std::ostringstream events;
+    events << '[';
+    for (size_t event_index = 0; event_index < trace.events.size(); ++event_index) {
+        if (event_index)
+            events << ',';
+        const auto& event = trace.events[event_index];
+        events << '[' << event_index + 1 << ',' << event.time_us << ",\"" << event.kind << "\"," << event.expert << ']';
+    }
+    events << ']'; text(events.str()); csv << (index == 0 ? ",NA," : ",true,");
+    ids(predicted, prediction_observed); csv << ',';
+    if (prediction_observed)
+        csv << recall;
+    else
+        csv << "NA";
+    csv << ','; ids(trace.original_pending, index != 0);
+    csv << ','; ids(trace.original_copying, index != 0);
+    csv << ','; ids(trace.current_pending);
+    csv << ','; ids(trace.current_copying);
+    csv << '\n';
+    csv.flush();
+    OPENVINO_ASSERT(csv.good(), "Cannot write LOG_HANDOFF_CSV_PATH");
 }
 
 void LookaheadContext::build_once(cldnn::network& network) {
@@ -72,6 +343,7 @@ const LookaheadLayerDesc* LookaheadContext::get_next_layer(const cldnn::primitiv
 }
 
 void LookaheadContext::enter(const cldnn::primitive_id& id) {
+    // MOE_LES_LOG(id, "event=lookahead_enter epoch=" << m_epoch);
     m_prefetcher->rethrow_if_failed();
     auto found = m_layer_indices.find(id);
     if (found == m_layer_indices.end()) {
@@ -85,6 +357,7 @@ void LookaheadContext::enter(const cldnn::primitive_id& id) {
 }
 
 void LookaheadContext::demand_partitioned(const cldnn::primitive_id& id) {
+    // MOE_LES_LOG(id, "event=lookahead_demand_partitioned epoch=" << m_epoch);
     auto found = m_layer_indices.find(id);
     if (found != m_layer_indices.end()) {
         m_prefetcher->advance(m_epoch, found->second);
@@ -99,6 +372,8 @@ std::shared_ptr<IExpertWeightProvider> LookaheadContext::bind(const cldnn::primi
     }
     auto offload = std::dynamic_pointer_cast<OffloadExpertWeightProvider>(provider);
     if (offload) {
+        offload->cache().set_log_layer(id);
+        // MOE_LES_LOG(id, "event=provider_bind provider=" << offload.get());
         m_prefetcher->bind(offload);
         m_providers[id] = std::move(offload);
     }
@@ -114,32 +389,52 @@ void LookaheadContext::predict(const LookaheadLayerDesc& next_layer,
     const auto& target = next_layer.moe_inst->id();
     auto& state = m_predictions[target];
     if (state.consumed && !state.consumed->load(std::memory_order_acquire)) {
+        // MOE_LES_LOG(target, "event=prediction_skip reason=previous_not_consumed epoch=" << m_epoch);
         return;
     }
+    // MOE_LES_LOG(target, "event=router_prediction_submit_begin hidden=" << hidden.get() << " dependency=" << ready.get()
+    //             << " epoch=" << m_epoch);
     auto result = m_routers.at(target)->enqueue(hidden, ready);
+    // MOE_LES_LOG(target, "event=router_prediction_submit_end indices=" << result.indices.get()
+    //             << " completion=" << result.ready.get() << " epoch=" << m_epoch);
     state = {hidden, ready, result.indices, result.weights, result.ready,
              std::make_shared<std::atomic<bool>>(true), false, result.cpu_indices};
+    auto handoff = m_handoffs.find(target);
+    if (handoff != m_handoffs.end())
+        handoff->second.predicted_indices = result.indices;
 }
 
 void LookaheadContext::prefetch(const cldnn::primitive_inst* current_moe) {
     const auto* next_layer = get_next_layer(current_moe);
     if (!next_layer) {
+        // MOE_LES_LOG(current_moe->id(), "event=prefetch_skip reason=no_next_layer epoch=" << m_epoch);
         return;
     }
     const auto& target = next_layer->moe_inst->id();
     auto& state = m_predictions[target];
     auto provider = m_providers.find(target);
     if (state.submitted || !state.prediction_ready || provider == m_providers.end()) {
+        // MOE_LES_LOG(current_moe->id(), "event=prefetch_skip target=" << target << " submitted=" << state.submitted
+        //         << " has_prediction=" << static_cast<bool>(state.prediction_ready)
+        //         << " has_provider=" << (provider != m_providers.end()));
         return;
     }
     auto weights = provider->second;
     const auto& link = m_links.at(m_source_links.at(current_moe->id()));
     if (!weights || weights->resident_capacity() <= link.top_k) {
+        // MOE_LES_LOG(current_moe->id(), "event=prefetch_skip reason=capacity target=" << target);
         return;
     }
     state.submitted = true;
     state.consumed->store(false, std::memory_order_release);
     m_network.get_stream().flush();
+    auto handoff = m_handoffs.find(target);
+    if (handoff != m_handoffs.end()) {
+        handoff->second.prefetch_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    MOE_LES_LOG(current_moe->id(), "event=prefetch_queue_submit target=" << target << " epoch=" << m_epoch
+                << " prediction=" << state.predicted_indices.get() << " dependency=" << state.prediction_ready.get());
     m_prefetcher->submit_prefetch({m_layer_indices.at(target), m_epoch,
                                   state.predicted_indices, state.prediction_ready, weights, state.consumed, state.cpu_indices});
 }

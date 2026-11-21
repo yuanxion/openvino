@@ -6,6 +6,7 @@
 
 #include <mutex>
 #include <atomic>
+#include <optional>
 #include <unordered_map>
 
 #include "lookahead_router.hpp"
@@ -25,6 +26,12 @@ struct LookaheadLayerDesc {
 
 class LookaheadContext {
 public:
+    struct CacheSnapshot {
+        size_t completed_token = 0;
+        int64_t time_us = 0;
+        std::vector<size_t> ready;
+    };
+
     struct Prediction {
         cldnn::memory::ptr hidden;
         cldnn::event::ptr hidden_ready;
@@ -47,8 +54,29 @@ public:
     void enter(const cldnn::primitive_id& id);
     void demand_partitioned(const cldnn::primitive_id& id);
     void pause_for_prefill();
+    void capture_cache_baseline();
+    void begin_handoff(const cldnn::primitive_id& source, size_t token, bool selected);
+    void checkpoint_handoff(const cldnn::primitive_id& source);
+    void finish_handoff(const cldnn::primitive_id& target, size_t token, const std::vector<uint32_t>& actual);
+    CacheSnapshot cache_baseline(const cldnn::primitive_id& id,
+                                 const std::string& request,
+                                 size_t decode_token,
+                                 bool prefill = false) const;
     std::shared_ptr<IExpertWeightProvider> bind(const cldnn::primitive_id& id,
                                                std::shared_ptr<IExpertWeightProvider> provider);
+
+    std::optional<LRUCache::Trace> cache_snapshot(const cldnn::primitive_id& id) const {
+        const auto found = m_providers.find(id);
+        if (found == m_providers.end() || !found->second)
+            return std::nullopt;
+        return found->second->cache().snapshot();
+    }
+
+    void set_cache_log_window(const cldnn::primitive_id& id, bool enabled) {
+        const auto found = m_providers.find(id);
+        if (found != m_providers.end() && found->second)
+            found->second->cache().set_log_window(enabled);
+    }
 
     Prediction prediction(const cldnn::primitive_id& id) const {
         auto found = m_predictions.find(id);
@@ -75,6 +103,18 @@ private:
     std::unordered_map<cldnn::primitive_id, std::unique_ptr<LookaheadRouter>> m_routers;
     std::unordered_map<cldnn::primitive_id, Prediction> m_predictions;
     std::unique_ptr<ExpertPrefetcher> m_prefetcher;
+    std::string m_baseline_request;
+    size_t m_baseline_completed = 0;
+    std::unordered_map<cldnn::primitive_id, CacheSnapshot> m_cache_baselines;
+    std::unordered_map<cldnn::primitive_id, CacheSnapshot> m_prefill_baselines;
+    struct Handoff {
+        cldnn::primitive_id source;
+        size_t token = 0;
+        size_t checkpoint_events = 0;
+        int64_t checkpoint_us = 0, prefetch_us = 0;
+        cldnn::memory::ptr predicted_indices;
+    };
+    std::unordered_map<cldnn::primitive_id, Handoff> m_handoffs;
 };
 
 class LookaheadRegistry {

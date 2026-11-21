@@ -3,6 +3,7 @@
 //
 
 #include "moe_otd_runtime.hpp"
+#include "les_log.hpp"
 
 #include <array>
 #include <chrono>
@@ -360,7 +361,9 @@ std::vector<cldnn::event::ptr> fill_weights_memory_async(cldnn::stream& transfer
                                                       const std::vector<uint32_t>& experts,
                                                       const std::vector<size_t>& slots,
                                                       uint64_t* uploaded_bytes,
-                                                      LookaheadStagingPool* staging_pool) {
+                                                      LookaheadStagingPool* staging_pool,
+                                                      const std::string& log_layer) {
+    MOE_LES_LOG(log_layer, "event=weights_load_begin experts=" << moe::les_ids(experts) << " slots=" << moe::les_ids(slots));
     constexpr size_t chunk_bytes = LookaheadStagingPool::chunk_bytes;
     const std::array<cldnn::memory::ptr, 9> tensors{weights.gate_w, weights.up_w, weights.down_w,
                                                 weights.gate_s, weights.up_s, weights.down_s,
@@ -371,6 +374,8 @@ std::vector<cldnn::event::ptr> fill_weights_memory_async(cldnn::stream& transfer
         size_t source;
         size_t destination;
         size_t bytes;
+        uint32_t expert;
+        size_t slot;
     };
     OPENVINO_ASSERT(weight_bin_offsets.size() == tensors.size() && experts.size() == slots.size(), "Invalid LES upload plan");
     const auto expert_count = static_cast<size_t>(config.num_expert);
@@ -396,7 +401,7 @@ std::vector<cldnn::event::ptr> fill_weights_memory_async(cldnn::stream& transfer
             OPENVINO_ASSERT(bytes <= file_size - source, "LES tensor read outside weight file");
             OPENVINO_ASSERT(slots[index] < memory->size() / bytes, "LES upload outside physical slot buffer");
             OPENVINO_ASSERT(component < 3 || bytes <= chunk_bytes, "LES transposed metadata exceeds 8 MiB per expert");
-            plans.push_back({memory, component, source, slots[index] * bytes, bytes});
+            plans.push_back({memory, component, source, slots[index] * bytes, bytes, experts[index], slots[index]});
         }
     }
     LookaheadStagingPool local_pool;
@@ -411,7 +416,9 @@ std::vector<cldnn::event::ptr> fill_weights_memory_async(cldnn::stream& transfer
             for (size_t offset = 0; offset < plan.bytes;) {
                 auto& buffer = staging[cursor++ % staging.size()];
                 if (buffer.upload) {
+                    // MOE_LES_LOG(log_layer, "event=staging_wait_begin completion=" << buffer.upload.get());
                     buffer.upload->wait();
+                    // MOE_LES_LOG(log_layer, "event=staging_wait_end completion=" << buffer.upload.get());
                 }
                 auto bytes = std::min(chunk_bytes, plan.bytes - offset);
                 if (!buffer.memory) {
@@ -422,16 +429,29 @@ std::vector<cldnn::event::ptr> fill_weights_memory_async(cldnn::stream& transfer
                 }
                 cldnn::mem_lock<uint8_t, cldnn::mem_lock_type::write> payload(buffer.memory, transfer_stream);
                 const auto read_start = les_trace_enabled() ? les_device_time(transfer_stream) : 0;
+                // MOE_LES_LOG(log_layer, "event=weights_read_begin expert=" << plan.expert << " slot=" << plan.slot
+                //             << " component=" << plan.component << " source_offset=" << plan.source + offset << " bytes=" << bytes);
                 weight_reader.read(reinterpret_cast<char*>(payload.data()), bytes, plan.source + offset);
+                // MOE_LES_LOG(log_layer, "event=weights_read_end expert=" << plan.expert << " slot=" << plan.slot
+                //             << " component=" << plan.component << " bytes=" << bytes);
                 if (les_trace_enabled()) {
                     les_trace_interval("read", read_start, les_device_time(transfer_stream));
                 }
                 if (plan.component >= 3) {
+                    // MOE_LES_LOG(log_layer, "event=metadata_transform_begin expert=" << plan.expert << " slot=" << plan.slot
+                    //             << " component=" << plan.component);
                     std::vector<uint8_t> metadata(payload.data(), payload.data() + bytes);
                     maybe_transpose_scale_zp(config, plan.component, plan.memory->get_layout(), metadata, bytes);
                     std::memcpy(payload.data(), metadata.data(), bytes);
+                    // MOE_LES_LOG(log_layer, "event=metadata_transform_end expert=" << plan.expert << " slot=" << plan.slot
+                    //             << " component=" << plan.component);
                 }
                 buffer.upload = plan.memory->copy_from(transfer_stream, payload.data(), 0, plan.destination + offset, bytes, false);
+                // MOE_LES_LOG(log_layer, "--> copy_from_end expert=" << plan.expert << " slot=" << plan.slot
+                //             << " component=" << plan.component << " destination_offset=" << plan.destination + offset
+                //             << " bytes=" << bytes);
+                // // MOE_LES_LOG(log_layer, "event=weights_copy_from_end expert=" << plan.expert << " slot=" << plan.slot
+                // //             << " component=" << plan.component << " completion=" << buffer.upload.get());
                 OPENVINO_ASSERT(buffer.upload, "LES upload did not return a completion event");
                 events.push_back(buffer.upload);
                 if (uploaded_bytes) {
@@ -446,12 +466,15 @@ std::vector<cldnn::event::ptr> fill_weights_memory_async(cldnn::stream& transfer
             }
         }
     } catch (...) {
+        MOE_LES_LOG(log_layer, "event=weights_load_exception");
         error = std::current_exception();
     }
     for (auto& buffer : staging) {
         if (buffer.upload) {
             try {
+                // MOE_LES_LOG(log_layer, "event=upload_wait_begin completion=" << buffer.upload.get());
                 buffer.upload->wait();
+                // MOE_LES_LOG(log_layer, "event=upload_wait_end completion=" << buffer.upload.get());
             } catch (...) {
                 if (!error) {
                     error = std::current_exception();
@@ -462,6 +485,8 @@ std::vector<cldnn::event::ptr> fill_weights_memory_async(cldnn::stream& transfer
     if (error) {
         std::rethrow_exception(error);
     }
+    MOE_LES_LOG(log_layer, "event=weights_load_end experts=" << moe::les_ids(experts) << " slots=" << moe::les_ids(slots)
+                << " uploads=" << events.size());
     return events;
 }
 

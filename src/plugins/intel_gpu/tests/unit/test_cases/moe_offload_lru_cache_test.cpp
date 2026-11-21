@@ -28,6 +28,89 @@ cldnn::event::ptr make_lookahead_test_event() {
 }
 }
 
+TEST(moe_lookahead_lru, logging_preserves_slot_lifecycle_without_waits) {
+    LRUCache cache(4);
+    cache.set_log_layer("unit-log-layer");
+    for (size_t expert = 1; expert <= 4; ++expert) {
+        cache.set_filled(cache.get_lru_item(expert).first);
+    }
+    cache.set_log_window(true);
+    ASSERT_TRUE(cache.get_lru_item(1).second);
+    const auto demand = cache.partition_3way({1, 5}, make_lookahead_test_event);
+    ASSERT_TRUE(demand);
+    ASSERT_EQ(demand->missing.size(), 1U);
+    const auto load = demand->missing.front();
+    EXPECT_EQ(cache.snapshot().current_queued, (std::vector<size_t>{5}));
+    ASSERT_TRUE(cache.start_load(load));
+    EXPECT_TRUE(cache.snapshot().current_queued.empty());
+    EXPECT_EQ(cache.snapshot().current_copying, (std::vector<size_t>{5}));
+    ASSERT_TRUE(cache.fail_load(load));
+    EXPECT_EQ(cache.snapshot().current_queued, (std::vector<size_t>{5}));
+    EXPECT_TRUE(cache.snapshot().current_copying.empty());
+    ASSERT_TRUE(cache.start_load(load));
+    ASSERT_TRUE(cache.complete_load(load));
+    EXPECT_TRUE(cache.snapshot().current_queued.empty());
+    EXPECT_TRUE(cache.snapshot().current_copying.empty());
+    cache.unpin_all(make_lookahead_test_event());
+    const auto speculative = cache.reserve_speculative(6, 1, make_lookahead_test_event);
+    ASSERT_TRUE(speculative);
+    ASSERT_TRUE(cache.start_load(*speculative));
+    ASSERT_TRUE(cache.complete_load(*speculative));
+    const auto cancelled = cache.reserve_speculative(7, 1, make_lookahead_test_event);
+    ASSERT_TRUE(cancelled);
+    ASSERT_TRUE(cache.cancel_load(*cancelled));
+    cache.set_filled(cache.get_lru_item(8).first);
+    cache.set_filled(cache.get_lru_item(9).first);
+    cache.evict_one();
+    cache.set_log_window(false);
+    EXPECT_EQ(cache.size(), 3U);
+}
+
+TEST(moe_lookahead_lru, ordered_events_only_include_current_logging_window_without_waits) {
+    LRUCache cache(4);
+    cache.set_log_layer("unit-window-layer");
+    cache.set_log_window(true);
+    const auto load = cache.reserve_speculative(1, 1, make_lookahead_test_event);
+    ASSERT_TRUE(load);
+    cache.log_enqueue(*load, 123, 1);
+    ASSERT_TRUE(cache.start_load(*load));
+    const auto first_window = cache.ordered_cache_events();
+    cache.set_log_window(true);
+    EXPECT_EQ(cache.ordered_cache_events().size(), first_window.size());
+    cache.set_log_window(false);
+    ASSERT_TRUE(cache.fail_load(*load));
+    ASSERT_TRUE(cache.start_load(*load));
+    ASSERT_TRUE(cache.complete_load(*load));
+    const auto closed = cache.ordered_cache_events();
+    EXPECT_EQ(closed.size(), first_window.size());
+    cache.set_log_window(true);
+    ASSERT_TRUE(cache.complete_load(*load));
+    EXPECT_TRUE(cache.ordered_cache_events().empty());
+    const auto cancelled = cache.reserve_speculative(2, 1, make_lookahead_test_event);
+    ASSERT_TRUE(cancelled);
+    ASSERT_TRUE(cache.cancel_load(*cancelled));
+    cache.evict_one();
+    cache.set_log_window(false);
+    const auto events = cache.ordered_cache_events();
+    if (ov::intel_gpu::ocl::moe::LESLog::instance().enabled()) {
+        ASSERT_EQ(closed.size(), 3U);
+        EXPECT_EQ(closed[0].kind, 'R');
+        EXPECT_EQ(closed[1].kind, 'J');
+        EXPECT_EQ(closed[2].kind, 'B');
+        ASSERT_EQ(events.size(), 3U);
+        const std::string kinds = "RXE";
+        for (size_t index = 0; index < events.size(); ++index) {
+            EXPECT_EQ(events[index].kind, kinds[index]);
+            EXPECT_EQ(events[index].expert, index < 2 ? 2U : 1U);
+            if (index) {
+                EXPECT_LE(events[index - 1].time_us, events[index].time_us);
+            }
+        }
+    } else {
+        EXPECT_TRUE(events.empty());
+    }
+}
+
 TEST(moe_lookahead_lru, partitions_and_pins_ready_inflight_missing_atomically) {
     LRUCache cache(8);
     const auto resident = cache.get_lru_item(1);
@@ -184,6 +267,98 @@ TEST(moe_lookahead_lru, cancellation_and_failed_reservation_do_not_alias_slots) 
     auto demand = cache.partition_3way({3, 2}, make_lookahead_test_event);
     ASSERT_TRUE(demand);
     EXPECT_NE(demand->slots[0], demand->slots[1]);
+}
+
+TEST(moe_lookahead_lru, trace_replays_eviction_then_reload_in_order) {
+    LRUCache cache(4);
+    for (size_t expert = 1; expert <= 4; ++expert)
+        cache.set_filled(cache.get_lru_item(expert).first);
+    cache.begin_trace();
+    EXPECT_ANY_THROW(cache.begin_trace());
+    auto first = cache.reserve_speculative(5, 1, make_lookahead_test_event);
+    ASSERT_TRUE(first);
+    std::thread worker([&] { EXPECT_TRUE(cache.complete_load(*first)); });
+    worker.join();
+    const auto checkpoint = cache.trace_checkpoint();
+    EXPECT_EQ(checkpoint.first, 3U);
+    auto second = cache.reserve_speculative(1, 1, make_lookahead_test_event);
+    ASSERT_TRUE(second);
+    ASSERT_TRUE(cache.complete_load(*second));
+    EXPECT_TRUE(cache.complete_load(*first));
+    auto trace = cache.end_trace();
+    EXPECT_EQ(trace.original, (std::vector<size_t>{1, 2, 3, 4}));
+    EXPECT_EQ(trace.current, (std::vector<size_t>{3, 4, 5, 1}));
+    ASSERT_EQ(trace.events.size(), 6U);
+    EXPECT_EQ(trace.events[0].kind, 'E'); EXPECT_EQ(trace.events[0].expert, 1U);
+    EXPECT_EQ(trace.events[1].kind, 'R'); EXPECT_EQ(trace.events[1].expert, 5U);
+    EXPECT_EQ(trace.events[2].kind, 'P'); EXPECT_EQ(trace.events[2].expert, 5U);
+    EXPECT_EQ(trace.events[3].kind, 'E'); EXPECT_EQ(trace.events[3].expert, 2U);
+    EXPECT_EQ(trace.events[4].kind, 'R'); EXPECT_EQ(trace.events[4].expert, 1U);
+    EXPECT_EQ(trace.events[5].kind, 'P'); EXPECT_EQ(trace.events[5].expert, 1U);
+    EXPECT_LE(trace.start_us, trace.events.front().time_us);
+    EXPECT_LE(trace.events.back().time_us, trace.end_us);
+    EXPECT_ANY_THROW(cache.end_trace());
+}
+
+TEST(moe_lookahead_lru, trace_distinguishes_inherited_completion_and_cancelled_load) {
+    LRUCache cache(4);
+    for (size_t expert = 1; expert <= 4; ++expert)
+        cache.set_filled(cache.get_lru_item(expert).first);
+    auto inherited = cache.reserve_speculative(5, 1, make_lookahead_test_event);
+    ASSERT_TRUE(inherited);
+    cache.begin_trace();
+    ASSERT_TRUE(cache.complete_load(*inherited));
+    auto cancelled = cache.reserve_speculative(6, 1, make_lookahead_test_event);
+    ASSERT_TRUE(cancelled);
+    ASSERT_TRUE(cache.cancel_load(*cancelled));
+    EXPECT_FALSE(cache.complete_load(*cancelled));
+    auto trace = cache.end_trace();
+    EXPECT_EQ(trace.original, (std::vector<size_t>{2, 3, 4}));
+    EXPECT_EQ(trace.current, (std::vector<size_t>{3, 4, 5}));
+    ASSERT_EQ(trace.events.size(), 4U);
+    EXPECT_EQ(trace.events[0].kind, 'I'); EXPECT_EQ(trace.events[0].expert, 5U);
+    EXPECT_EQ(trace.events[1].kind, 'E'); EXPECT_EQ(trace.events[1].expert, 2U);
+    EXPECT_EQ(trace.events[2].kind, 'R'); EXPECT_EQ(trace.events[2].expert, 6U);
+    EXPECT_EQ(trace.events[3].kind, 'X'); EXPECT_EQ(trace.events[3].expert, 6U);
+}
+
+TEST(moe_lookahead_lru, trace_records_load_lifecycle_and_live_pending_snapshots) {
+    LRUCache cache(8);
+    auto inherited = cache.reserve_speculative(5, 2, make_lookahead_test_event);
+    ASSERT_TRUE(inherited);
+    ASSERT_TRUE(cache.start_load(*inherited));
+    cache.begin_trace();
+    auto cancelled = cache.reserve_speculative(6, 2, make_lookahead_test_event);
+    ASSERT_TRUE(cancelled);
+    ASSERT_TRUE(cache.start_load(*cancelled));
+    EXPECT_FALSE(cache.start_load(*cancelled));
+    ASSERT_TRUE(cache.fail_load(*cancelled));
+    ASSERT_TRUE(cache.cancel_load(*cancelled));
+    EXPECT_FALSE(cache.start_load(*cancelled));
+    EXPECT_FALSE(cache.fail_load(*cancelled));
+    ASSERT_TRUE(cache.complete_load(*inherited));
+    auto demand = cache.partition_3way({7}, make_lookahead_test_event);
+    ASSERT_TRUE(demand);
+    ASSERT_EQ(demand->missing.size(), 1U);
+    ASSERT_TRUE(cache.start_load(demand->missing.front()));
+    ASSERT_TRUE(cache.complete_load(demand->missing.front()));
+    auto pending = cache.reserve_speculative(8, 2, make_lookahead_test_event);
+    ASSERT_TRUE(pending);
+    ASSERT_TRUE(cache.start_load(*pending));
+    const auto snapshot = cache.snapshot();
+    const auto trace = cache.end_trace();
+    EXPECT_EQ(trace.original_pending, (std::vector<size_t>{5}));
+    EXPECT_EQ(trace.original_copying, (std::vector<size_t>{5}));
+    EXPECT_EQ(trace.current, (std::vector<size_t>{5, 7}));
+    EXPECT_EQ(trace.current_pending, (std::vector<size_t>{8}));
+    EXPECT_EQ(trace.current_copying, (std::vector<size_t>{8}));
+    EXPECT_EQ(snapshot.current, trace.current);
+    EXPECT_EQ(snapshot.current_pending, trace.current_pending);
+    EXPECT_EQ(snapshot.current_copying, trace.current_copying);
+    std::vector<char> kinds;
+    for (const auto& event : trace.events)
+        kinds.push_back(event.kind);
+    EXPECT_EQ(kinds, (std::vector<char>{'R', 'B', 'F', 'X', 'I', 'Q', 'B', 'D', 'R', 'B'}));
 }
 
 TEST(moe_les_reservations, deduplicates_and_rejects_capacity_without_mutation) {
