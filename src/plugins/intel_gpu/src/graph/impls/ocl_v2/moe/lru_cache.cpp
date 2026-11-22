@@ -38,11 +38,11 @@ void LRUCache::load_trace_event_unlocked(const char* name, const Node& node) con
                                                       node.state.generation, node.state.speculative, node.state.demanded);
     LESTimeline::instant(name, args);
     if (std::string(name) == "expert_copying")
-        LESTimeline::span("expert_reserved_wait", args, node.state.reserved_us, node.state.copy_started_us,
-                          LESTimeline::thread_id());
+        LESTimeline::load_span("expert_reserved_wait", args, node.state.reserved_us, node.state.copy_started_us,
+                               node.state.load_trace->target_layer_index, node.lru_expert_no);
     else if (std::string(name) == "expert_completed" && node.state.copy_started_us)
-        LESTimeline::span("expert_host_copy", args, node.state.copy_started_us, node.state.completed_us,
-                          LESTimeline::thread_id());
+        LESTimeline::load_span("expert_host_copy", args, node.state.copy_started_us, node.state.completed_us,
+                               node.state.load_trace->target_layer_index, node.lru_expert_no);
     const char* itt = std::getenv("OV_GPU_LES_ITT");
     if (itt && (std::string(itt) == "1" || std::string(itt) == "details")) {
         static auto domain = openvino::itt::internal::domain("ov::intel_gpu");

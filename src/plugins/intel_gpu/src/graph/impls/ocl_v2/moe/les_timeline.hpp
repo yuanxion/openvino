@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
+#include <map>
 #include <mutex>
 #include <memory>
 #include <sstream>
@@ -74,6 +75,15 @@ public:
             instance().write(name, args, start, end - start, 'X', thread);
     }
 
+    static void load_span(const std::string& name, const std::string& args, int64_t start, int64_t end,
+                          uint32_t layer, size_t slot) {
+        if (enabled()) {
+            auto& timeline = instance();
+            const auto thread = timeline.load_track(layer, slot);
+            timeline.write(name, args, start, end - start, 'X', thread);
+        }
+    }
+
 private:
     LESTimeline() : output(std::getenv("OV_GPU_LES_TRACE")) {
         output << "[\n{\"ph\":\"M\",\"name\":\"les_clock\",\"pid\":" << process_id()
@@ -97,6 +107,17 @@ private:
 #endif
     }
 
+    uint64_t load_track(uint32_t layer, size_t slot) {
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto result = load_tracks.emplace(std::make_pair(layer, slot), (uint64_t{1} << 29) + load_tracks.size());
+        if (result.second) {
+            output << ",\n{\"ph\":\"M\",\"name\":\"thread_name\",\"pid\":" << process_id()
+                   << ",\"tid\":" << result.first->second << ",\"args\":{\"name\":"
+                   << quote("LES layer " + std::to_string(layer) + " slot " + std::to_string(slot)) << "}}";
+        }
+        return result.first->second;
+    }
+
     void write(const std::string& name, const std::string& args, int64_t start, int64_t duration,
                char phase, uint64_t thread) {
         std::lock_guard<std::mutex> lock(mutex);
@@ -111,6 +132,7 @@ private:
 
     std::ofstream output;
     std::mutex mutex;
+    std::map<std::pair<uint32_t, size_t>, uint64_t> load_tracks;
 };
 
 struct LESLoadContext {
