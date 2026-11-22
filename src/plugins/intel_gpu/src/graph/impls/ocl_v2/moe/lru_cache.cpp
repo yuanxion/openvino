@@ -7,8 +7,49 @@
 #include <chrono>
 #include <unordered_set>
 #include "openvino/core/except.hpp"
+#include "openvino/itt.hpp"
 
 namespace ov::intel_gpu::ocl::moe {
+
+void LRUCache::set_load_trace_context(size_t token, uint32_t layer, bool selected,
+                                     const std::vector<uint32_t>& topk) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_load_trace_context.reset();
+    if (!selected)
+        return;
+    auto context = std::make_shared<LESLoadContext>();
+    const char* request = std::getenv("LOG_REQUEST_CONTEXT");
+    context->request = request ? request : "";
+    context->token_index = token;
+    context->layer_index = context->target_layer_index = layer;
+    context->topk_expert_ids = topk;
+    m_load_trace_context = std::move(context);
+}
+
+std::shared_ptr<const LESLoadContext> LRUCache::load_trace_context() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_load_trace_context;
+}
+
+void LRUCache::load_trace_event_unlocked(const char* name, const Node& node) const {
+    if (!node.state.load_trace)
+        return;
+    const auto args = node.state.load_trace->arguments(node.expert, node.lru_expert_no,
+                                                      node.state.generation, node.state.speculative, node.state.demanded);
+    LESTimeline::instant(name, args);
+    if (std::string(name) == "expert_copying")
+        LESTimeline::span("expert_reserved_wait", args, node.state.reserved_us, node.state.copy_started_us,
+                          LESTimeline::thread_id());
+    else if (std::string(name) == "expert_completed" && node.state.copy_started_us)
+        LESTimeline::span("expert_host_copy", args, node.state.copy_started_us, node.state.completed_us,
+                          LESTimeline::thread_id());
+    const char* itt = std::getenv("OV_GPU_LES_ITT");
+    if (itt && (std::string(itt) == "1" || std::string(itt) == "details")) {
+        static auto domain = openvino::itt::internal::domain("ov::intel_gpu");
+        openvino::itt::internal::taskBegin(domain, openvino::itt::handle(std::string(name) + " " + args));
+        openvino::itt::internal::taskEnd(domain);
+    }
+}
 
 void LRUCache::record_cache_event_unlocked(char kind, size_t expert, const std::string& details) {
     static_cast<void>(details);
@@ -444,6 +485,8 @@ std::optional<LRUCache::Partition> LRUCache::partition_3way(const std::vector<ui
         ++m_total_experts;
         m_list.back().state.reserved_us = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
+        m_list.back().state.load_trace = m_load_trace_context;
+        load_trace_event_unlocked("expert_reserved", m_list.back());
         record_cache_event_unlocked('R', load.expert_id, " origin=demand");
         trace_event_unlocked('Q', load.expert_id);
     }
@@ -477,7 +520,8 @@ std::optional<LRUCache::Partition> LRUCache::partition_3way(const std::vector<ui
 std::optional<LRUCache::Load> LRUCache::reserve_speculative(uint32_t expert_id,
                                                          size_t top_k,
                                                          const EventFactory& make_event,
-                                                         const std::vector<uint32_t>& predicted_experts) {
+                                                         const std::vector<uint32_t>& predicted_experts,
+                                                         std::shared_ptr<const LESLoadContext> context) {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (top_k >= m_max_total_experts || m_map.count(Key{expert_id})) {
         return std::nullopt;
@@ -529,6 +573,8 @@ std::optional<LRUCache::Load> LRUCache::reserve_speculative(uint32_t expert_id,
     ++m_total_experts;
     m_list.back().state.reserved_us = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
+    m_list.back().state.load_trace = std::move(context);
+    load_trace_event_unlocked("expert_reserved", m_list.back());
     record_cache_event_unlocked('R', expert_id, " origin=speculative");
     trace_event_unlocked('R', expert_id);
     return load;
@@ -556,6 +602,7 @@ bool LRUCache::start_load(const Load& load) {
             std::chrono::steady_clock::now().time_since_epoch()).count();
     }
     record_cache_event_unlocked('B', load.expert_id);
+    load_trace_event_unlocked("expert_copying", *found->second);
     trace_event_unlocked('B', load.expert_id);
     return true;
 }
@@ -566,6 +613,7 @@ bool LRUCache::fail_load(const Load& load) {
     if (found == m_map.end() || found->second->state.generation != load.generation || !found->second->state.loading)
         return false;
     found->second->state.copying = false;
+    load_trace_event_unlocked("expert_failed", *found->second);
     record_cache_event_unlocked('F', load.expert_id);
     trace_event_unlocked('F', load.expert_id);
     return true;
@@ -592,6 +640,7 @@ bool LRUCache::complete_load(const Load& load) {
     if (was_loading) {
         node.state.completed_us = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
+        load_trace_event_unlocked("expert_completed", node);
     }
     if (was_loading && LESLog::instance().enabled()) {
         std::ostringstream details;
@@ -613,6 +662,7 @@ bool LRUCache::cancel_load(const Load& load) {
         return false;
     }
     m_filled_list[found->second->lru_expert_no] = false;
+    load_trace_event_unlocked("expert_cancelled", *found->second);
     trace_event_unlocked('X', found->second->expert);
     m_list.erase(found->second);
     m_map.erase(found);

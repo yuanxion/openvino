@@ -375,6 +375,12 @@ struct ExpertPrefetcher::State {
                         consume(*prediction);
                         throw;
                     }
+                    auto trace_context = prediction->trace_context;
+                    if (trace_context) {
+                        auto context = std::make_shared<LESLoadContext>(*trace_context);
+                        context->prediction_expert_ids = experts;
+                        trace_context = std::move(context);
+                    }
                     for (auto expert : experts) {
                         OPENVINO_ASSERT(expert < static_cast<uint32_t>(binding->config.num_expert), "Invalid predicted expert ID");
                         std::optional<LRUCache::Load> load;
@@ -384,7 +390,7 @@ struct ExpertPrefetcher::State {
                                 break;
                             }
                             load = binding->cache->reserve_speculative(expert, binding->config.top_k,
-                                [this] { return make_ready_event(); }, experts);
+                                [this] { return make_ready_event(); }, experts, trace_context);
                         }
                         if (load) {
                             watch(load->last_use_event);

@@ -15,6 +15,7 @@
 
 #include "intel_gpu/runtime/event.hpp"
 #include "les_log.hpp"
+#include "les_timeline.hpp"
 
 namespace ov::intel_gpu::ocl::moe {
 
@@ -72,6 +73,7 @@ struct CacheItemExtended {
     int64_t reserved_us = 0;
     int64_t copy_started_us = 0;
     int64_t completed_us = 0;
+    std::shared_ptr<const LESLoadContext> load_trace;
 };
 
 class LRUCache {
@@ -113,6 +115,9 @@ public:
                                                                           const LRUCache& target);
     void set_timestamp_arguments(const std::vector<size_t>& topk, const std::vector<size_t>& demand);
     void set_timestamp_prediction(const std::vector<size_t>& predicted, const std::vector<size_t>& submitted);
+    void set_load_trace_context(size_t token, uint32_t layer, bool selected,
+                                const std::vector<uint32_t>& topk = {});
+    std::shared_ptr<const LESLoadContext> load_trace_context() const;
 
     struct Load {
         uint32_t expert_id;
@@ -141,7 +146,8 @@ public:
     std::optional<Load> reserve_speculative(uint32_t expert_id,
                                           size_t top_k,
                                           const EventFactory& make_event,
-                                          const std::vector<uint32_t>& predicted_experts = {});
+                                          const std::vector<uint32_t>& predicted_experts = {},
+                                          std::shared_ptr<const LESLoadContext> context = {});
     bool complete_load(const Load& load);
     bool start_load(const Load& load);
     bool fail_load(const Load& load);
@@ -234,6 +240,8 @@ private:
     bool m_log_emit = false;
     std::vector<size_t> m_log_topk, m_log_demand, m_log_predicted, m_log_prefetching;
     std::string m_log_layer = "unbound";
+    std::shared_ptr<const LESLoadContext> m_load_trace_context;
+    void load_trace_event_unlocked(const char* name, const Node& node) const;
     void record_cache_event_unlocked(char kind, size_t expert, const std::string& details = "");
     TimestampLogRecord timestamp_snapshot_unlocked(const std::vector<size_t>& topk_experts) const;
     void log_cache_state_unlocked(char kind, size_t expert, int64_t event_us,

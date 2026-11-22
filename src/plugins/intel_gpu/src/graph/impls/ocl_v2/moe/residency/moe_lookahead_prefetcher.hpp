@@ -19,6 +19,7 @@ class engine;
 namespace ov::intel_gpu::ocl::moe {
 
 class OffloadExpertWeightProvider;
+struct LESLoadContext;
 
 struct PrefetchTask {
     uint32_t target_layer_idx = 0;
@@ -28,6 +29,7 @@ struct PrefetchTask {
     std::weak_ptr<OffloadExpertWeightProvider> target_provider;
     std::shared_ptr<std::atomic<bool>> consumed;
     std::shared_ptr<std::vector<uint32_t>> cpu_indices;
+    std::shared_ptr<const LESLoadContext> trace_context;
 };
 
 class ExpertPrefetcher {

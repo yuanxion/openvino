@@ -453,8 +453,15 @@ bool LookaheadContext::prefetch(const cldnn::primitive_inst* current_moe) {
         handoff->second.prefetch_us = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
     }
+    auto trace_context = m_providers.at(current_moe->id())->cache().load_trace_context();
+    if (trace_context) {
+        auto context = std::make_shared<LESLoadContext>(*trace_context);
+        context->target_layer_index = m_layer_indices.at(target);
+        trace_context = std::move(context);
+    }
     m_prefetcher->submit_prefetch({m_layer_indices.at(target), m_epoch,
-                                  state.predicted_indices, state.prediction_ready, weights, state.consumed, state.cpu_indices});
+                                  state.predicted_indices, state.prediction_ready, weights, state.consumed,
+                                  state.cpu_indices, std::move(trace_context)});
     return true;
 }
 

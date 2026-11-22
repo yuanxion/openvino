@@ -28,6 +28,52 @@ cldnn::event::ptr make_lookahead_test_event() {
 }
 }
 
+TEST(moe_lookahead_lru, load_timeline_preserves_origin_across_tokens_and_demand_takeover) {
+    using ov::intel_gpu::ocl::moe::LESLoadContext;
+    LRUCache source(8), target(8);
+    source.set_filled(source.get_lru_item(1).first);
+    source.set_load_trace_context(3, 2, true, {1, 5});
+    const auto context = source.load_trace_context();
+    ASSERT_TRUE(context);
+    const auto demand = source.partition_3way({1, 5}, make_lookahead_test_event);
+    ASSERT_TRUE(demand);
+    ASSERT_EQ(demand->missing.size(), 1U);
+    source.set_load_trace_context(99, 2, false);
+    EXPECT_FALSE(source.load_trace_context());
+    ASSERT_TRUE(source.start_load(demand->missing.front()));
+    ASSERT_TRUE(source.complete_load(demand->missing.front()));
+    ASSERT_TRUE(source.complete_load(demand->missing.front()));
+    auto prediction = std::make_shared<LESLoadContext>(*context);
+    prediction->target_layer_index = 3;
+    prediction->prediction_expert_ids = {7, 8};
+    const auto hinted = target.reserve_speculative(7, 2, make_lookahead_test_event, {7, 8}, prediction);
+    ASSERT_TRUE(hinted);
+    target.set_load_trace_context(4, 3, true, {7, 9});
+    const auto partition = target.partition_3way({7, 9}, make_lookahead_test_event);
+    ASSERT_TRUE(partition);
+    ASSERT_EQ(partition->missing.size(), 1U);
+    EXPECT_FALSE(target.cancel_load(*hinted));
+    ASSERT_TRUE(target.start_load(*hinted));
+    EXPECT_FALSE(target.start_load(*hinted));
+    ASSERT_TRUE(target.complete_load(*hinted));
+    ASSERT_TRUE(target.start_load(partition->missing.front()));
+    ASSERT_TRUE(target.complete_load(partition->missing.front()));
+    target.unpin_all(make_lookahead_test_event());
+    const auto cancelled = target.reserve_speculative(6, 2, make_lookahead_test_event, {6}, prediction);
+    ASSERT_TRUE(cancelled);
+    ASSERT_TRUE(target.cancel_load(*cancelled));
+    EXPECT_FALSE(target.start_load(*cancelled));
+    const auto failed = target.reserve_speculative(8, 2, make_lookahead_test_event, {7, 8}, prediction);
+    ASSERT_TRUE(failed);
+    ASSERT_TRUE(target.start_load(*failed));
+    ASSERT_TRUE(target.fail_load(*failed));
+    EXPECT_EQ(context->token_index, 3U);
+    EXPECT_EQ(context->topk_expert_ids, (std::vector<uint32_t>{1, 5}));
+    EXPECT_EQ(prediction->layer_index, 2U);
+    EXPECT_EQ(prediction->target_layer_index, 3U);
+    EXPECT_EQ(prediction->prediction_expert_ids, (std::vector<uint32_t>{7, 8}));
+}
+
 TEST(moe_lookahead_lru, logging_preserves_slot_lifecycle_without_waits) {
     LRUCache cache(4);
     cache.set_log_layer("unit-log-layer");

@@ -69,6 +69,80 @@ using cldnn::onednn::convert_data_type;
 using cldnn::onednn::onednn_linear;
 using cldnn::onednn::onednn_matmul;
 
+class LESPhaseTrace {
+public:
+    static bool enabled() {
+        return itt_enabled() || moe::LESTimeline::enabled();
+    }
+
+    static bool itt_enabled() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("OV_GPU_LES_ITT");
+            return value && (std::string(value) == "1" || std::string(value) == "details");
+        }();
+        return enabled;
+    }
+
+    static bool details() {
+        static const bool details = [] {
+            const char* value = std::getenv("OV_GPU_LES_ITT");
+            return value && std::string(value) == "details";
+        }();
+        return details;
+    }
+
+    ~LESPhaseTrace() {
+        finish();
+    }
+
+    void mark(std::string name, size_t token, uint32_t layer, const moe::TimestampLogRecord* record) {
+        finish();
+        m_name = name;
+        const char* request = std::getenv("LOG_REQUEST_CONTEXT");
+        m_args = "{\"request\":" + moe::LESTimeline::quote(request ? request : "") +
+                 ",\"token_index\":" + std::to_string(token) + ",\"layer_index\":" + std::to_string(layer) + '}';
+        if (details() && record) {
+            for (const auto* snapshot : {&record->current, &record->target}) {
+                name += "\nlayer_" + std::to_string(snapshot->layer_index);
+                const auto append = [&](const char* field, const std::vector<size_t>& values) {
+                    name += std::string(": ") + field + " [";
+                    for (size_t index = 0; index < values.size(); ++index)
+                        name += (index ? "," : "") + std::to_string(values[index]);
+                    name += ']';
+                };
+                append("lru_cache_expert_ids", snapshot->expert_ids);
+                append("topk_expert_ids", snapshot->topk_expert_ids);
+                append("ready", snapshot->ready_expert_ids);
+                append("inflight", snapshot->inflight_expert_ids);
+                append("missing", snapshot->missing_expert_ids);
+            }
+        }
+        m_start = moe::LESTimeline::now();
+        m_thread = moe::LESTimeline::thread_id();
+        if (itt_enabled()) {
+            openvino::itt::internal::taskBegin(ov::intel_gpu::itt::domains::intel_gpu_plugin(),
+                                              openvino::itt::handle(name), "token_layer", (uint64_t{token} << 32) | layer);
+        }
+        m_open = true;
+    }
+
+    void finish() {
+        if (m_open) {
+            const auto end = moe::LESTimeline::now();
+            if (itt_enabled())
+                openvino::itt::internal::taskEnd(ov::intel_gpu::itt::domains::intel_gpu_plugin());
+            moe::LESTimeline::span(m_name, m_args, m_start, end, m_thread);
+            m_open = false;
+        }
+    }
+
+private:
+    bool m_open = false;
+    std::string m_name, m_args;
+    int64_t m_start = 0;
+    uint64_t m_thread = 0;
+};
+
 inline dnnl::algorithm moe_activation_to_dnnl_algo(ov::op::internal::MOE::Activation_type act) {
     switch (act) {
     case ov::op::internal::MOE::Activation_type::GEGLU_TANH:
@@ -782,7 +856,7 @@ public:
                    std::chrono::steady_clock::now().time_since_epoch()).count();
     }
 
-    void timestamp_log(typed_primitive_inst<moe_3gemm_fused_compressed>& instance,
+    moe::TimestampLogRecord timestamp_log(typed_primitive_inst<moe_3gemm_fused_compressed>& instance,
                        const char* tag,
                        const char* file,
                        int line,
@@ -804,6 +878,7 @@ public:
         record.current = snapshots.first.layer_snapshot(record.layer_index);
         record.target = snapshots.second.layer_snapshot(record.target_index);
         moe::LESLog::instance().write_timestamp(record);
+        return record;
     }
 
     static const std::vector<size_t>& debug_token_ids() {
@@ -1962,7 +2037,9 @@ public:
         const auto& selected_tokens = debug_token_ids();
         size_t debug_token = 0;
         bool logging = false;
-        if ((!selected_tokens.empty() || moe::LESLog::instance().enabled()) && _weight_provider->is_offloaded() && token_num == 1) {
+        bool tracing = false;
+        if ((!selected_tokens.empty() || moe::LESLog::instance().enabled() || LESPhaseTrace::enabled()) &&
+            _weight_provider->is_offloaded() && token_num == 1) {
             const char* context = std::getenv("LOG_REQUEST_CONTEXT");
             const std::string request = context ? context : "";
             if (_debug_request != request) {
@@ -1976,10 +2053,11 @@ public:
             }();
             OPENVINO_ASSERT(selected_request.empty() || !request.empty(),
                             "LOG_REQUEST requires request labels from benchmark_vlm");
-            logging = _lookahead && moe::LESLog::instance().enabled() &&
-                      (selected_request.empty() || selected_request == request)
+            const bool selected = _lookahead && (selected_request.empty() || selected_request == request)
                       && (selected_tokens.empty() || selected_tokens.front() == 0
                           || std::find(selected_tokens.begin(), selected_tokens.end(), debug_token) != selected_tokens.end());
+            logging = selected && moe::LESLog::instance().enabled();
+            tracing = selected && LESPhaseTrace::enabled();
         }
         if (moe::LESLog::instance().enabled() && _weight_provider->is_offloaded() && token_num == 1)
             static_cast<OffloadExpertWeightProvider&>(*_weight_provider).cache().set_log_window(true);
@@ -1987,6 +2065,11 @@ public:
         moe::TimestampLogRecord log_context;
         log_context.token_index = debug_token ? debug_token - 1 : 0;
         size_t point_index = 0;
+        LESPhaseTrace phase_trace;
+        if (_lookahead && _weight_provider->is_offloaded() && token_num == 1) {
+            static_cast<OffloadExpertWeightProvider&>(*_weight_provider).cache().set_load_trace_context(
+                log_context.token_index, _lookahead->layer_index(instance.id()), tracing);
+        }
         if (_lookahead && moe::LESLog::instance().enabled() && token_num == 1) {
             _lookahead->prepare_timestamp_window(instance.id(), log_context.token_index, logging);
             _lookahead->set_cache_log_context(instance.id(), log_context.token_index, logging);
@@ -1994,9 +2077,16 @@ public:
                 _lookahead->set_cache_log_context(next->moe_inst->id(), log_context.token_index, logging);
         }
         const auto log_point = [&](const char* tag, int line, bool next_layer = false) {
-            if (logging) {
+            if (logging || tracing) {
+                if (tracing)
+                    phase_trace.finish();
                 const auto numbered = std::to_string(point_index++) + '-' + tag;
-                timestamp_log(instance, numbered.c_str(), __FILE__, line, next_layer, known_topk, log_context);
+                moe::TimestampLogRecord record;
+                if (logging)
+                    record = timestamp_log(instance, numbered.c_str(), __FILE__, line, next_layer, known_topk, log_context);
+                if (tracing)
+                    phase_trace.mark(numbered, log_context.token_index, _lookahead->layer_index(instance.id()),
+                                     logging ? &record : nullptr);
             }
         };
         log_point("exec_batched_gemv", __LINE__);
@@ -2031,6 +2121,8 @@ public:
             log_point("topk_copy_to_start", __LINE__);
             scratch.topk_id->copy_to(stream, experts.data(), 0, 0, experts.size() * sizeof(uint32_t), true);
             known_topk.assign(experts.begin(), experts.end());
+            static_cast<OffloadExpertWeightProvider&>(*_weight_provider).cache().set_load_trace_context(
+                log_context.token_index, _lookahead->layer_index(instance.id()), tracing, experts);
             log_point("topk_copy_to_end", __LINE__);
 
             for (auto expert : experts) {
