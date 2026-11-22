@@ -31,6 +31,7 @@ cldnn::event::ptr make_lookahead_test_event() {
 TEST(moe_lookahead_lru, load_timeline_preserves_origin_across_tokens_and_demand_takeover) {
     using ov::intel_gpu::ocl::moe::LESLoadContext;
     LRUCache source(8), target(8);
+    source.set_log_window(true, true);
     source.set_filled(source.get_lru_item(1).first);
     source.set_load_trace_context(3, 2, true, {1, 5});
     const auto context = source.load_trace_context();
@@ -38,20 +39,42 @@ TEST(moe_lookahead_lru, load_timeline_preserves_origin_across_tokens_and_demand_
     const auto demand = source.partition_3way({1, 5}, make_lookahead_test_event);
     ASSERT_TRUE(demand);
     ASSERT_EQ(demand->missing.size(), 1U);
+    source.log_enqueue(demand->missing.front(), 0, 1);
     source.set_load_trace_context(99, 2, false);
     EXPECT_FALSE(source.load_trace_context());
     ASSERT_TRUE(source.start_load(demand->missing.front()));
     ASSERT_TRUE(source.complete_load(demand->missing.front()));
     ASSERT_TRUE(source.complete_load(demand->missing.front()));
+    const auto snapshot = source.timestamp_snapshot({1, 5}).layer_snapshot(2);
+    const auto arguments = ov::intel_gpu::ocl::moe::LESTimeline::layer_arguments(snapshot);
+    EXPECT_NE(arguments.find("\"topk_expert_ids\":[1,5]"), std::string::npos);
+    EXPECT_NE(arguments.find("\"ready_expert_ids\":[1,5]"), std::string::npos);
+    EXPECT_NE(arguments.find("\"prediction_ids\":[]"), std::string::npos);
+    if (ov::intel_gpu::ocl::moe::LESTimeline::enabled()) {
+        size_t lifecycle_events = 0;
+        for (const auto& event : snapshot.cache_events) {
+            if (event.expert != demand->missing.front().expert_id)
+                continue;
+            if (event.state == ov::intel_gpu::ocl::moe::les_event_name('R') ||
+                event.state == ov::intel_gpu::ocl::moe::les_event_name('J') ||
+                event.state == ov::intel_gpu::ocl::moe::les_event_name('B') ||
+                event.state == ov::intel_gpu::ocl::moe::les_event_name('D'))
+                ++lifecycle_events;
+        }
+        EXPECT_EQ(lifecycle_events, 4U);
+        EXPECT_EQ(snapshot.cache_events.back().state, ov::intel_gpu::ocl::moe::les_event_name('D'));
+    }
     auto prediction = std::make_shared<LESLoadContext>(*context);
     prediction->target_layer_index = 3;
     prediction->prediction_expert_ids = {7, 8};
     const auto hinted = target.reserve_speculative(7, 2, make_lookahead_test_event, {7, 8}, prediction);
     ASSERT_TRUE(hinted);
+    target.log_enqueue(*hinted, 0, 1);
     target.set_load_trace_context(4, 3, true, {7, 9});
     const auto partition = target.partition_3way({7, 9}, make_lookahead_test_event);
     ASSERT_TRUE(partition);
     ASSERT_EQ(partition->missing.size(), 1U);
+    target.log_enqueue(partition->missing.front(), 0, 1);
     EXPECT_FALSE(target.cancel_load(*hinted));
     ASSERT_TRUE(target.start_load(*hinted));
     EXPECT_FALSE(target.start_load(*hinted));

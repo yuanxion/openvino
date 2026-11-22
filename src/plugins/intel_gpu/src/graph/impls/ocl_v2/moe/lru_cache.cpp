@@ -39,10 +39,10 @@ void LRUCache::load_trace_event_unlocked(const char* name, const Node& node) con
     LESTimeline::instant(name, args);
     if (std::string(name) == "expert_copying")
         LESTimeline::load_span("expert_reserved_wait", args, node.state.reserved_us, node.state.copy_started_us,
-                               node.state.load_trace->target_layer_index, node.lru_expert_no);
+                               node.state.load_trace->target_layer_index, node.lru_expert_no, node.expert);
     else if (std::string(name) == "expert_completed" && node.state.copy_started_us)
         LESTimeline::load_span("expert_host_copy", args, node.state.copy_started_us, node.state.completed_us,
-                               node.state.load_trace->target_layer_index, node.lru_expert_no);
+                               node.state.load_trace->target_layer_index, node.lru_expert_no, node.expert);
     const char* itt = std::getenv("OV_GPU_LES_ITT");
     if (itt && (std::string(itt) == "1" || std::string(itt) == "details")) {
         static auto domain = openvino::itt::internal::domain("ov::intel_gpu");
@@ -53,7 +53,7 @@ void LRUCache::load_trace_event_unlocked(const char* name, const Node& node) con
 
 void LRUCache::record_cache_event_unlocked(char kind, size_t expert, const std::string& details) {
     static_cast<void>(details);
-    if (!LESLog::instance().enabled() || !m_log_window)
+    if ((!LESLog::instance().enabled() && !LESTimeline::enabled()) || !m_log_window)
         return;
     const auto now = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -149,7 +149,7 @@ TimestampLogRecord LRUCache::timestamp_snapshot_unlocked(const std::vector<size_
 }
 
 void LRUCache::set_log_window(bool enabled, bool reset) {
-    if (!LESLog::instance().enabled())
+    if (!LESLog::instance().enabled() && !LESTimeline::enabled())
         return;
     std::lock_guard<std::mutex> lock(m_mutex);
     if (m_log_window == enabled && !reset)
@@ -171,6 +171,7 @@ void LRUCache::log_enqueue(const Load& load, uint64_t epoch, size_t queue_depth)
     const auto found = m_map.find(Key{load.expert_id});
     if (found == m_map.end() || found->second->state.generation != load.generation)
         return;
+    load_trace_event_unlocked("expert_enqueued", *found->second);
     std::ostringstream details;
     details << " origin=speculative epoch=" << epoch << " queue_depth=" << queue_depth;
     record_cache_event_unlocked('J', load.expert_id, details.str());
@@ -613,7 +614,6 @@ bool LRUCache::fail_load(const Load& load) {
     if (found == m_map.end() || found->second->state.generation != load.generation || !found->second->state.loading)
         return false;
     found->second->state.copying = false;
-    load_trace_event_unlocked("expert_failed", *found->second);
     record_cache_event_unlocked('F', load.expert_id);
     trace_event_unlocked('F', load.expert_id);
     return true;
@@ -642,7 +642,7 @@ bool LRUCache::complete_load(const Load& load) {
             std::chrono::steady_clock::now().time_since_epoch()).count();
         load_trace_event_unlocked("expert_completed", node);
     }
-    if (was_loading && LESLog::instance().enabled()) {
+    if (was_loading && (LESLog::instance().enabled() || LESTimeline::enabled())) {
         std::ostringstream details;
         details << " reserved_us=" << node.state.reserved_us << " copy_started_us=" << node.state.copy_started_us
                 << " completed_us=" << node.state.completed_us
@@ -662,7 +662,6 @@ bool LRUCache::cancel_load(const Load& load) {
         return false;
     }
     m_filled_list[found->second->lru_expert_no] = false;
-    load_trace_event_unlocked("expert_cancelled", *found->second);
     trace_event_unlocked('X', found->second->expert);
     m_list.erase(found->second);
     m_map.erase(found);

@@ -9,7 +9,9 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <vector>
+#include "les_log.hpp"
 #ifdef __linux__
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -70,17 +72,40 @@ public:
             instance().write(name, args, now(), 0, 'i', thread_id());
     }
 
+    static std::string layer_arguments(const TimestampLayerRecord& layer) {
+        std::ostringstream events;
+        events << '[';
+        bool first = true;
+        for (const auto& event : layer.cache_events) {
+            if (event.state != les_event_name('R') && event.state != les_event_name('J') &&
+                event.state != les_event_name('B') && event.state != les_event_name('D'))
+                continue;
+            events << (first ? "" : ",") << "{\"sequence\":" << event.sequence
+                   << ",\"timestamp_us\":" << event.timestamp << ",\"state\":" << quote(event.state)
+                   << ",\"expert_id\":" << event.expert << '}';
+            first = false;
+        }
+        events << ']';
+        return "{\"lru_cache_expert_ids\":" + array(layer.expert_ids) +
+               ",\"topk_expert_ids\":" + array(layer.topk_expert_ids) +
+               ",\"prediction_ids\":" + array(layer.predicted_expert_ids) +
+               ",\"ready_expert_ids\":" + array(layer.ready_expert_ids) +
+               ",\"inflight_expert_ids\":" + array(layer.inflight_expert_ids) +
+               ",\"missing_expert_ids\":" + array(layer.missing_expert_ids) +
+               ",\"cache_events\":" + events.str() + '}';
+    }
+
     static void span(const std::string& name, const std::string& args, int64_t start, int64_t end, uint64_t thread) {
         if (enabled())
             instance().write(name, args, start, end - start, 'X', thread);
     }
 
     static void load_span(const std::string& name, const std::string& args, int64_t start, int64_t end,
-                          uint32_t layer, size_t slot) {
+                          uint32_t layer, size_t slot, size_t expert) {
         if (enabled()) {
             auto& timeline = instance();
-            const auto thread = timeline.load_track(layer, slot);
-            timeline.write(name, args, start, end - start, 'X', thread);
+            const auto thread = timeline.load_track(layer, slot, expert);
+            timeline.write(name + " expert " + std::to_string(expert), args, start, end - start, 'X', thread);
         }
     }
 
@@ -107,13 +132,14 @@ private:
 #endif
     }
 
-    uint64_t load_track(uint32_t layer, size_t slot) {
+    uint64_t load_track(uint32_t layer, size_t slot, size_t expert) {
         std::lock_guard<std::mutex> lock(mutex);
-        const auto result = load_tracks.emplace(std::make_pair(layer, slot), (uint64_t{1} << 29) + load_tracks.size());
+        const auto result = load_tracks.emplace(std::make_tuple(layer, slot, expert), (uint64_t{1} << 29) + load_tracks.size());
         if (result.second) {
             output << ",\n{\"ph\":\"M\",\"name\":\"thread_name\",\"pid\":" << process_id()
                    << ",\"tid\":" << result.first->second << ",\"args\":{\"name\":"
-                   << quote("LES layer " + std::to_string(layer) + " slot " + std::to_string(slot)) << "}}";
+                   << quote("LES layer " + std::to_string(layer) + " expert " + std::to_string(expert) +
+                            " slot " + std::to_string(slot)) << "}}";
         }
         return result.first->second;
     }
@@ -132,7 +158,7 @@ private:
 
     std::ofstream output;
     std::mutex mutex;
-    std::map<std::pair<uint32_t, size_t>, uint64_t> load_tracks;
+    std::map<std::tuple<uint32_t, size_t, size_t>, uint64_t> load_tracks;
 };
 
 struct LESLoadContext {

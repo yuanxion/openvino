@@ -101,6 +101,13 @@ public:
         const char* request = std::getenv("LOG_REQUEST_CONTEXT");
         m_args = "{\"request\":" + moe::LESTimeline::quote(request ? request : "") +
                  ",\"token_index\":" + std::to_string(token) + ",\"layer_index\":" + std::to_string(layer) + '}';
+        if (record) {
+            const bool has_next = record->target_index != record->layer_index;
+            m_args.pop_back();
+            m_args += ",\"next_layer_index\":" + (has_next ? std::to_string(record->target_index) : "null") +
+                      ",\"current_layer\":" + moe::LESTimeline::layer_arguments(record->current) +
+                      ",\"next_layer\":" + moe::LESTimeline::layer_arguments(has_next ? record->target : moe::TimestampLayerRecord{}) + '}';
+        }
         if (details() && record) {
             for (const auto* snapshot : {&record->current, &record->target}) {
                 name += "\nlayer_" + std::to_string(snapshot->layer_index);
@@ -862,8 +869,9 @@ public:
                        int line,
                        bool next_layer,
                        const std::vector<size_t>& topk_experts,
-                       const moe::TimestampLogRecord& context) {
-        const auto* next = next_layer ? _lookahead->get_next_layer(&instance) : nullptr;
+                       const moe::TimestampLogRecord& context,
+                       bool tracing = false) {
+        const auto* next = (next_layer || tracing) ? _lookahead->get_next_layer(&instance) : nullptr;
         const auto& target = next ? next->moe_inst->id() : instance.id();
         _lookahead->set_timestamp_arguments(instance.id(), topk_experts, context.missing_expert_ids);
         auto snapshots = _lookahead->timestamp_pair(instance.id(), target);
@@ -2066,15 +2074,15 @@ public:
         log_context.token_index = debug_token ? debug_token - 1 : 0;
         size_t point_index = 0;
         LESPhaseTrace phase_trace;
-        if (_lookahead && _weight_provider->is_offloaded() && token_num == 1) {
+        if (LESPhaseTrace::enabled() && _lookahead && _weight_provider->is_offloaded() && token_num == 1) {
             static_cast<OffloadExpertWeightProvider&>(*_weight_provider).cache().set_load_trace_context(
                 log_context.token_index, _lookahead->layer_index(instance.id()), tracing);
         }
-        if (_lookahead && moe::LESLog::instance().enabled() && token_num == 1) {
-            _lookahead->prepare_timestamp_window(instance.id(), log_context.token_index, logging);
-            _lookahead->set_cache_log_context(instance.id(), log_context.token_index, logging);
+        if (_lookahead && (moe::LESLog::instance().enabled() || moe::LESTimeline::enabled()) && token_num == 1) {
+            _lookahead->prepare_timestamp_window(instance.id(), log_context.token_index, logging || tracing);
+            _lookahead->set_cache_log_context(instance.id(), log_context.token_index, logging || tracing);
             if (const auto* next = _lookahead->get_next_layer(&instance))
-                _lookahead->set_cache_log_context(next->moe_inst->id(), log_context.token_index, logging);
+                _lookahead->set_cache_log_context(next->moe_inst->id(), log_context.token_index, logging || tracing);
         }
         const auto log_point = [&](const char* tag, int line, bool next_layer = false) {
             if (logging || tracing) {
@@ -2082,11 +2090,10 @@ public:
                     phase_trace.finish();
                 const auto numbered = std::to_string(point_index++) + '-' + tag;
                 moe::TimestampLogRecord record;
-                if (logging)
-                    record = timestamp_log(instance, numbered.c_str(), __FILE__, line, next_layer, known_topk, log_context);
+                record = timestamp_log(instance, numbered.c_str(), __FILE__, line, next_layer, known_topk, log_context, tracing);
                 if (tracing)
                     phase_trace.mark(numbered, log_context.token_index, _lookahead->layer_index(instance.id()),
-                                     logging ? &record : nullptr);
+                                     &record);
             }
         };
         log_point("exec_batched_gemv", __LINE__);
@@ -2121,8 +2128,9 @@ public:
             log_point("topk_copy_to_start", __LINE__);
             scratch.topk_id->copy_to(stream, experts.data(), 0, 0, experts.size() * sizeof(uint32_t), true);
             known_topk.assign(experts.begin(), experts.end());
-            static_cast<OffloadExpertWeightProvider&>(*_weight_provider).cache().set_load_trace_context(
-                log_context.token_index, _lookahead->layer_index(instance.id()), tracing, experts);
+            if (LESPhaseTrace::enabled())
+                static_cast<OffloadExpertWeightProvider&>(*_weight_provider).cache().set_load_trace_context(
+                    log_context.token_index, _lookahead->layer_index(instance.id()), tracing, experts);
             log_point("topk_copy_to_end", __LINE__);
 
             for (auto expert : experts) {
@@ -2274,7 +2282,7 @@ public:
                     for (const auto& load : partition->missing) {
                         missing_ids.push_back(load.expert_id);
                     }
-                    if (logging) {
+                    if (logging || tracing) {
                         log_context.missing_expert_ids.assign(missing_ids.begin(), missing_ids.end());
                     }
                     log_point("partition_3way", __LINE__);

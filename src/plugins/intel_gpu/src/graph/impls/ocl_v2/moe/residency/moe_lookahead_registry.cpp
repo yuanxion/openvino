@@ -362,7 +362,7 @@ void LookaheadContext::set_timestamp_prediction(const cldnn::primitive_id& id, c
 }
 
 void LookaheadContext::prepare_timestamp_window(const cldnn::primitive_id& id, size_t token, bool emit) {
-    if (!LESLog::instance().enabled())
+    if (!LESLog::instance().enabled() && !LESTimeline::enabled())
         return;
     const auto found = m_layer_indices.find(id);
     if (found == m_layer_indices.end() || (m_cursor && found->second > *m_cursor) || m_timestamp_epoch == m_epoch + 1)

@@ -380,6 +380,7 @@ struct ExpertPrefetcher::State {
                         auto context = std::make_shared<LESLoadContext>(*trace_context);
                         context->prediction_expert_ids = experts;
                         trace_context = std::move(context);
+                        binding->cache->set_timestamp_prediction(std::vector<size_t>(experts.begin(), experts.end()), {});
                     }
                     for (auto expert : experts) {
                         OPENVINO_ASSERT(expert < static_cast<uint32_t>(binding->config.num_expert), "Invalid predicted expert ID");
