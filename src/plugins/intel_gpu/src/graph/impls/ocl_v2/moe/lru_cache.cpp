@@ -10,57 +10,29 @@
 
 namespace ov::intel_gpu::ocl::moe {
 
-void LRUCache::log_cache_state_unlocked(char kind, size_t expert, int64_t event_us,
-                                       const std::string& details, bool snapshot) const {
-    const char* prefix = les_changed_prefix;
-    if (kind == 'R' || kind == 'F' || kind == 'J')
-        prefix = les_queued_prefix;
-    else if (kind == 'B')
-        prefix = les_copying_prefix;
-    else if (kind == 'D')
-        prefix = les_ready_prefix;
-    else if (kind == 'E' || kind == 'X')
-        prefix = les_evicted_prefix;
-    std::vector<size_t> experts;
-    if (kind == 'E' || kind == 'X') {
-        experts.push_back(expert);
-    } else {
-        for (const auto& node : m_list) {
-            const bool queued = node.state.loading && !node.state.copying;
-            const bool selected = (kind == 'R' || kind == 'F' || kind == 'J') ? queued :
-                                  kind == 'B' ? node.state.copying : m_filled_list[node.lru_expert_no];
-            if (selected)
-                experts.push_back(node.expert);
-        }
-    }
-    std::ostringstream text;
-    text << "event=" << (snapshot ? "cache_state" : "cache_change") << " cache=" << this
-         << " window=" << m_log_window_id << " state=" << kind << " event_us=" << event_us;
-    if (!snapshot) {
-        text << " expert=" << expert;
-        const auto found = m_map.find(Key{expert});
-        if (found != m_map.end())
-            text << ' ' << log_node_unlocked(*found->second);
-    }
-    text << details << u8" \u6709\u5e8f\u7f13\u5b58\u4e8b\u4ef6=[";
-    for (size_t index = 0; index < m_ordered_cache_events.size(); ++index) {
-        if (index)
-            text << ',';
-        const auto& event = m_ordered_cache_events[index];
-        text << '[' << index + 1 << ',' << event.time_us << ",\"" << event.kind << "\"," << event.expert << ']';
-    }
-    text << ']';
-    LESLog::instance().write(m_log_layer, __FILE__, __LINE__, __func__, text.str(), prefix, les_ids(experts));
-}
-
 void LRUCache::record_cache_event_unlocked(char kind, size_t expert, const std::string& details) {
-    MOE_LES_LOG(m_log_layer, "event=record_cache_event_unlocked kind=" << kind << " expert=" << expert);
+    static_cast<void>(details);
     if (!LESLog::instance().enabled() || !m_log_window)
         return;
     const auto now = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
-    m_ordered_cache_events.push_back({now, kind, expert});
-    log_cache_state_unlocked(kind, expert, now, details);
+    m_ordered_cache_events.push_back({now, kind, expert, ++m_cache_event_sequence});
+    if (m_log_emit && LESLog::instance().text_enabled()) {
+        auto record = timestamp_snapshot_unlocked({});
+        record.token_index = m_log_token_index;
+        record.layer_index = m_log_layer_index;
+        record.target_index = m_log_layer_index;
+        record.source_code = "lru_cache.cpp:" + std::to_string(__LINE__);
+        record.tag = "cache_event";
+        LESLog::instance().write_timestamp(record, false);
+    }
+}
+
+void LRUCache::set_log_context(size_t token_index, uint32_t layer_index, bool emit) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_log_token_index = token_index;
+    m_log_layer_index = layer_index;
+    m_log_emit = emit;
 }
 
 std::vector<LRUCache::TraceEvent> LRUCache::ordered_cache_events() const {
@@ -68,27 +40,89 @@ std::vector<LRUCache::TraceEvent> LRUCache::ordered_cache_events() const {
     return m_ordered_cache_events;
 }
 
-void LRUCache::set_log_window(bool enabled) {
+TimestampLogRecord LRUCache::timestamp_snapshot(const std::vector<size_t>& topk_experts) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return timestamp_snapshot_unlocked(topk_experts);
+}
+
+std::pair<TimestampLogRecord, TimestampLogRecord> LRUCache::timestamp_pair(const LRUCache& current,
+                                                                         const LRUCache& target) {
+    if (&current == &target) {
+        const auto snapshot = current.timestamp_snapshot({});
+        return {snapshot, snapshot};
+    }
+    std::scoped_lock lock(current.m_mutex, target.m_mutex);
+    auto first = current.timestamp_snapshot_unlocked({});
+    auto second = target.timestamp_snapshot_unlocked({});
+    first.timestamp = second.timestamp;
+    return {std::move(first), std::move(second)};
+}
+
+void LRUCache::set_timestamp_arguments(const std::vector<size_t>& topk, const std::vector<size_t>& demand) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_log_topk = topk;
+    m_log_demand = demand;
+}
+
+void LRUCache::set_timestamp_prediction(const std::vector<size_t>& predicted, const std::vector<size_t>& submitted) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_log_predicted = predicted;
+    m_log_prefetching = submitted;
+}
+
+TimestampLogRecord LRUCache::timestamp_snapshot_unlocked(const std::vector<size_t>& requested_topk) const {
+    TimestampLogRecord record;
+    record.timestamp = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const auto& topk_experts = requested_topk.empty() ? m_log_topk : requested_topk;
+    record.target_topk_expert_ids = topk_experts;
+    record.missing_expert_ids = m_log_demand;
+    record.predicted_expert_ids = m_log_predicted;
+    record.prefetching_expert_ids = m_log_prefetching;
+    for (auto expert : topk_experts) {
+        auto found = m_map.find(Key{expert});
+        if (found == m_map.end())
+            record.partition_missing_expert_ids.push_back(expert);
+        else if (found->second->state.loading)
+            record.inflight_expert_ids.push_back(expert);
+        else if (m_filled_list[found->second->lru_expert_no])
+            record.ready_expert_ids.push_back(expert);
+        else
+            record.partition_missing_expert_ids.push_back(expert);
+    }
+    for (const auto& node : m_list) {
+        if (!m_filled_list[node.lru_expert_no])
+            continue;
+        record.target_expert_ids.push_back(node.expert);
+        if (std::find(topk_experts.begin(), topk_experts.end(), node.expert) != topk_experts.end())
+            record.target_expert_hit_ids.push_back(node.expert);
+    }
+    for (const auto& event : m_ordered_cache_events) {
+        record.cache_events.push_back({event.sequence, event.time_us, les_event_name(event.kind), event.expert});
+        if (std::find(topk_experts.begin(), topk_experts.end(), event.expert) != topk_experts.end() &&
+            std::find(record.cache_events_expert_hit_ids.begin(), record.cache_events_expert_hit_ids.end(), event.expert) ==
+                record.cache_events_expert_hit_ids.end())
+            record.cache_events_expert_hit_ids.push_back(event.expert);
+    }
+    return record;
+}
+
+void LRUCache::set_log_window(bool enabled, bool reset) {
     if (!LESLog::instance().enabled())
         return;
     std::lock_guard<std::mutex> lock(m_mutex);
-    if (m_log_window == enabled)
+    if (m_log_window == enabled && !reset)
         return;
     if (enabled) {
         m_ordered_cache_events.clear();
-        m_log_window = true;
+        m_log_topk.clear();
+        m_log_demand.clear();
+        m_log_predicted.clear();
+        m_log_prefetching.clear();
+        m_log_emit = false;
         ++m_log_window_id;
-        // MOE_LES_LOG(m_log_layer, "event=cache_window phase=begin cache=" << this << " window=" << m_log_window_id);
-
     }
-    const auto now = std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-    for (const char kind : {'D', 'B', 'R'})
-        log_cache_state_unlocked(kind, 0, now, enabled ? " boundary=begin" : " boundary=end", true);
-    if (!enabled) {
-        MOE_LES_LOG(m_log_layer, "event=cache_window phase=end cache=" << this << " window=" << m_log_window_id);
-        m_log_window = false;
-    }
+    m_log_window = enabled;
 }
 
 void LRUCache::log_enqueue(const Load& load, uint64_t epoch, size_t queue_depth) {
@@ -123,7 +157,6 @@ void LRUCache::trace_event_unlocked(char kind, size_t expert) {
 void LRUCache::begin_trace() {
     std::lock_guard<std::mutex> lock(m_mutex);
     OPENVINO_ASSERT(!m_trace_active, "LRU trace already active");
-    MOE_LES_LOG(m_log_layer, "event=trace_begin cache=" << this);
     m_trace = {};
     m_trace_generation = m_generation;
     for (const auto& node : m_list) {
@@ -172,7 +205,6 @@ LRUCache::Trace LRUCache::snapshot() const {
 LRUCache::Trace LRUCache::end_trace() {
     std::lock_guard<std::mutex> lock(m_mutex);
     OPENVINO_ASSERT(m_trace_active, "LRU trace was not started");
-    MOE_LES_LOG(m_log_layer, "event=trace_end cache=" << this);
     capture_snapshot_unlocked(m_trace);
     m_trace_active = false;
     return std::move(m_trace);
@@ -346,7 +378,6 @@ void LRUCache::move_to_end(std::list<Node>::iterator it) {
 std::optional<LRUCache::Partition> LRUCache::partition_3way(const std::vector<uint32_t>& topk_ids,
                                                         const EventFactory& make_event,
                                                         bool allow_pending_reuse) {
-    MOE_LES_LOG(m_log_layer, "event=partition_3way topk_ids=" << les_ids(topk_ids));
     std::lock_guard<std::mutex> lock(m_mutex);
     const std::unordered_set<uint32_t> requested(topk_ids.begin(), topk_ids.end());
     if (requested.size() > m_max_total_experts) {
@@ -476,14 +507,6 @@ std::optional<LRUCache::Load> LRUCache::reserve_speculative(uint32_t expert_id,
         }
         slot = victim->lru_expert_no;
         last_use = victim->state.last_use_event;
-        if (LESLog::instance().enabled()) {
-            const auto oldest = std::find_if(m_list.begin(), m_list.end(), [](const Node& node) {
-                return node.state.status == SlotStatus::READY && !node.state.loading;
-            });
-            MOE_LES_LOG(m_log_layer, "event=speculative_victim incoming=" << expert_id << " victim=" << victim->expert
-                        << " slot=" << slot << " predicted=" << les_ids(predicted_experts)
-                        << " oldest_ready=" << oldest->expert);
-        }
     }
     auto ready = make_event();
     if (victim == m_list.end()) {
@@ -586,7 +609,7 @@ bool LRUCache::cancel_load(const Load& load) {
     std::lock_guard<std::mutex> lock(m_mutex);
     auto found = m_map.find(Key{load.expert_id});
     if (found == m_map.end() || found->second->state.generation != load.generation ||
-        found->second->state.demanded || !found->second->state.loading) {
+        found->second->state.demanded || found->second->state.copying || !found->second->state.loading) {
         return false;
     }
     m_filled_list[found->second->lru_expert_no] = false;

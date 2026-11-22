@@ -409,9 +409,7 @@ std::optional<ExpertSlotLease> OffloadExpertWeightProvider::try_acquire_simultan
                 perf->gpu_misses.fetch_add(1, std::memory_order_relaxed);
             }
             OPENVINO_ASSERT(_resident != nullptr, "OffloadExpertWeightProvider: resident buffers not bound");
-            MOE_LES_LOG(_cache->log_layer(), "event=synchronous_load_begin expert=" << expert << " slot=" << slot);
             moe_otd::fill_weights_memory(stream, _config, _weight_bin_offsets, _weight_reader, *_resident, {expert}, {slot});
-            MOE_LES_LOG(_cache->log_layer(), "event=synchronous_load_end expert=" << expert << " slot=" << slot);
             _cache->set_filled(slot);
         }
 
@@ -442,9 +440,7 @@ size_t OffloadExpertWeightProvider::acquire_one(uint32_t expert, cldnn::stream& 
             perf->gpu_misses.fetch_add(1, std::memory_order_relaxed);
         }
         OPENVINO_ASSERT(_resident != nullptr, "OffloadExpertWeightProvider: resident buffers not bound");
-        MOE_LES_LOG(_cache->log_layer(), "event=synchronous_load_begin expert=" << expert << " slot=" << slot);
         moe_otd::fill_weights_memory(stream, _config, _weight_bin_offsets, _weight_reader, *_resident, {expert}, {slot});
-        MOE_LES_LOG(_cache->log_layer(), "event=synchronous_load_end expert=" << expert << " slot=" << slot);
         _cache->set_filled(slot);
     }
 

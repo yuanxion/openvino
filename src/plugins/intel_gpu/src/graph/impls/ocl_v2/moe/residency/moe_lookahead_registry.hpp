@@ -47,11 +47,21 @@ public:
     ~LookaheadContext();
     void build_once(cldnn::network& network);
     const LookaheadLayerDesc* get_next_layer(const cldnn::primitive_inst* current_moe) const;
+    uint32_t layer_index(const cldnn::primitive_id& id) const { return m_layer_indices.at(id); }
+    std::optional<TimestampLogRecord> timestamp_snapshot(const cldnn::primitive_id& id,
+                                                       const std::vector<size_t>& topk_experts) const;
+    std::pair<TimestampLogRecord, TimestampLogRecord> timestamp_pair(const cldnn::primitive_id& current,
+                                                                  const cldnn::primitive_id& target) const;
+    void set_timestamp_arguments(const cldnn::primitive_id& id, const std::vector<size_t>& topk,
+                                 const std::vector<size_t>& demand);
+    void set_timestamp_prediction(const cldnn::primitive_id& id, const std::vector<size_t>& predicted,
+                                  const std::vector<size_t>& submitted);
     ExpertPrefetcher& prefetcher() { return *m_prefetcher; }
     uint64_t epoch() const { return m_epoch; }
     const std::vector<cldnn::program::les_router_link>& links() const { return m_links; }
 
     void enter(const cldnn::primitive_id& id);
+    void prepare_timestamp_window(const cldnn::primitive_id& id, size_t token = 0, bool emit = false);
     void demand_partitioned(const cldnn::primitive_id& id);
     void pause_for_prefill();
     void capture_cache_baseline();
@@ -83,10 +93,16 @@ public:
         return found == m_predictions.end() ? Prediction{} : found->second;
     }
 
+    void set_cache_log_context(const cldnn::primitive_id& id, size_t token_index, bool emit) {
+        const auto found = m_providers.find(id);
+        if (found != m_providers.end() && found->second)
+            found->second->cache().set_log_context(token_index, layer_index(id), emit);
+    }
+
     void predict(const LookaheadLayerDesc& next_layer,
                  const cldnn::memory::ptr& hidden,
                  const cldnn::event::ptr& ready);
-    void prefetch(const cldnn::primitive_inst* current_moe);
+    bool prefetch(const cldnn::primitive_inst* current_moe);
 
 private:
     cldnn::network& m_network;
@@ -98,6 +114,7 @@ private:
     std::vector<LookaheadLayerDesc> m_layers;
     std::unordered_map<const cldnn::primitive_inst*, size_t> m_moe_to_next_index;
     uint64_t m_epoch = 0;
+    uint64_t m_timestamp_epoch = 0;
     std::optional<uint32_t> m_cursor;
     std::unordered_map<cldnn::primitive_id, std::shared_ptr<OffloadExpertWeightProvider>> m_providers;
     std::unordered_map<cldnn::primitive_id, std::unique_ptr<LookaheadRouter>> m_routers;

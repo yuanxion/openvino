@@ -111,6 +111,91 @@ TEST(moe_lookahead_lru, ordered_events_only_include_current_logging_window_witho
     }
 }
 
+TEST(moe_lookahead_lru, timestamp_window_reset_preserves_residency_and_event_identity) {
+    LRUCache cache(8);
+    cache.set_log_window(true);
+    const auto load = cache.reserve_speculative(1, 2, make_lookahead_test_event);
+    ASSERT_TRUE(load);
+    ASSERT_TRUE(cache.start_load(*load));
+    ASSERT_TRUE(cache.complete_load(*load));
+    const auto before = cache.timestamp_snapshot({1});
+    EXPECT_EQ(before.target_expert_ids, (std::vector<size_t>{1}));
+    EXPECT_EQ(before.target_expert_hit_ids, (std::vector<size_t>{1}));
+    if (ov::intel_gpu::ocl::moe::LESLog::instance().enabled()) {
+        ASSERT_EQ(before.cache_events.size(), 3U);
+        EXPECT_EQ(before.cache_events[0].state, u8"\u9884\u8ba2");
+        EXPECT_EQ(before.cache_events[1].state, u8"\u52a0\u8f7d");
+        EXPECT_EQ(before.cache_events[2].state, u8"\u642c\u5b8c");
+        EXPECT_EQ(before.cache_events_expert_hit_ids, (std::vector<size_t>{1}));
+    }
+    cache.set_log_window(true, true);
+    const auto after = cache.timestamp_snapshot({1});
+    EXPECT_EQ(after.target_expert_ids, before.target_expert_ids);
+    EXPECT_EQ(after.target_expert_hit_ids, before.target_expert_hit_ids);
+    EXPECT_TRUE(after.cache_events.empty());
+    EXPECT_TRUE(after.cache_events_expert_hit_ids.empty());
+    const auto next = cache.reserve_speculative(2, 2, make_lookahead_test_event);
+    ASSERT_TRUE(next);
+    const auto final = cache.timestamp_snapshot({1, 2});
+    EXPECT_EQ(final.target_expert_ids, (std::vector<size_t>{1}));
+    if (ov::intel_gpu::ocl::moe::LESLog::instance().enabled()) {
+        ASSERT_EQ(final.cache_events.size(), 1U);
+        EXPECT_GT(final.cache_events.front().sequence, before.cache_events.back().sequence);
+        EXPECT_EQ(final.cache_events_expert_hit_ids, (std::vector<size_t>{2}));
+    }
+}
+
+TEST(moe_lookahead_lru, timestamp_three_classes_follow_load_completion) {
+    LRUCache cache(8);
+    cache.set_log_window(true);
+    cache.set_log_context(0, 0, true);
+    cache.set_filled(cache.get_lru_item(1).first);
+    const auto pending = cache.reserve_speculative(2, 3, make_lookahead_test_event);
+    ASSERT_TRUE(pending);
+    const auto before = cache.timestamp_snapshot({1, 2, 3});
+    EXPECT_EQ(before.ready_expert_ids, (std::vector<size_t>{1}));
+    EXPECT_EQ(before.inflight_expert_ids, (std::vector<size_t>{2}));
+    EXPECT_EQ(before.partition_missing_expert_ids, (std::vector<size_t>{3}));
+    ASSERT_TRUE(cache.complete_load(*pending));
+    const auto after = cache.timestamp_snapshot({1, 2, 3});
+    EXPECT_EQ(after.ready_expert_ids, (std::vector<size_t>{1, 2}));
+    EXPECT_TRUE(after.inflight_expert_ids.empty());
+    EXPECT_EQ(after.partition_missing_expert_ids, (std::vector<size_t>{3}));
+}
+
+TEST(moe_lookahead_lru, timestamp_pair_preserves_unknown_topk_and_layer_arguments) {
+    LRUCache current(8);
+    LRUCache target(8);
+    current.set_log_window(true);
+    target.set_log_window(true);
+    current.set_filled(current.get_lru_item(1).first);
+    current.set_timestamp_arguments({1, 2}, {2});
+    target.set_timestamp_prediction({3, 4}, {3, 4});
+    const auto pair = LRUCache::timestamp_pair(current, target);
+    EXPECT_EQ(pair.first.timestamp, pair.second.timestamp);
+    EXPECT_EQ(pair.first.target_topk_expert_ids, (std::vector<size_t>{1, 2}));
+    EXPECT_EQ(pair.first.ready_expert_ids, (std::vector<size_t>{1}));
+    EXPECT_EQ(pair.first.partition_missing_expert_ids, (std::vector<size_t>{2}));
+    EXPECT_EQ(pair.first.missing_expert_ids, (std::vector<size_t>{2}));
+    EXPECT_TRUE(pair.first.predicted_expert_ids.empty());
+    EXPECT_TRUE(pair.second.target_topk_expert_ids.empty());
+    EXPECT_TRUE(pair.second.ready_expert_ids.empty());
+    EXPECT_TRUE(pair.second.inflight_expert_ids.empty());
+    EXPECT_TRUE(pair.second.partition_missing_expert_ids.empty());
+    EXPECT_TRUE(pair.second.missing_expert_ids.empty());
+    EXPECT_EQ(pair.second.predicted_expert_ids, (std::vector<size_t>{3, 4}));
+    EXPECT_EQ(pair.second.prefetching_expert_ids, (std::vector<size_t>{3, 4}));
+    const auto same = LRUCache::timestamp_pair(current, current);
+    EXPECT_EQ(same.first.timestamp, same.second.timestamp);
+    EXPECT_EQ(same.first.target_expert_ids, same.second.target_expert_ids);
+    target.set_log_window(true, true);
+    if (ov::intel_gpu::ocl::moe::LESLog::instance().enabled()) {
+        const auto reset = target.timestamp_snapshot({});
+        EXPECT_TRUE(reset.predicted_expert_ids.empty());
+        EXPECT_TRUE(reset.prefetching_expert_ids.empty());
+    }
+}
+
 TEST(moe_lookahead_lru, partitions_and_pins_ready_inflight_missing_atomically) {
     LRUCache cache(8);
     const auto resident = cache.get_lru_item(1);
@@ -156,6 +241,36 @@ TEST(moe_lookahead_lru, preserves_war_event_on_slot_replacement) {
     EXPECT_EQ(next->missing.front().last_use_event, consumer);
     EXPECT_EQ(next->missing.front().slot, first->missing.front().slot);
     EXPECT_FALSE(cache.complete_load(first->missing.front()));
+}
+
+TEST(moe_lookahead_lru, unpin_preserves_residency_and_eviction_preserves_consumer_event) {
+    LRUCache cache(1);
+    cache.set_log_window(true);
+    const auto initial = cache.partition_3way({1}, make_lookahead_test_event);
+    ASSERT_TRUE(initial);
+    ASSERT_TRUE(cache.complete_load(initial->missing.front()));
+    const auto before = cache.resident_experts();
+    const auto consumer = make_lookahead_test_event();
+    cache.unpin_all(consumer);
+    EXPECT_EQ(cache.size(), 1U);
+    EXPECT_EQ(cache.resident_experts(), before);
+    if (ov::intel_gpu::ocl::moe::LESLog::instance().enabled()) {
+        const auto events = cache.timestamp_snapshot({1}).cache_events;
+        ASSERT_FALSE(events.empty());
+        EXPECT_EQ(events.back().state, u8"\u89e3\u9664\u5360\u7528");
+    }
+    const auto replacement = cache.partition_3way({2}, make_lookahead_test_event);
+    ASSERT_TRUE(replacement);
+    ASSERT_EQ(replacement->missing.size(), 1U);
+    EXPECT_EQ(replacement->missing.front().slot, initial->missing.front().slot);
+    EXPECT_EQ(replacement->missing.front().last_use_event, consumer);
+    EXPECT_TRUE(cache.resident_experts().empty());
+    if (ov::intel_gpu::ocl::moe::LESLog::instance().enabled()) {
+        const auto events = cache.ordered_cache_events();
+        EXPECT_EQ(std::count_if(events.begin(), events.end(), [](const auto& event) {
+            return event.kind == 'E' && event.expert == 1;
+        }), 1);
+    }
 }
 
 TEST(moe_lookahead_lru, pending_waves_reuse_slots_only_after_consumer_is_recorded) {
@@ -234,6 +349,25 @@ TEST(moe_lookahead_lru, prediction_protection_does_not_pin_hits_or_change_demand
     ASSERT_EQ(demand->missing.size(), 2U);
     EXPECT_EQ(demand->missing[0].slot, 1U);
     EXPECT_EQ(demand->missing[1].slot, 0U);
+}
+
+TEST(moe_lookahead_lru, cancellation_does_not_reuse_an_active_copy_slot) {
+    LRUCache cache(8);
+    const auto active = cache.reserve_speculative(1, 2, make_lookahead_test_event);
+    ASSERT_TRUE(active);
+    ASSERT_TRUE(cache.start_load(*active));
+    EXPECT_FALSE(cache.cancel_load(*active));
+    const auto still_pending = cache.get_pending_load(1);
+    ASSERT_TRUE(still_pending);
+    EXPECT_EQ(still_pending->generation, active->generation);
+    EXPECT_EQ(cache.snapshot().current_copying, (std::vector<size_t>{1}));
+    const auto queued = cache.reserve_speculative(2, 2, make_lookahead_test_event);
+    ASSERT_TRUE(queued);
+    EXPECT_NE(queued->slot, active->slot);
+    EXPECT_TRUE(cache.cancel_load(*queued));
+    EXPECT_TRUE(cache.complete_load(*active));
+    EXPECT_EQ(cache.resident_experts(), (std::vector<size_t>{1}));
+    EXPECT_FALSE(cache.cancel_load(*active));
 }
 
 TEST(moe_lookahead_lru, cancelled_replacement_retains_physical_slot_war) {

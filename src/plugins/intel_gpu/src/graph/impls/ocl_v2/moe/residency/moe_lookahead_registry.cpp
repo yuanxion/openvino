@@ -25,12 +25,10 @@ LookaheadContext::~LookaheadContext() {
 }
 
 void LookaheadContext::pause_for_prefill() {
-    // MOE_LES_LOG("network:" + std::to_string(m_network.get_id()), "event=prefill_pause_begin epoch=" << m_epoch);
     m_compute_stream->flush();
     m_prefetcher->advance(++m_epoch, std::numeric_limits<uint32_t>::max());
     m_prefetcher->drain();
     m_cursor.reset();
-    // MOE_LES_LOG("network:" + std::to_string(m_network.get_id()), "event=prefill_pause_end epoch=" << m_epoch);
 }
 
 void LookaheadContext::capture_cache_baseline() {
@@ -109,7 +107,6 @@ LookaheadContext::CacheSnapshot LookaheadContext::cache_baseline(const cldnn::pr
 }
 
 void LookaheadContext::begin_handoff(const cldnn::primitive_id& source, size_t token, bool selected) {
-    // MOE_LES_LOG(source, "event=handoff_begin decode=" << token << " selected=" << selected);
     const char* path = std::getenv("LOG_HANDOFF_CSV_PATH");
     if (!path || !*path || !selected)
         return;
@@ -141,7 +138,6 @@ void LookaheadContext::checkpoint_handoff(const cldnn::primitive_id& source) {
 void LookaheadContext::finish_handoff(const cldnn::primitive_id& target,
                                     size_t token,
                                     const std::vector<uint32_t>& actual) {
-    MOE_LES_LOG(target, "event=handoff_finish decode=" << token << " actual=" << les_ids(actual));
     const char* path = std::getenv("LOG_HANDOFF_CSV_PATH");
     if (!path || !*path)
         return;
@@ -342,14 +338,50 @@ const LookaheadLayerDesc* LookaheadContext::get_next_layer(const cldnn::primitiv
     return descriptor.is_supported ? &descriptor : nullptr;
 }
 
+std::optional<TimestampLogRecord> LookaheadContext::timestamp_snapshot(const cldnn::primitive_id& id,
+                                                                     const std::vector<size_t>& topk_experts) const {
+    const auto provider = m_providers.find(id);
+    if (provider == m_providers.end())
+        return std::nullopt;
+    return provider->second->cache().timestamp_snapshot(topk_experts);
+}
+
+std::pair<TimestampLogRecord, TimestampLogRecord> LookaheadContext::timestamp_pair(
+    const cldnn::primitive_id& current, const cldnn::primitive_id& target) const {
+    return LRUCache::timestamp_pair(m_providers.at(current)->cache(), m_providers.at(target)->cache());
+}
+
+void LookaheadContext::set_timestamp_arguments(const cldnn::primitive_id& id, const std::vector<size_t>& topk,
+                                             const std::vector<size_t>& demand) {
+    m_providers.at(id)->cache().set_timestamp_arguments(topk, demand);
+}
+
+void LookaheadContext::set_timestamp_prediction(const cldnn::primitive_id& id, const std::vector<size_t>& predicted,
+                                              const std::vector<size_t>& submitted) {
+    m_providers.at(id)->cache().set_timestamp_prediction(predicted, submitted);
+}
+
+void LookaheadContext::prepare_timestamp_window(const cldnn::primitive_id& id, size_t token, bool emit) {
+    if (!LESLog::instance().enabled())
+        return;
+    const auto found = m_layer_indices.find(id);
+    if (found == m_layer_indices.end() || (m_cursor && found->second > *m_cursor) || m_timestamp_epoch == m_epoch + 1)
+        return;
+    for (const auto& provider : m_providers) {
+        provider.second->cache().set_log_window(true, true);
+        provider.second->cache().set_log_context(token, layer_index(provider.first), emit);
+    }
+    m_timestamp_epoch = m_epoch + 1;
+}
+
 void LookaheadContext::enter(const cldnn::primitive_id& id) {
-    // MOE_LES_LOG(id, "event=lookahead_enter epoch=" << m_epoch);
     m_prefetcher->rethrow_if_failed();
     auto found = m_layer_indices.find(id);
     if (found == m_layer_indices.end()) {
         return;
     }
     if (!m_cursor || found->second <= *m_cursor) {
+        prepare_timestamp_window(id);
         ++m_epoch;
         m_prefetcher->advance(m_epoch, 0);
     }
@@ -357,7 +389,6 @@ void LookaheadContext::enter(const cldnn::primitive_id& id) {
 }
 
 void LookaheadContext::demand_partitioned(const cldnn::primitive_id& id) {
-    // MOE_LES_LOG(id, "event=lookahead_demand_partitioned epoch=" << m_epoch);
     auto found = m_layer_indices.find(id);
     if (found != m_layer_indices.end()) {
         m_prefetcher->advance(m_epoch, found->second);
@@ -373,7 +404,6 @@ std::shared_ptr<IExpertWeightProvider> LookaheadContext::bind(const cldnn::primi
     auto offload = std::dynamic_pointer_cast<OffloadExpertWeightProvider>(provider);
     if (offload) {
         offload->cache().set_log_layer(id);
-        // MOE_LES_LOG(id, "event=provider_bind provider=" << offload.get());
         m_prefetcher->bind(offload);
         m_providers[id] = std::move(offload);
     }
@@ -389,14 +419,9 @@ void LookaheadContext::predict(const LookaheadLayerDesc& next_layer,
     const auto& target = next_layer.moe_inst->id();
     auto& state = m_predictions[target];
     if (state.consumed && !state.consumed->load(std::memory_order_acquire)) {
-        // MOE_LES_LOG(target, "event=prediction_skip reason=previous_not_consumed epoch=" << m_epoch);
         return;
     }
-    // MOE_LES_LOG(target, "event=router_prediction_submit_begin hidden=" << hidden.get() << " dependency=" << ready.get()
-    //             << " epoch=" << m_epoch);
     auto result = m_routers.at(target)->enqueue(hidden, ready);
-    // MOE_LES_LOG(target, "event=router_prediction_submit_end indices=" << result.indices.get()
-    //             << " completion=" << result.ready.get() << " epoch=" << m_epoch);
     state = {hidden, ready, result.indices, result.weights, result.ready,
              std::make_shared<std::atomic<bool>>(true), false, result.cpu_indices};
     auto handoff = m_handoffs.find(target);
@@ -404,26 +429,21 @@ void LookaheadContext::predict(const LookaheadLayerDesc& next_layer,
         handoff->second.predicted_indices = result.indices;
 }
 
-void LookaheadContext::prefetch(const cldnn::primitive_inst* current_moe) {
+bool LookaheadContext::prefetch(const cldnn::primitive_inst* current_moe) {
     const auto* next_layer = get_next_layer(current_moe);
     if (!next_layer) {
-        // MOE_LES_LOG(current_moe->id(), "event=prefetch_skip reason=no_next_layer epoch=" << m_epoch);
-        return;
+        return false;
     }
     const auto& target = next_layer->moe_inst->id();
     auto& state = m_predictions[target];
     auto provider = m_providers.find(target);
     if (state.submitted || !state.prediction_ready || provider == m_providers.end()) {
-        // MOE_LES_LOG(current_moe->id(), "event=prefetch_skip target=" << target << " submitted=" << state.submitted
-        //         << " has_prediction=" << static_cast<bool>(state.prediction_ready)
-        //         << " has_provider=" << (provider != m_providers.end()));
-        return;
+        return false;
     }
     auto weights = provider->second;
     const auto& link = m_links.at(m_source_links.at(current_moe->id()));
     if (!weights || weights->resident_capacity() <= link.top_k) {
-        // MOE_LES_LOG(current_moe->id(), "event=prefetch_skip reason=capacity target=" << target);
-        return;
+        return false;
     }
     state.submitted = true;
     state.consumed->store(false, std::memory_order_release);
@@ -433,10 +453,9 @@ void LookaheadContext::prefetch(const cldnn::primitive_inst* current_moe) {
         handoff->second.prefetch_us = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
     }
-    MOE_LES_LOG(current_moe->id(), "event=prefetch_queue_submit target=" << target << " epoch=" << m_epoch
-                << " prediction=" << state.predicted_indices.get() << " dependency=" << state.prediction_ready.get());
     m_prefetcher->submit_prefetch({m_layer_indices.at(target), m_epoch,
                                   state.predicted_indices, state.prediction_ready, weights, state.consumed, state.cpu_indices});
+    return true;
 }
 
 std::shared_ptr<LookaheadContext> LookaheadRegistry::acquire(cldnn::network& network) {

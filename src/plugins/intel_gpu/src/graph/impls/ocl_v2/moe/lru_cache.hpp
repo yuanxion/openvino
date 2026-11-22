@@ -82,7 +82,6 @@ public:
         if (m_log_layer == layer)
             return;
         m_log_layer = layer;
-        // MOE_LES_LOG(m_log_layer, "event=cache_bind cache=" << this << " capacity=" << m_max_total_experts);
     }
     std::string log_layer() const {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -93,6 +92,7 @@ public:
         int64_t time_us;
         char kind;
         size_t expert;
+        uint64_t sequence = 0;
     };
     struct Trace {
         int64_t start_us = 0, end_us = 0;
@@ -105,8 +105,14 @@ public:
     std::pair<size_t, int64_t> trace_checkpoint() const;
     Trace end_trace();
     Trace snapshot() const;
-    void set_log_window(bool enabled);
+    void set_log_window(bool enabled, bool reset = false);
+    void set_log_context(size_t token_index, uint32_t layer_index, bool emit);
     std::vector<TraceEvent> ordered_cache_events() const;
+    TimestampLogRecord timestamp_snapshot(const std::vector<size_t>& topk_experts) const;
+    static std::pair<TimestampLogRecord, TimestampLogRecord> timestamp_pair(const LRUCache& current,
+                                                                          const LRUCache& target);
+    void set_timestamp_arguments(const std::vector<size_t>& topk, const std::vector<size_t>& demand);
+    void set_timestamp_prediction(const std::vector<size_t>& predicted, const std::vector<size_t>& submitted);
 
     struct Load {
         uint32_t expert_id;
@@ -173,7 +179,6 @@ public:
     }
     void set_initialized() {
         m_initialized = true;
-        // MOE_LES_LOG(m_log_layer, "event=cache_initialized cache=" << this << " capacity=" << m_max_total_experts);
     }
 
     std::vector<size_t> resident_experts() const {
@@ -223,8 +228,14 @@ private:
     bool m_log_window = false;
     uint64_t m_log_window_id = 0;
     std::vector<TraceEvent> m_ordered_cache_events;
+    uint64_t m_cache_event_sequence = 0;
+    size_t m_log_token_index = 0;
+    uint32_t m_log_layer_index = 0;
+    bool m_log_emit = false;
+    std::vector<size_t> m_log_topk, m_log_demand, m_log_predicted, m_log_prefetching;
     std::string m_log_layer = "unbound";
     void record_cache_event_unlocked(char kind, size_t expert, const std::string& details = "");
+    TimestampLogRecord timestamp_snapshot_unlocked(const std::vector<size_t>& topk_experts) const;
     void log_cache_state_unlocked(char kind, size_t expert, int64_t event_us,
                                   const std::string& details, bool snapshot = false) const;
     std::string log_node_unlocked(const Node& node) const;

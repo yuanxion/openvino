@@ -145,9 +145,6 @@ struct ExpertPrefetcher::State {
     }
 
     void finish(Job& job, cl_int status) {
-        // MOE_LES_LOG(job.binding->cache->log_layer(), "event=worker_load_publish expert=" << job.load.expert_id
-        //         << " slot=" << job.load.slot << " generation=" << job.load.generation
-        //         << " status=" << status << " completion=" << job.load.ready_event.get());
         if (status == CL_COMPLETE) {
             job.binding->cache->complete_load(job.load);
         } else {
@@ -162,20 +159,15 @@ struct ExpertPrefetcher::State {
     void discard_locked() {
         for (auto& task : predictions) {
             if (auto provider = task.target_provider.lock()) {
-                MOE_LES_LOG(provider->cache().log_layer(), "event=prediction_discard reason=shutdown epoch=" << task.generation);
             }
             consume(task);
         }
         predictions.clear();
         for (auto& job : demand) {
-            MOE_LES_LOG(job.binding->cache->log_layer(), "event=job_abandon origin=demand expert=" << job.load.expert_id
-                        << " slot=" << job.load.slot << " generation=" << job.load.generation);
             abandoned.push_back(std::move(job));
         }
         demand.clear();
         for (auto& job : speculative) {
-            MOE_LES_LOG(job.binding->cache->log_layer(), "event=job_abandon origin=speculative expert=" << job.load.expert_id
-                        << " slot=" << job.load.slot << " generation=" << job.load.generation);
             job.binding->cache->cancel_load(job.load);
             abandoned.push_back(std::move(job));
         }
@@ -218,8 +210,6 @@ struct ExpertPrefetcher::State {
         for (auto task = predictions.begin(); task != predictions.end();) {
             if (task->generation != generation || task->target_layer_idx <= cursor) {
                 if (auto provider = task->target_provider.lock()) {
-                    MOE_LES_LOG(provider->cache().log_layer(), "event=prediction_expire epoch=" << task->generation
-                                << " current_epoch=" << generation << " cursor=" << cursor);
                 }
                 consume(*task);
                 task = predictions.erase(task);
@@ -230,9 +220,6 @@ struct ExpertPrefetcher::State {
         }
         for (auto job = speculative.begin(); job != speculative.end();) {
             if (job->generation != generation || job->layer <= cursor) {
-                MOE_LES_LOG(job->binding->cache->log_layer(), "event=job_expire expert=" << job->load.expert_id
-                            << " slot=" << job->load.slot << " generation=" << job->load.generation
-                            << " epoch=" << job->generation << " current_epoch=" << generation << " cursor=" << cursor);
                 if (job->binding->cache->cancel_load(job->load)) {
                     abandoned.push_back(*job);
                 } else {
@@ -344,9 +331,6 @@ struct ExpertPrefetcher::State {
                 fail_abandoned();
                 if (selected) {
                     try {
-                        MOE_LES_LOG(selected->binding->cache->log_layer(), "--> worker_load_begin expert=" << selected->load.expert_id
-                                    << " slot=" << selected->load.slot << " generation=" << selected->load.generation
-                                    << " dependency=" << selected->load.last_use_event.get());
                         OPENVINO_ASSERT(event_status(selected->load.last_use_event) == CL_COMPLETE,
                                         "Lookahead consumer event failed");
                         if (selected->load.last_use_event) {
@@ -357,12 +341,8 @@ struct ExpertPrefetcher::State {
                         moe_otd::fill_weights_memory_async(*dma, source.config, source.offsets, *source.reader,
                                                            source.weights, {selected->load.expert_id}, {selected->load.slot},
                                                            nullptr, &staging, source.cache->log_layer());
-                        MOE_LES_LOG(source.cache->log_layer(), "--> worker_load_end expert=" << selected->load.expert_id
-                                    << " slot=" << selected->load.slot << " generation=" << selected->load.generation << " experts=" << les_ids(source.cache->snapshot().current));
                         finish(*selected, CL_COMPLETE);
                     } catch (...) {
-                        MOE_LES_LOG(selected->binding->cache->log_layer(), "event=worker_load_exception expert=" << selected->load.expert_id
-                                    << " slot=" << selected->load.slot << " generation=" << selected->load.generation);
                         finish(*selected, CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST);
                         throw;
                     }
@@ -390,8 +370,6 @@ struct ExpertPrefetcher::State {
                         }
                         consume(*prediction);
                         if (binding) {
-                            MOE_LES_LOG(binding->cache->log_layer(), "event=prediction_readback experts=" << les_ids(experts)
-                                        << " epoch=" << prediction->generation << " target_index=" << prediction->target_layer_idx);
                         }
                     } catch (...) {
                         consume(*prediction);
@@ -403,8 +381,6 @@ struct ExpertPrefetcher::State {
                         {
                             std::lock_guard<std::mutex> lock(wakeup->mutex);
                             if (stop || prediction->generation != generation || prediction->target_layer_idx <= cursor) {
-                                MOE_LES_LOG(binding->cache->log_layer(), "event=prediction_reserve_stop expert=" << expert
-                                            << " epoch=" << prediction->generation << " current_epoch=" << generation);
                                 break;
                             }
                             load = binding->cache->reserve_speculative(expert, binding->config.top_k,
@@ -484,8 +460,6 @@ cldnn::event::ptr ExpertPrefetcher::make_ready_event() {
 void ExpertPrefetcher::submit_prefetch(PrefetchTask task) {
     rethrow_if_failed();
     if (auto provider = task.target_provider.lock()) {
-        MOE_LES_LOG(provider->cache().log_layer(), "event=prediction_enqueue epoch=" << task.generation
-                    << " target_index=" << task.target_layer_idx << " dependency=" << task.prediction_ready_event.get());
     }
     m_state->watch(task.prediction_ready_event);
     {
@@ -500,7 +474,6 @@ cldnn::event::ptr ExpertPrefetcher::demand_async(OffloadExpertWeightProvider& pr
                                               const std::vector<uint32_t>& missing_ids) {
     rethrow_if_failed();
     if (missing_ids.empty()) {
-        MOE_LES_LOG(provider.cache().log_layer(), "event=demand_skip reason=no_missing");
         return {};
     }
     auto batch = std::make_shared<State::Batch>(State::Batch{missing_ids.size(), make_ready_event()});
@@ -517,8 +490,7 @@ cldnn::event::ptr ExpertPrefetcher::demand_async(OffloadExpertWeightProvider& pr
         auto binding = m_state->bindings.at(&provider);
         for (const auto& load : loads) {
             m_state->demand.push_back({binding, load, batch});
-            MOE_LES_LOG(provider.cache().log_layer(), "event=job_enqueue origin=demand expert=" << load.expert_id
-                        << " slot=" << load.slot << " generation=" << load.generation << " batch=" << batch->ready.get());
+            binding->cache->log_enqueue(load, m_state->generation, m_state->demand.size());
         }
     }
     m_state->wakeup->notify();
@@ -530,8 +502,6 @@ void ExpertPrefetcher::promote(OffloadExpertWeightProvider& provider, const std:
     const auto binding = m_state->bindings.at(&provider);
     for (auto job = m_state->speculative.begin(); job != m_state->speculative.end();) {
         if (job->binding == binding && std::find(topk_ids.begin(), topk_ids.end(), job->load.expert_id) != topk_ids.end()) {
-            MOE_LES_LOG(provider.cache().log_layer(), "event=job_promote expert=" << job->load.expert_id
-                        << " slot=" << job->load.slot << " generation=" << job->load.generation);
             m_state->demand.push_back(*job);
             job = m_state->speculative.erase(job);
         } else {

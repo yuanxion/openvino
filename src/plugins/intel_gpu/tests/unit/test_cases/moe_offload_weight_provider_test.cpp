@@ -498,7 +498,14 @@ TEST_F(moe_les_upload, current_demand_does_not_wait_for_next_prediction) {
     prefetcher.advance(1, 0);
     auto current = current_provider->cache().partition_3way({0}, [&] { return prefetcher.make_ready_event(); });
     ASSERT_TRUE(current);
+    current_provider->cache().set_log_window(true);
     auto current_copy = prefetcher.demand_async(*current_provider, {0});
+    if (ov::intel_gpu::ocl::moe::LESLog::instance().enabled()) {
+        const auto events = current_provider->cache().ordered_cache_events();
+        EXPECT_EQ(std::count_if(events.begin(), events.end(), [](const auto& event) {
+            return event.kind == 'J' && event.expert == 0;
+        }), 1);
+    }
     cl::UserEvent prediction_gate(dynamic_cast<cldnn::ocl::ocl_engine&>(get_test_engine()).get_cl_context());
     auto consumed = std::make_shared<std::atomic<bool>>(false);
     prefetcher.submit_prefetch({1, 1, predicted_ids, std::make_shared<cldnn::ocl::ocl_event>(prediction_gate), provider, consumed});

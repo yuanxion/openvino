@@ -782,6 +782,30 @@ public:
                    std::chrono::steady_clock::now().time_since_epoch()).count();
     }
 
+    void timestamp_log(typed_primitive_inst<moe_3gemm_fused_compressed>& instance,
+                       const char* tag,
+                       const char* file,
+                       int line,
+                       bool next_layer,
+                       const std::vector<size_t>& topk_experts,
+                       const moe::TimestampLogRecord& context) {
+        const auto* next = next_layer ? _lookahead->get_next_layer(&instance) : nullptr;
+        const auto& target = next ? next->moe_inst->id() : instance.id();
+        _lookahead->set_timestamp_arguments(instance.id(), topk_experts, context.missing_expert_ids);
+        auto snapshots = _lookahead->timestamp_pair(instance.id(), target);
+        moe::TimestampLogRecord record;
+        record.timestamp = snapshots.first.timestamp;
+        const auto* filename = std::strrchr(file, '/');
+        record.source_code = std::string(filename ? filename + 1 : file) + ':' + std::to_string(line);
+        record.tag = tag;
+        record.layer_index = _lookahead->layer_index(instance.id());
+        record.target_index = _lookahead->layer_index(target);
+        record.token_index = context.token_index;
+        record.current = snapshots.first.layer_snapshot(record.layer_index);
+        record.target = snapshots.second.layer_snapshot(record.target_index);
+        moe::LESLog::instance().write_timestamp(record);
+    }
+
     static const std::vector<size_t>& debug_token_ids() {
         static const std::vector<size_t> tokens = [] {
             std::vector<size_t> selected;
@@ -1917,12 +1941,7 @@ public:
 
         kernel_dump_info.add_entry_point(stage.kernel->get_id());
 
-        // MOE_LES_LOG(instance.id(), "event=kernel_submit_begin kernel=" << stage.kernel->get_id()
-        //         << " global=" << moe::les_ids(global) << " local=" << moe::les_ids(local)
-        //         << " dependencies=" << moe::les_ids(events));
         auto completion = stream.enqueue_kernel(*stage.kernel, desc, {}, events, needs_completion_event);
-        // MOE_LES_LOG(instance.id(), "event=kernel_submit_end kernel=" << stage.kernel->get_id()
-        //         << " completion=" << completion.get());
         return completion;
     }
 
@@ -1940,7 +1959,6 @@ public:
                                         typed_primitive_inst<moe_3gemm_fused_compressed>& instance,
                                         scratch_buffers& scratch,
                                         size_t token_num) {
-        const auto& layer_id = instance.id();
         const auto& selected_tokens = debug_token_ids();
         size_t debug_token = 0;
         bool logging = false;
@@ -1958,42 +1976,30 @@ public:
             }();
             OPENVINO_ASSERT(selected_request.empty() || !request.empty(),
                             "LOG_REQUEST requires request labels from benchmark_vlm");
-            logging = !selected_tokens.empty() && (selected_request.empty() || selected_request == request)
-                      && (selected_tokens.front() == 0
+            logging = _lookahead && moe::LESLog::instance().enabled() &&
+                      (selected_request.empty() || selected_request == request)
+                      && (selected_tokens.empty() || selected_tokens.front() == 0
                           || std::find(selected_tokens.begin(), selected_tokens.end(), debug_token) != selected_tokens.end());
         }
-        // MOE_LES_LOG(layer_id, "event=decode_begin token_num=" << token_num << " decode=" << debug_token
-        //         << " request=" << _debug_request << " dependencies=" << moe::les_ids(events));
         if (moe::LESLog::instance().enabled() && _weight_provider->is_offloaded() && token_num == 1)
             static_cast<OffloadExpertWeightProvider&>(*_weight_provider).cache().set_log_window(true);
-        DebugTokenRow debug_row;
-        if (_lookahead && token_num == 1)
-            _lookahead->begin_handoff(instance.id(), debug_token, logging);
-        auto* debug_provider = logging ? static_cast<OffloadExpertWeightProvider*>(_weight_provider.get()) : nullptr;
-        if (logging) {
-            debug_row.enter = debug_time_us();
-            debug_row.request = _debug_request;
-            debug_row.entry_cache = debug_provider->cache().resident_experts();
-            const char* baseline_path = std::getenv("LOG_BASELINE_CSV_PATH");
-            debug_row.has_baseline = baseline_path && *baseline_path;
-            if (debug_row.has_baseline) {
-                OPENVINO_ASSERT(_lookahead, "LES baseline requires the lookahead path");
-                debug_row.baseline = _lookahead->cache_baseline(instance.id(), _debug_request, debug_token);
-                debug_row.prefill = _lookahead->cache_baseline(instance.id(), _debug_request, debug_token, true);
-            }
+        std::vector<size_t> known_topk;
+        moe::TimestampLogRecord log_context;
+        log_context.token_index = debug_token ? debug_token - 1 : 0;
+        size_t point_index = 0;
+        if (_lookahead && moe::LESLog::instance().enabled() && token_num == 1) {
+            _lookahead->prepare_timestamp_window(instance.id(), log_context.token_index, logging);
+            _lookahead->set_cache_log_context(instance.id(), log_context.token_index, logging);
+            if (const auto* next = _lookahead->get_next_layer(&instance))
+                _lookahead->set_cache_log_context(next->moe_inst->id(), log_context.token_index, logging);
         }
-        const auto ready_actual = [&](std::vector<size_t>& ready, int64_t& snapshot_time) {
-            ready = debug_provider->cache().resident_experts();
-            snapshot_time = debug_time_us();
-            // MOE_LES_LOG(layer_id, "event=ready_snapshot experts=" << moe::les_ids(ready));
-            std::vector<size_t> hits;
-            for (const auto expert : debug_row.actual) {
-                if (std::find(ready.begin(), ready.end(), expert) != ready.end())
-                    hits.push_back(expert);
+        const auto log_point = [&](const char* tag, int line, bool next_layer = false) {
+            if (logging) {
+                const auto numbered = std::to_string(point_index++) + '-' + tag;
+                timestamp_log(instance, numbered.c_str(), __FILE__, line, next_layer, known_topk, log_context);
             }
-            return hits;
         };
-
+        log_point("exec_batched_gemv", __LINE__);
         auto& cur_net = instance.get_network();
         auto& stream = cur_net.get_stream();
         auto cur_moe = instance.get_typed_desc<moe_3gemm_fused_compressed>();
@@ -2011,64 +2017,34 @@ public:
         OPENVINO_ASSERT(!logging || split_les, "LES CSV requires the single-token LES offload path");
         std::vector<uint32_t> experts;
         if (split_les) {
-            MOE_LES_LOG(layer_id, "event=[5]_stream_finish_begin");
+            log_point("stream_finish_start", __LINE__);
             stream.finish();
-            MOE_LES_LOG(layer_id, "event=[6]_stream_finish_end");
+            log_point("stream_finish_end", __LINE__);
         }
         if (token_num == 1) {
-            if (logging)
-                debug_row.prediction_start = debug_time_us();
-            MOE_LES_LOG(layer_id, "event=[7]_prediction_enqueue_begin");
+            log_point("enqueue_lookahead_prediction", __LINE__);
             enqueue_lookahead_prediction(events, instance);
-            // MOE_LES_LOG(layer_id, "event=prediction_enqueue_end");
         }
         if (split_les) {
             experts.resize(token_num * static_cast<size_t>(max_topk));
             stream.enqueue_barrier({stream.enqueue_marker({}, true)});
-            MOE_LES_LOG(layer_id, "event=[8]_topk_copy_to_begin count=" << experts.size());
+            log_point("topk_copy_to_start", __LINE__);
             scratch.topk_id->copy_to(stream, experts.data(), 0, 0, experts.size() * sizeof(uint32_t), true);
-            MOE_LES_LOG(layer_id, "event=[9]_topk_copy_to_end topk experts=" << moe::les_ids(experts));
+            known_topk.assign(experts.begin(), experts.end());
+            log_point("topk_copy_to_end", __LINE__);
+
             for (auto expert : experts) {
                 OPENVINO_ASSERT(expert < static_cast<uint32_t>(cur_moe->_config.num_expert),
                                 "Lookahead TopK readback outside expert range: layer=", instance.id(),
                                 ", expert=", expert, ", count=", cur_moe->_config.num_expert,
                                 ", layout=", scratch.topk_id->get_layout().to_short_string());
             }
-            if (logging) {
-                _lookahead->finish_handoff(instance.id(), debug_token, experts);
-                debug_row.topk_readback_end = debug_time_us();
-                debug_row.actual.assign(experts.begin(), experts.end());
-                if (debug_row.has_baseline) {
-                    const auto hits = [&](const std::vector<size_t>& cache) {
-                        std::vector<size_t> ready;
-                        for (const auto expert : debug_row.actual) {
-                            if (std::find(cache.begin(), cache.end(), expert) != cache.end())
-                                ready.push_back(expert);
-                        }
-                        return ready;
-                    };
-                    debug_row.baseline_hits = hits(debug_row.baseline.ready);
-                    debug_row.baseline_misses = debug_added(debug_row.actual, debug_row.baseline_hits);
-                    debug_row.entry_hits = hits(debug_row.entry_cache);
-                    debug_row.entry_added = debug_added(debug_row.entry_hits, debug_row.baseline_hits);
-                    debug_row.entry_lost = debug_added(debug_row.baseline_hits, debug_row.entry_hits);
-                    debug_row.prefill_hits = hits(debug_row.prefill.ready);
-                    debug_row.prefill_added = debug_added(debug_row.entry_hits, debug_row.prefill_hits);
-                    debug_row.prefill_lost = debug_added(debug_row.prefill_hits, debug_row.entry_hits);
-                }
-                debug_row.readback_hits = ready_actual(debug_row.readback_cache, debug_row.readback_snapshot);
-                debug_row.readback_misses = debug_added(debug_row.actual, debug_row.readback_hits);
-            }
         }
         auto batch_mem_ptr = scratch.topk_id;
         if (!split_les) {
-            // MOE_LES_LOG(layer_id, "event=expert_mapping_begin");
             batch_mem_ptr = get_batched_gemv_expert_ids(stream, instance, scratch, token_num);
-            // MOE_LES_LOG(layer_id, "event=expert_mapping_end fallback=" << !batch_mem_ptr);
             if (!batch_mem_ptr) {
-                // MOE_LES_LOG(layer_id, "event=fallback_begin");
                 auto result = exec_batched_gemv_fallback(events, stream, instance, scratch, token_num);
-                // MOE_LES_LOG(layer_id, "event=decode_end path=fallback completion=" << result.get());
                 return result;
             }
             if (_lookahead && token_num == 1) {
@@ -2125,8 +2101,6 @@ public:
             bool pass_a = false;
             auto enqueue_pairs = [&](const std::vector<event::ptr>& dependencies, const memory::ptr& indices,
                                      const memory::ptr& mask) {
-                // MOE_LES_LOG(layer_id, "event=pass_begin pass=" << (mask ? (pass_a ? "A" : "B") : "all")
-                //             << " dependencies=" << moe::les_ids(dependencies));
                 std::vector<memory::ptr> args_gate_up =
                     {indices, mlp_gate_wei_mem, mlp_gate_scale_mem, mlp_gate_zp_mem, mlp_up_wei_mem, mlp_up_scale_mem, mlp_up_zp_mem};
                 if (mask) {
@@ -2136,9 +2110,7 @@ public:
                     args_gate_up.insert(args_gate_up.end(), extra_args_gate_up.begin(), extra_args_gate_up.end());
                 }
                 args_gate_up.push_back(hidden_states_mem_ptr);
-                if (logging)
-                    (pass_a ? debug_row.pass_a_gate_up : debug_row.pass_b_gate_up) = debug_time_us();
-                // MOE_LES_LOG(layer_id, "event=gate_up_submit_begin pass=" << (pass_a ? "A" : "B"));
+                log_point(pass_a ? "pass_a_gate_up" : "pass_b_gate_up", __LINE__, true);
                 auto ret_event = execute_stage(dependencies,
                                                instance,
                                                mask ? *mlp_gate_up_masked : *stage_gate_up,
@@ -2146,7 +2118,6 @@ public:
                                                {scratch.up},
                                                {token_num * compute_experts, subgroup_size, static_cast<size_t>(_intermediate_size / N_BLOCK)},
                                                {1, subgroup_size, SUBGROUP_NUM}, split_les);
-                // MOE_LES_LOG(layer_id, "event=gate_up_submit_end completion=" << ret_event.get());
                 if (split_les && moe_otd::les_trace_enabled()) {
                     trace_events.emplace_back(pass_a ? "pass_a_gate" : "pass_b_gate", ret_event);
                 }
@@ -2163,10 +2134,7 @@ public:
                 if (_has_shared_expert) {
                     args_down.push_back(scratch.routing_weights);
                 }
-                if (logging)
-                    (pass_a ? debug_row.pass_a_down : debug_row.pass_b_down) = debug_time_us();
-                // MOE_LES_LOG(layer_id, "event=down_submit_begin pass=" << (pass_a ? "A" : "B")
-                //             << " dependency=" << ret_event.get());
+                log_point(pass_a ? "pass_a_down" : "pass_b_down", __LINE__, true);
                 ret_event = execute_stage({ret_event},
                                           instance,
                                           mask ? *mlp_down_masked : *stage_down,
@@ -2175,11 +2143,9 @@ public:
                                           {token_num * compute_experts, subgroup_size, static_cast<size_t>(_hidden_size / N_BLOCK)},
                                           {1, subgroup_size, SUBGROUP_NUM},
                                           split_les);
-                // MOE_LES_LOG(layer_id, "event=down_submit_end completion=" << ret_event.get());
                 if (split_les && moe_otd::les_trace_enabled()) {
                     trace_events.emplace_back(pass_a ? "pass_a_down" : "pass_b_down", ret_event);
                 }
-                // MOE_LES_LOG(layer_id, "event=pass_end completion=" << ret_event.get());
                 return ret_event;
             };
 
@@ -2203,27 +2169,12 @@ public:
                     const size_t first_pair = wave * wave_capacity;
                     const size_t last_pair = std::min(pair_count, first_pair + wave_capacity);
                     std::vector<uint32_t> wave_experts(experts.begin() + first_pair, experts.begin() + last_pair);
-                    // MOE_LES_LOG(layer_id, "event=wave_begin wave=" << wave << "/" << wave_count
-                    //            << " topk experts=" << moe::les_ids(wave_experts));
                     auto partition = [&] {
-                        if (logging) {
-                            debug_row.partition_hits = ready_actual(debug_row.partition_cache, debug_row.partition_snapshot);
-                            debug_row.partition_added = debug_added(debug_row.partition_hits, debug_row.readback_hits);
-                        }
-                        if (moe::LESLog::instance().enabled()) {
-                            provider->cache().set_log_window(false);
-                            const auto cache = provider->cache().snapshot();
-                            MOE_LES_LOG(layer_id, "event=[10]_partition_3way_begin wave=" << wave
-                                        << " current_layer_moe_cache_lru_expert_ids=" << moe::les_ids(cache.current)
-                                        << " pending_experts=" << moe::les_ids(cache.current_pending)
-                                        << " copying_experts=" << moe::les_ids(cache.current_copying)
-                                        << " topk_experts=" << moe::les_ids(experts));
-                        }
+                        log_point("partition_3way_start", __LINE__);
                         return provider->cache().partition_3way(wave_experts,
                             [&] { return prefetcher.make_ready_event(); }, wave > 0);
                     }();
                     OPENVINO_ASSERT(partition, "Lookahead demand cannot reserve its wave slots");
-                    // MOE_LES_LOG(layer_id, "event=demand_partition_end wave=" << wave << " slots=" << moe::les_ids(partition->slots));
                     if (wave == 0) {
                         _lookahead->demand_partitioned(instance.id());
                     }
@@ -2231,24 +2182,37 @@ public:
                     for (const auto& load : partition->missing) {
                         missing_ids.push_back(load.expert_id);
                     }
-                    // MOE_LES_LOG(layer_id, "event=demand_async_begin 本层缺失专家 experts=" << moe::les_ids(missing_ids));
+                    if (logging) {
+                        log_context.missing_expert_ids.assign(missing_ids.begin(), missing_ids.end());
+                    }
+                    log_point("partition_3way", __LINE__);
+                    log_point("prefetcher.demand_async", __LINE__);
                     auto demand_event = prefetcher.demand_async(*provider, missing_ids);
-                    // MOE_LES_LOG(layer_id, "event=demand_async_end completion=" << demand_event.get());
                     prefetcher.promote(*provider, wave_experts);
                     if (wave == 0) {
-                        if (moe::LESLog::instance().enabled()) {
+                        if (logging) {
                             const auto* next_layer = _lookahead->get_next_layer(&instance);
-                            const auto target = next_layer ? next_layer->moe_inst->id() : "none";
-                            const auto snapshot = next_layer ? _lookahead->cache_snapshot(target) : std::nullopt;
-                            const auto cache = snapshot.value_or(moe::LRUCache::Trace{});
-                            MOE_LES_LOG(layer_id, "event=[0]_lookahead->prefetch_begin target=" << target
-                                        << " cache_bound=" << snapshot.has_value()
-                                        << " next_layer_moe_cache_lru_expert_ids=" << moe::les_ids(cache.current)
-                                        << " pending_experts=" << moe::les_ids(cache.current_pending)
-                                        << " copying_experts=" << moe::les_ids(cache.current_copying));
+                            if (next_layer) {
+                                const auto prediction = _lookahead->prediction(next_layer->moe_inst->id());
+                                if (prediction.prediction_ready) {
+                                    prediction.prediction_ready->wait();
+                                    OPENVINO_ASSERT(prediction.cpu_indices, "Missing prediction CPU indices");
+                                    log_context.predicted_expert_ids.assign(prediction.cpu_indices->begin(),
+                                                                          prediction.cpu_indices->end());
+                                    _lookahead->set_timestamp_prediction(next_layer->moe_inst->id(),
+                                                                       log_context.predicted_expert_ids, {});
+                                }
+                            }
                         }
-                        _lookahead->prefetch(&instance);
-                        // MOE_LES_LOG(layer_id, "event=_lookahead->prefetch_end");
+                        const auto submitted = _lookahead->prefetch(&instance);
+                        if (logging && submitted) {
+                            log_context.prefetching_expert_ids = log_context.predicted_expert_ids;
+                            const auto* next_layer = _lookahead->get_next_layer(&instance);
+                            OPENVINO_ASSERT(next_layer, "Submitted prefetch without a target layer");
+                            _lookahead->set_timestamp_prediction(next_layer->moe_inst->id(), log_context.predicted_expert_ids,
+                                                               log_context.prefetching_expert_ids);
+                        }
+                        log_point("_lookahead->prefetch", __LINE__, true);
                         if (moe::LESLog::instance().enabled()) {
                             if (const auto* next_layer = _lookahead->get_next_layer(&instance))
                                 _lookahead->set_cache_log_window(next_layer->moe_inst->id(), true);
@@ -2287,17 +2251,11 @@ public:
                     auto dependencies = wave == 0 ? events : std::vector<event::ptr>{ret_event};
                     if (!partition->ready_pairs.empty() || (_has_shared_expert && wave == 0)) {
                         if (!partition->ready_events.empty()) {
-                            // MOE_LES_LOG(layer_id, "event=ready_barrier_submit dependencies=" << moe::les_ids(partition->ready_events));
                             dynamic_cast<cldnn::ocl::ocl_stream&>(stream).enqueue_external_barrier(partition->ready_events);
                         }
                         pass_a = true;
                         {
-                            if (logging) {
-                                debug_row.pass_a_hits = ready_actual(debug_row.pass_a_cache, debug_row.pass_a_snapshot);
-                                debug_row.pass_a_added = debug_added(debug_row.pass_a_hits, debug_row.partition_hits);
-                                debug_row.pass_a_misses = debug_added(debug_row.actual, debug_row.pass_a_hits);
-                            }
-                            MOE_LES_LOG(layer_id, "event=[1]_pass_a_submit wave=" << wave);
+                            log_point("pass_a", __LINE__, true);
                             ret_event = enqueue_pairs(dependencies, indices, ready_memory);
                         }
                         dependencies = {ret_event};
@@ -2309,48 +2267,30 @@ public:
                     }
                     if (!partition->inflight_pairs.empty() || !partition->missing_pairs.empty()) {
                         {
-                            // MOE_LES_LOG(layer_id, "event=pending_barrier_submit dependencies=" << moe::les_ids(copy_events));
                             dynamic_cast<cldnn::ocl::ocl_stream&>(stream).enqueue_external_barrier(copy_events);
                         }
                         pass_a = false;
-                        if (logging) {
-                            debug_row.pass_b_hits = ready_actual(debug_row.pass_b_cache, debug_row.pass_b_snapshot);
-                            const auto& previous = debug_row.pass_a_gate_up >= 0
-                                                       ? debug_row.pass_a_hits : debug_row.partition_hits;
-                            debug_row.pass_b_added = debug_added(debug_row.pass_b_hits, previous);
-                        }
                         {
-                            MOE_LES_LOG(layer_id, "event=[2]_pass_b_submit wave=" << wave);
+                            log_point("pass_b", __LINE__, true);
                             ret_event = enqueue_pairs(dependencies, indices, pending_memory);
                         }
                     }
                     provider->cache().unpin_all(ret_event);
                     stream.flush();
-                    // MOE_LES_LOG(layer_id, "event=wave_end wave=" << wave << " completion=" << ret_event.get());
                     }
-                    MOE_LES_LOG(layer_id, "event=[3]_reduce_submit_begin dependency=" << ret_event.get());
-                    if (logging)
-                        debug_row.reduce_start = debug_time_us();
+                    log_point("exec_batched_gemv_reduce", __LINE__, true);
                     ret = exec_batched_gemv_reduce(ret_event, instance, scratch, token_num);
-                    MOE_LES_LOG(layer_id, "event=[4]_reduce_submit_end completion=" << ret.get());
-                    if (logging) {
-                        debug_row.reduce_end = debug_time_us();
-                        debug_write_csv(cur_moe->id, debug_token, debug_row);
-                    }
-                    _lookahead->checkpoint_handoff(instance.id());
                     auto complete = stream.enqueue_marker({ret}, true);
                     stream.flush();
-                    // MOE_LES_LOG(layer_id, "event=decode_end decode=" << debug_token << " completion=" << complete.get());
                     return complete;
                 } catch (...) {
-                    MOE_LES_LOG(layer_id, "event=decode_exception action=cancel_all");
+                    log_point("exception", __LINE__);
                     prefetcher.cancel_all();
                     throw;
                 }
             }
             ret = exec_batched_gemv_reduce(ret_event, instance, scratch, token_num);
         }
-        MOE_LES_LOG(layer_id, "event=decode_end completion=" << ret.get());
         return ret;
     }
 
@@ -3472,15 +3412,12 @@ public:
     }
 
     cldnn::event::ptr execute(const std::vector<cldnn::event::ptr>& events, cldnn::primitive_inst& ins) override {
-        MOE_LES_LOG(ins.id(), "event=moe_execute_begin network=" << ins.get_network().get_id()
-                << " dependencies=" << moe::les_ids(events));
         auto& network = ins.get_network();
         if (!_lookahead) {
             _lookahead = moe::LookaheadRegistry::acquire(network);
         }
         if (!_lookahead || !_weight_provider->is_offloaded()) {
             auto result = execute_impl(events, ins);
-            MOE_LES_LOG(ins.id(), "event=moe_execute_end completion=" << result.get());
             return result;
         }
         auto* context = _lookahead.get();
@@ -3494,10 +3431,8 @@ public:
         _weight_provider = _lookahead->bind(ins.id(), _weight_provider);
         try {
             auto result = execute_impl(events, ins);
-            MOE_LES_LOG(ins.id(), "------------------------------------------------------------------------------------------" << result.get());
             return result;
         } catch (...) {
-            MOE_LES_LOG(ins.id(), "event=moe_execute_exception action=cancel_all");
             _lookahead->prefetcher().cancel_all();
             throw;
         }
@@ -3516,19 +3451,12 @@ public:
                     if (moe::LESLog::instance().enabled()) {
                         const auto snapshot = _lookahead->cache_snapshot(next_layer->moe_inst->id());
                         const auto cache = snapshot.value_or(moe::LRUCache::Trace{});
-                        // MOE_LES_LOG(instance.id(), "event=_lookahead->predict phase=begin target=" << next_layer->moe_inst->id()
-                        //             << " cache_bound=" << snapshot.has_value()
-                        //             << " next_layer_moe_cache_lru_expert_ids=" << moe::les_ids(cache.current)
-                        //             << " pending_experts=" << moe::les_ids(cache.current_pending)
-                        //             << " copying_experts=" << moe::les_ids(cache.current_copying));
                     }
                     _lookahead->predict(*next_layer, hidden, ready);
                 } else {
-                    MOE_LES_LOG(instance.id(), "event=prediction_skip reason=no_next_layer");
                 }
                 stream.enqueue_barrier({stream.enqueue_marker({}, true)});
             } else {
-                MOE_LES_LOG(instance.id(), "event=prediction_skip reason=hidden_layout");
             }
         }
     }
@@ -3559,19 +3487,15 @@ public:
         auto [hidden_states_mem_ptr, hidden_states_layout] = get_input_info(instance, static_cast<size_t>(MOE3GemmInputIndex::HIDDEN_STATES));
         size_t token_num = get_seq_len(hidden_states_layout);
 
-        MOE_LES_LOG(ins.id(), "event=moe_prepare_begin token_num=" << token_num);
         bind_weights_on_first_exec(instance);
 
         scratch_buffers scratch;
         prepare_internal_buffers(instance, scratch, token_num);
-        MOE_LES_LOG(ins.id(), "event=moe_prepare_end token_num=" << token_num);
         kernel_dump_info.clear_entries();
 
         // Batched GEMV: for small token counts (including single token, MTP/speculative decoding),
         // use optimized GEMV kernels with batch dimension. Avoids gather/scatter overhead.
         const MoeGemmImpl impl = select_impl(token_num);
-        MOE_LES_LOG(ins.id(), "event=moe_dispatch token_num=" << token_num << " implementation=" << static_cast<int>(impl)
-                << " shared_expert=" << _has_shared_expert << " offloaded=" << _weight_provider->is_offloaded());
         if (_lookahead && (token_num != 1 || impl != MoeGemmImpl::batched_gemv)) {
             _lookahead->pause_for_prefill();
         }
